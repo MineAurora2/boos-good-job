@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark light">
+    <title>求职雷达 · 投递统计面板</title>
+    <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
+    <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">
+                <div class="brand-mark" aria-hidden="true">
+                    <span></span><span></span><span></span>
+                </div>
+                <div>
+                    <strong>求职雷达</strong>
+                    <small>JOB OPS</small>
+                </div>
+            </div>
+
+            <nav class="nav-list" aria-label="主导航">
+                <button class="nav-item active" data-scroll="overview">
+                    <span class="nav-icon">⌁</span><span>数据总览</span>
+                </button>
+                <button class="nav-item" data-scroll="controlSection">
+                    <span class="nav-icon">◉</span><span>脚本监控</span>
+                    <span class="nav-count" id="navControlAlerts">0</span>
+                </button>
+                <button class="nav-item" data-scroll="reports">
+                    <span class="nav-icon">⌗</span><span>分析报表</span>
+                </button>
+                <button class="nav-item" data-scroll="mapSection">
+                    <span class="nav-icon">◎</span><span>地区分布</span>
+                </button>
+                <button class="nav-item" data-scroll="applications">
+                    <span class="nav-icon">▤</span><span>投递记录</span>
+                    <span class="nav-count" id="navRecordCount">0</span>
+                </button>
+                <button class="nav-item" data-scroll="adminSection">
+                    <span class="nav-icon">⚙</span><span>系统管理</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-spacer"></div>
+            <div class="daily-goal">
+                <div class="goal-head">
+                    <span>今日投递进度</span>
+                    <strong id="goalText">0 / 20</strong>
+                </div>
+                <div class="goal-track"><span id="goalBar"></span></div>
+                <small id="goalHint">保持节奏，比盲目海投更重要</small>
+            </div>
+            <div class="sidebar-status">
+                <span class="live-dot"></span>
+                <div><strong>数据服务正常</strong><small id="lastUpdated">正在同步…</small></div>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <button class="mobile-menu" id="mobileMenu" aria-label="打开菜单">☰</button>
+                <div class="page-title">
+                    <p>APPLICATION ANALYTICS</p>
+                    <h1>投递数据总览</h1>
+                </div>
+                <div class="top-actions">
+                    <div class="range-switch" id="rangeSwitch" aria-label="时间范围">
+                        <button data-range="7">近 7 天</button>
+                        <button class="active" data-range="30">近 30 天</button>
+                        <button data-range="all">全部</button>
+                    </div>
+                    <button class="icon-button theme-toggle" id="themeToggle" title="切换白天主题" aria-label="切换网页主题">☀</button>
+                    <button class="icon-button" id="refreshButton" title="刷新数据" aria-label="刷新数据">↻</button>
+                    <button class="export-button" id="exportButton"><span>⇩</span> 导出报表</button>
+                </div>
+            </header>
+
+            <section id="overview" class="metric-grid" aria-label="核心指标">
+                <article class="metric-card accent-cyan" data-widget-id="metric-total">
+                    <div class="metric-top"><span>累计投递</span><span class="metric-icon">↗</span></div>
+                    <div class="metric-value"><strong id="totalApplications">—</strong><small>份</small></div>
+                    <p id="totalDelta">正在计算投递趋势</p>
+                    <div class="sparkline" id="totalSparkline"></div>
+                </article>
+                <article class="metric-card accent-violet" data-widget-id="metric-companies">
+                    <div class="metric-top"><span>覆盖公司</span><span class="metric-icon">◇</span></div>
+                    <div class="metric-value"><strong id="uniqueCompanies">—</strong><small>家</small></div>
+                    <p id="companyDelta">去重后的公司数量</p>
+                    <div class="sparkline" id="companySparkline"></div>
+                </article>
+                <article class="metric-card accent-orange" data-widget-id="metric-salary">
+                    <div class="metric-top"><span>平均月薪</span><span class="metric-icon">¥</span></div>
+                    <div class="metric-value"><strong id="averageSalary">—</strong><small>K</small></div>
+                    <p id="salaryHint">按薪资区间中位数估算</p>
+                    <div class="sparkline" id="salarySparkline"></div>
+                </article>
+                <article class="metric-card accent-green" data-widget-id="metric-today">
+                    <div class="metric-top"><span>今日投递</span><span class="metric-icon">●</span></div>
+                    <div class="metric-value"><strong id="todayApplications">—</strong><small>份</small></div>
+                    <p id="todayHint">今日目标完成度 0%</p>
+                    <div class="sparkline" id="todaySparkline"></div>
+                </article>
+            </section>
+
+            <section id="controlSection" class="control-center" aria-label="脚本实时监控">
+                <div class="control-heading">
+                    <div><span class="eyebrow">LIVE MONITOR</span><h2>脚本实时监控</h2><p>集中查看多账号心跳、运行日志、实例状态与岗位决策</p></div>
+                    <div class="control-sync"><span id="controlSyncDot"></span><div><strong id="controlSyncText">正在连接控制服务</strong><small id="controlUpdatedAt">尚未同步</small></div><button id="refreshControl" type="button">刷新</button></div>
+                </div>
+
+                <div class="monitor-metrics panel">
+                    <div><span>在线脚本</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">2 分钟内有心跳</small></div>
+                    <div><span>累计接入</span><strong id="connectedClients">0</strong><small>已登记浏览器实例</small></div>
+                    <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
+                    <div><span>异常事件</span><strong id="monitorFailures">0</strong><small>当前统计区间</small></div>
+                </div>
+                <div class="monitor-grid panel">
+                    <div class="live-log-board"><div class="subpanel-title"><span>实时日志</span><div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs">暂停滚动</button><button id="clearLogs">清空</button></div></div><div id="liveLogs" class="live-logs"></div></div>
+                </div>
+
+                <div class="control-kpi-grid">
+                    <article><span>在线实例</span><strong id="controlOnlineCount">0</strong><small id="controlInstanceHint">等待心跳</small></article>
+                    <article><span>当前速度</span><strong id="controlRateValue">0</strong><small>份 / 小时</small></article>
+                    <article><span>当前状态</span><strong id="controlRunningCount">0</strong><small>运行中实例</small></article>
+                </div>
+
+                <div class="control-layout">
+                    <article class="control-card control-span-12">
+                        <div class="control-card-head"><div><span>浏览器实例</span><small id="controlInstanceSummary">等待脚本接入</small></div><button class="control-command subtle" data-control-action="refresh_instances">同步状态</button></div>
+                        <div id="controlInstanceList" class="control-instance-grid"></div>
+                    </article>
+
+                    <article class="control-card control-span-12">
+                        <div class="control-card-head"><div><span>当前岗位决策</span><small>实时查看扣星过程与筛选结果</small></div><span class="decision-badge" id="decisionState">等待岗位</span></div>
+                        <div id="currentDecision" class="current-decision-empty">暂无正在评分的岗位</div>
+                    </article>
+                    <article class="control-card control-span-12">
+                        <div class="control-card-head"><div><span>账号配额</span><small>按账号查看使用量并设置今日上限</small></div></div>
+                        <div class="control-table-wrap"><table class="control-table"><thead><tr><th>账号</th><th>使用量</th><th>今日上限</th><th>状态</th><th>操作</th></tr></thead><tbody id="accountQuotaBody"></tbody></table></div>
+                    </article>
+                </div>
+            </section>
+
+            <section id="reports" class="report-section">
+                <div class="report-section-head">
+                    <div><span class="eyebrow">INTERACTIVE REPORTS</span><h2>交互式统计报表</h2><p>拖动卡片调整布局，点击图表即可联动筛选</p></div>
+                    <button id="resetReportLayout">恢复默认布局</button>
+                </div>
+                <div id="reportCanvas" class="report-canvas">
+                <article class="panel trend-panel report-card report-wide" data-widget-id="report-trend">
+                    <div class="panel-head">
+                        <div><span class="eyebrow">投递趋势</span><h2>每日投递变化</h2></div>
+                        <div class="trend-controls">
+                            <div class="trend-date-inputs"><label class="trend-date-field"><span>开始</span><input id="trendStartDate" type="text" readonly placeholder="选择日期" aria-label="趋势开始日期"><b>▦</b></label><i></i><label class="trend-date-field"><span>结束</span><input id="trendEndDate" type="text" readonly placeholder="选择日期" aria-label="趋势结束日期"><b>▦</b></label></div>
+                            <div class="trend-quick-range" id="trendQuickRange"><button data-trend-range="today">今日</button><button data-trend-range="7">七天</button><button data-trend-range="month">当月</button><button data-trend-range="90">三个月</button><button data-trend-range="365">一年</button><button class="active" data-trend-range="all">全部</button></div>
+                        </div>
+                    </div>
+                    <div class="trend-summary"><strong id="trendTotal">0</strong><span>当前区间累计投递</span><em id="trendPeak">峰值 —</em></div>
+                    <div class="chart-box trend-chart-box" id="trendChart" aria-label="每日投递趋势图，按住图表可左右拖动日期，滚轮可缩放"></div>
+                    <div class="trend-scrollbar"><button id="trendZoomOut" title="缩小">−</button><input id="trendScroll" type="range" min="0" max="0" value="0" aria-label="趋势图水平滚动条"><button id="trendZoomIn" title="放大">＋</button></div>
+                </article>
+
+                <article class="panel funnel-panel report-card report-normal" data-widget-id="report-funnel">
+                    <div class="panel-head">
+                        <div><span class="eyebrow">转化漏斗</span><h2>筛选与投递效率</h2></div>
+                        <span class="panel-badge">全量日志</span>
+                    </div>
+                    <div class="funnel-content">
+                        <div class="conversion-ring" id="conversionRing">
+                            <div><strong id="conversionRate">0%</strong><span>投递转化</span></div>
+                        </div>
+                        <div class="funnel-list">
+                            <div><span><i class="dot violet"></i>已评估岗位</span><strong id="evaluatedJobs">0</strong></div>
+                            <div><span><i class="dot cyan"></i>进入投递</span><strong id="funnelDelivered">0</strong></div>
+                            <div><span><i class="dot orange"></i>低于阈值</span><strong id="belowThreshold">0</strong></div>
+                            <div><span><i class="dot red"></i>队列异常</span><strong id="queueFailures">0</strong></div>
+                        </div>
+                    </div>
+                    <p class="insight" id="funnelInsight">数据越完整，转化分析越准确。</p>
+                </article>
+                <article id="mapSection" class="panel map-panel report-card report-full" data-widget-id="report-map">
+                    <div class="panel-head">
+                        <div><span class="eyebrow">地区分布</span><h2>投递热力地图</h2></div>
+                        <div class="map-head-tools">
+                            <div class="map-level-switch" id="mapLevelSwitch" aria-label="地图详细层级">
+                                <button class="active" data-map-level="province">省份</button>
+                                <button data-map-level="city">地级市</button>
+                            </div>
+                            <select id="mapMetric" class="compact-select" aria-label="地图指标">
+                                <option value="count">投递数量</option>
+                                <option value="salary">平均薪资</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="map-content">
+                        <div class="map-stage" id="mapStage">
+                            <div id="chinaMap" class="china-map" aria-label="可切换省份和地级市层级的中国投递热力地图"></div>
+                            <div class="map-navigation" aria-label="地图缩放控制">
+                                <button id="mapZoomIn" title="放大地图" aria-label="放大地图">＋</button>
+                                <span id="mapZoomValue">100%</span>
+                                <button id="mapZoomOut" title="缩小地图" aria-label="缩小地图">−</button>
+                                <button id="mapResetView" title="恢复地图视图" aria-label="恢复地图视图">⌂</button>
+                            </div>
+                            <div class="map-interaction-hint" id="mapInteractionHint">省份热力 · 点击筛选 · 滚轮缩放 · 按住拖动</div>
+                        </div>
+                        <div class="location-ranking">
+                            <div class="ranking-title"><span id="locationRankingTitle">热门省份</span><small id="knownLocationRate">已识别 0%</small></div>
+                            <div id="locationList" class="ranking-list"></div>
+                            <div class="map-scale"><span id="mapScaleMin">少</span><i></i><i></i><i></i><i></i><i></i><span id="mapScaleMax">多</span></div>
+                        </div>
+                    </div>
+                </article>
+
+                <article class="panel salary-panel report-card report-half" data-widget-id="report-salary">
+                    <div class="panel-head">
+                        <div><span class="eyebrow">薪资分析</span><h2>岗位薪资分布</h2></div>
+                        <span class="panel-badge" id="salaryCoverage">识别率 0%</span>
+                    </div>
+                    <div id="salaryChart" class="salary-chart"></div>
+                </article>
+                <article class="panel role-panel report-card report-half" data-widget-id="report-role">
+                    <div class="panel-head">
+                        <div><span class="eyebrow">岗位画像</span><h2>职位类型分布</h2></div>
+                    </div>
+                    <div class="role-content">
+                        <div class="role-donut" id="roleDonut"><div><strong id="roleKinds">0</strong><span>岗位类型</span></div></div>
+                        <div class="role-legend" id="roleLegend"></div>
+                    </div>
+                </article>
+
+                <article class="panel industry-panel report-card report-full" data-widget-id="report-industry">
+                <div class="panel-head">
+                    <div><span class="eyebrow">行业分析</span><h2>投递行业 TOP 10</h2></div>
+                    <span class="panel-badge" id="industryCoverage">识别率 0%</span>
+                </div>
+                <div id="industryChart" class="industry-chart"></div>
+                </article>
+                </div>
+            </section>
+
+            <section id="applications" class="panel records-panel">
+                <div class="records-head">
+                    <div><span class="eyebrow">投递明细</span><h2>全部投递记录</h2><p id="recordSubtitle">共 0 条记录</p></div>
+                    <div class="record-filters">
+                        <label class="search-box"><span>⌕</span><input id="searchInput" type="search" placeholder="搜索公司或岗位"></label>
+                        <select id="statusFilter" class="compact-select">
+                            <option value="all">全部状态</option>
+                            <option value="sent">已投递</option>
+                            <option value="queued">进行中</option>
+                            <option value="duplicate">重复投递</option>
+                            <option value="failed_unknown">异常</option>
+                        </select>
+                        <button class="advanced-toggle" id="advancedToggle">高级筛选 <span>⌄</span></button>
+                    </div>
+                </div>
+                <div class="advanced-filters" id="advancedFilters" hidden>
+                    <label><span>城市</span><select id="cityFilter" class="compact-select"><option value="all">全部城市</option></select></label>
+                    <label><span>经验</span><select id="experienceFilter" class="compact-select"><option value="all">全部经验</option></select></label>
+                    <label><span>学历</span><select id="educationFilter" class="compact-select"><option value="all">全部学历</option></select></label>
+                    <label><span>最低月薪（K）</span><input id="minSalaryFilter" type="number" min="0" step="1" placeholder="例如 8"></label>
+                    <label><span>最高月薪（K）</span><input id="maxSalaryFilter" type="number" min="0" step="1" placeholder="例如 20"></label>
+                    <label><span>关键词</span><input id="keywordFilter" type="text" placeholder="行业、岗位、搜索词"></label>
+                    <button id="resetFilters" class="reset-filter">重置筛选</button>
+                    <div id="activeFilterChips" class="filter-chips"></div>
+                </div>
+                <div class="table-command-bar">
+                    <div class="selection-tools">
+                        <span id="selectedCount">已选择 0 项</span>
+                        <button id="exportSelected" disabled>导出所选</button>
+                        <button id="deleteSelected" class="danger-action" disabled>删除所选</button>
+                        <button id="clearSelection" disabled>取消选择</button>
+                    </div>
+                    <div class="table-view-tools">
+                        <div class="density-switch" id="densitySwitch">
+                            <button data-density="compact" title="紧凑">紧凑</button>
+                            <button class="active" data-density="default" title="默认">默认</button>
+                            <button data-density="comfortable" title="宽松">宽松</button>
+                        </div>
+                        <div class="column-manager">
+                            <button id="columnManagerButton">列设置 ▾</button>
+                            <div id="columnManagerMenu" class="column-manager-menu" hidden></div>
+                        </div>
+                        <button id="resetTableView">重置表格</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table id="recordsTable">
+                        <colgroup id="recordsColgroup"></colgroup>
+                        <thead id="recordsHead"></thead>
+                        <tbody id="recordsBody"></tbody>
+                    </table>
+                    <div class="empty-state" id="emptyState" hidden><span>⌕</span><strong>没有找到匹配记录</strong><p>试试调整时间范围或筛选条件</p></div>
+                </div>
+                <div class="pagination">
+                    <span id="pageInfo">第 1 页</span>
+                    <div><button id="prevPage" aria-label="上一页">←</button><div id="pageNumbers"></div><button id="nextPage" aria-label="下一页">→</button></div>
+                </div>
+            </section>
+
+            <section id="adminSection" class="panel admin-panel">
+                <div class="panel-head admin-head">
+                    <div><span class="eyebrow">LOCAL ADMIN</span><h2>系统管理</h2><p>仅允许从本机访问；敏感密钥不会回显</p></div>
+                    <span class="panel-badge" id="adminSaveState">尚未修改</span>
+                </div>
+                <div class="admin-tabs" id="adminTabs">
+                    <button class="active" data-admin-tab="config">参数配置</button>
+                    <button data-admin-tab="resume">简历管理</button>
+                    <button data-admin-tab="prompts">提示词管理</button>
+                </div>
+                <div class="admin-view active" data-admin-view="config">
+                    <div id="visualConfigForm" class="visual-config-form"></div>
+                    <div class="admin-actions"><span id="configNotice">常用参数保存后立即生效，数据库路径需要重启。</span><button id="saveConfig" class="primary-action">保存参数配置</button></div>
+                </div>
+                <div class="admin-view" data-admin-view="resume">
+                    <div class="editor-toolbar"><select id="resumeSelect" class="compact-select"></select><input id="newResumeName" type="text" placeholder="新建文件名，例如 resume.md"><button id="createResume">新建/切换</button><span id="resumeMeta"></span></div>
+                    <textarea id="resumeEditor" class="large-editor" spellcheck="false" placeholder="在这里编辑 Markdown 简历"></textarea>
+                    <div class="admin-actions"><span>保存后将作为定制招呼语和 AI 筛选使用的简历。</span><button id="saveResume" class="primary-action">保存简历</button></div>
+                </div>
+                <div class="admin-view" data-admin-view="prompts">
+                    <div class="editor-toolbar"><select id="promptSelect" class="compact-select"></select><span id="promptHint">提示词中的占位符必须保留</span></div>
+                    <textarea id="promptEditor" class="large-editor code-editor" spellcheck="false"></textarea>
+                    <div class="admin-actions"><span>保存前会校验花括号和必要占位符，修改立即用于后续请求。</span><button id="savePrompt" class="primary-action">保存当前提示词</button></div>
+                </div>
+            </section>
+
+            <footer>求职雷达统计面板 · 数据来自本地投递日志 · <span id="footerTime"></span></footer>
+        </main>
+    </div>
+
+    <div class="drawer-backdrop" id="drawerBackdrop"></div>
+    <aside class="detail-drawer" id="detailDrawer" aria-label="投递详情" aria-hidden="true">
+        <button class="drawer-close" id="drawerClose" aria-label="关闭">×</button>
+        <span class="eyebrow">APPLICATION DETAIL</span>
+        <h2 id="drawerCompany">—</h2>
+        <p id="drawerTitle">—</p>
+        <div class="drawer-status" id="drawerStatus">—</div>
+        <dl id="drawerDetails"></dl>
+        <div class="drawer-note"><strong>数据说明</strong><p>薪资为招聘页面展示区间；平均薪资按区间中位数估算，仅用于求职决策参考。</p></div>
+    </aside>
+
+    <div class="confirm-overlay" id="deleteConfirm" hidden>
+        <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="deleteConfirmTitle">
+            <span class="eyebrow">DELETE RECORDS</span>
+            <h2 id="deleteConfirmTitle">确认删除投递记录？</h2>
+            <p id="deleteConfirmMessage"></p>
+            <div class="confirm-warning" id="deleteConfirmWarning">已完成的普通投递删除后，将解除该公司与岗位的重复拦截；今日投递额度不会返还。</div>
+            <div class="confirm-actions">
+                <button id="deleteConfirmCancel">取消</button>
+                <button id="deleteConfirmSubmit" class="danger-action">确认删除</button>
+            </div>
+        </section>
+    </div>
+
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/dashboard/app.js" defer></script>
+</body>
+</html>

@@ -1,6 +1,35 @@
 import copy
 import json
 import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _load_env_file(path: Path) -> None:
+    """加载项目本地 .env，但不覆盖进程中显式设置的环境变量。"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+_load_env_file(ROOT / '.env')
 
 
 DEFAULT_USER_CONFIG = {
@@ -9,13 +38,36 @@ DEFAULT_USER_CONFIG = {
     'chat_model': 'qwen3:0.6b',
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
     'character': '简洁 直接 礼貌',
+    'llm': {
+        'enabled': False,
+        'api_base': '',
+        'api_key': '',
+        'model': 'gpt-4o-mini',
+        'timeout': 15,
+        'job_filter': False,
+        'max_concurrent_requests': 1,
+        'min_request_interval': 0.8,
+        'retry_count': 2,
+        'retry_base_delay': 1.0,
+        'retry_max_delay': 8.0,
+        'circuit_failure_threshold': 3,
+        'circuit_open_seconds': 60,
+        'cache_ttl_seconds': 1800,
+        'introduce_max_tokens': 1024,
+        'introduce_retry_max_tokens': 4096,
+        'filter_max_tokens': 128,
+        'verbose_errors': False,
+    },
+    'resume_content': '',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
     'backend': {
         'job_score_delay_base_ms': 4000,
         'job_score_delay_jitter_ms': 500,
+        'daily_greet_limit': 90,
+        'delivery_db_path': 'delivery_state.db',
     },
     'frontend': {
-        'serverHost': 'http://127.0.0.1:8000',
+        'serverHost': 'http://127.0.0.1:47999',
         'resumeIndex': 0,
         'thread': 50,
         'timestampTimeout': 3000,
@@ -230,6 +282,47 @@ DEFAULT_USER_CONFIG = {
 }
 
 
+def _unify_scoring_rules(scoring: dict, policy: dict | None = None) -> dict:
+    """Convert legacy score rules into deduction-only 1–5 star maps."""
+    if all(key in scoring for key in ('title_deduction_keywords', 'detail_deduction_keywords')):
+        return copy.deepcopy(scoring)
+    policy = policy or {}
+    strong_scale = float(policy.get('strong_title_scale', 0.82))
+    medium_scale = float(policy.get('medium_title_scale', 0.75))
+    strong_cap = int(policy.get('strong_title_cap', 78))
+    medium_cap = int(policy.get('medium_title_cap', 58))
+    positive = {}
+    for keyword, score in scoring.get('title_medium_keywords', {}).items():
+        positive[keyword] = min(round(score * medium_scale), medium_cap)
+    for keyword, score in scoring.get('title_strong_keywords', {}).items():
+        positive[keyword] = max(positive.get(keyword, 0), min(round(score * strong_scale), strong_cap))
+    negative = {keyword: -abs(score) for keyword, score in scoring.get('title_penalty_keywords', {}).items()}
+    for keyword, score in scoring.get('title_block_keywords', {}).items():
+        negative[keyword] = min(negative.get(keyword, 0), -abs(score))
+    if 'title_positive_keywords' in scoring:
+        positive.update(scoring.get('title_positive_keywords', {}))
+        negative.update({keyword: -abs(score) for keyword, score in scoring.get('title_negative_keywords', {}).items()})
+    title_keywords = {**positive, **negative}
+    detail_keywords = copy.deepcopy(scoring.get('detail_support_keywords', scoring.get('detail_positive_keywords', {})))
+    detail_keywords.update({keyword: -abs(score) for keyword, score in scoring.get('detail_negative_keywords', {}).items()})
+    if 'title_keywords' in scoring:
+        title_keywords = copy.deepcopy(scoring['title_keywords'])
+    if 'detail_keywords' in scoring:
+        detail_keywords = copy.deepcopy(scoring['detail_keywords'])
+    to_deductions = lambda values: {
+        keyword: max(1, min(5, int((abs(score) + 19) // 20)))
+        for keyword, score in values.items() if score < 0
+    }
+    return {
+        'title_deduction_keywords': to_deductions(title_keywords),
+        'detail_deduction_keywords': to_deductions(detail_keywords),
+    }
+
+
+DEFAULT_USER_CONFIG['scoring'] = _unify_scoring_rules(DEFAULT_USER_CONFIG['scoring'], DEFAULT_USER_CONFIG.get('scoring_policy'))
+DEFAULT_USER_CONFIG.pop('scoring_policy', None)
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     result = copy.deepcopy(base)
     for key, value in override.items():
@@ -253,9 +346,9 @@ def _apply_legacy_compat(config: dict, user_config: dict) -> dict:
 
 
 def _load_raw_user_config():
-    config_path = 'user_config.json'
-    if os.path.exists(config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
+    config_path = ROOT / 'user_config.json'
+    if config_path.exists():
+        with config_path.open('r', encoding='utf-8') as f:
             user_config = json.load(f)
         if isinstance(user_config, dict):
             return user_config
@@ -264,10 +357,28 @@ def _load_raw_user_config():
 
 def load_user_config():
     config = copy.deepcopy(DEFAULT_USER_CONFIG)
-    user_config = RAW_USER_CONFIG
+    user_config = _load_raw_user_config()
     if isinstance(user_config, dict) and user_config:
+        if isinstance(user_config.get('scoring'), dict):
+            user_config = copy.deepcopy(user_config)
+            user_config['scoring'] = _unify_scoring_rules(user_config['scoring'], user_config.get('scoring_policy'))
+            user_config.pop('scoring_policy', None)
         config = _deep_merge(config, user_config)
+        # Keyword maps are complete user-managed collections. They must replace
+        # defaults as a whole so that deleting a card does not make the default
+        # keyword reappear after reload or process restart.
+        user_scoring = user_config.get('scoring')
+        if isinstance(user_scoring, dict):
+            for group_name, keyword_scores in user_scoring.items():
+                if isinstance(keyword_scores, dict):
+                    config['scoring'][group_name] = copy.deepcopy(keyword_scores)
         config = _apply_legacy_compat(config, user_config)
+    env_api_base = os.environ.get('GOODJOB_LLM_API_BASE')
+    env_api_key = os.environ.get('GOODJOB_LLM_API_KEY')
+    if env_api_base is not None:
+        config['llm']['api_base'] = env_api_base.strip()
+    if env_api_key is not None:
+        config['llm']['api_key'] = env_api_key.strip()
     return config
 
 
@@ -286,17 +397,14 @@ class Config:
     job_score_delay_base_ms = USER_CONFIG['backend']['job_score_delay_base_ms']
     job_score_delay_jitter_ms = USER_CONFIG['backend']['job_score_delay_jitter_ms']
 
-    title_block_keywords = USER_CONFIG['scoring']['title_block_keywords']
-    title_penalty_keywords = USER_CONFIG['scoring']['title_penalty_keywords']
-    title_strong_keywords = USER_CONFIG['scoring']['title_strong_keywords']
-    title_medium_keywords = USER_CONFIG['scoring']['title_medium_keywords']
-    detail_infra_keywords = USER_CONFIG['scoring']['detail_infra_keywords']
-    detail_support_keywords = USER_CONFIG['scoring']['detail_support_keywords']
-    detail_negative_keywords = USER_CONFIG['scoring']['detail_negative_keywords']
+    title_deduction_keywords = USER_CONFIG['scoring']['title_deduction_keywords']
+    detail_deduction_keywords = USER_CONFIG['scoring']['detail_deduction_keywords']
 
     frontend = USER_CONFIG['frontend']
     backend = USER_CONFIG['backend']
     scoring = USER_CONFIG['scoring']
+    llm = USER_CONFIG['llm']
+    resume_content = USER_CONFIG['resume_content']
 
     @classmethod
     def get_default_introduce(cls):
@@ -310,3 +418,26 @@ class Config:
             'tags': cls.tags,
             'frontend': cls.frontend,
         }
+
+    @classmethod
+    def reload(cls):
+        """从磁盘重新加载配置，并一次性替换运行时类属性。"""
+        global RAW_USER_CONFIG, USER_CONFIG
+        RAW_USER_CONFIG = _load_raw_user_config()
+        USER_CONFIG = load_user_config()
+        cls.resume_name = USER_CONFIG['resume_name']
+        cls.think_model = USER_CONFIG['think_model']
+        cls.chat_model = USER_CONFIG['chat_model']
+        cls.introduce = USER_CONFIG['introduce']
+        cls.character = USER_CONFIG['character']
+        cls.tags = USER_CONFIG['tags']
+        cls.job_score_delay_base_ms = USER_CONFIG['backend']['job_score_delay_base_ms']
+        cls.job_score_delay_jitter_ms = USER_CONFIG['backend']['job_score_delay_jitter_ms']
+        cls.title_deduction_keywords = USER_CONFIG['scoring']['title_deduction_keywords']
+        cls.detail_deduction_keywords = USER_CONFIG['scoring']['detail_deduction_keywords']
+        cls.frontend = USER_CONFIG['frontend']
+        cls.backend = USER_CONFIG['backend']
+        cls.scoring = USER_CONFIG['scoring']
+        cls.llm = USER_CONFIG['llm']
+        cls.resume_content = USER_CONFIG['resume_content']
+        return copy.deepcopy(USER_CONFIG)

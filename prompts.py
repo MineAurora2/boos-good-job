@@ -168,3 +168,146 @@ NEEDWORKS = """根据聊天内容判断用户是否在向你要作品集
   输出：
     false
 """.strip()
+
+CUSTOM_INTRODUCE = """你负责生成一条可以直接发送给招聘者的首次招呼消息。
+
+<岗位信息>
+{job_info}
+</岗位信息>
+
+<求职者简历>
+{resume}
+</求职者简历>
+
+只使用简历中真实存在且与岗位直接相关的经历和技能，不得编造。使用求职者第一人称，语气自然、礼貌、真诚，根据实际情况突出相关工作、实习经验或应届生身份。岗位未说明工作时间时，可以在结尾简短询问；已经说明则不要重复询问。
+
+最终正文为80至130字、单段纯文本，不换行，不使用列表、标题、Markdown、引号或占位变量。在内部完成信息筛选和措辞检查，禁止输出分析、解释、思考步骤、写作计划或草稿说明。只输出可直接发送给招聘者的完整消息。
+""".strip()
+
+JOB_FILTER = """判断这份工作是否适合求职者。
+
+工作介绍：
+{job_info}
+
+求职者简历：
+{resume}
+
+只在以下情况返回false：
+- 岗位明确要求简历中没有的技术，并且没有提到简历中相关技术的
+- 岗位和不符合简历
+- 岗位是纯销售、纯客服、纯管理，与运维/网络/IT技术支持无关
+- 岗位明确写了大小周、单休、月休4天
+- 岗位要求3年以上工作经验
+
+其他情况都返回true。
+
+输出两行：
+第一行：true或false
+第二行：给出200字以内的理由
+""".strip()
+
+
+# 网页管理端只写入覆盖文件，不直接改动 Python 源码。
+import json as _json
+from pathlib import Path as _Path
+from string import Formatter as _Formatter
+
+
+PROMPT_KEYS = (
+    'INTRODUCE', 'TAGS', 'CHARACTER', 'JOBSOURCE', 'CHAT', 'INTERSET',
+    'NEEDRESUME', 'NEEDWORKS', 'CUSTOM_INTRODUCE', 'JOB_FILTER',
+)
+PROMPT_LABELS = {
+    'INTRODUCE': '自我介绍生成',
+    'TAGS': '岗位标签生成',
+    'CHARACTER': '性格分析',
+    'JOBSOURCE': '岗位匹配评分',
+    'CHAT': '聊天回复',
+    'INTERSET': '兴趣判断',
+    'NEEDRESUME': '简历需求判断',
+    'NEEDWORKS': '作品集需求判断',
+    'CUSTOM_INTRODUCE': '定制打招呼语',
+    'JOB_FILTER': 'AI 岗位筛选',
+}
+PROMPT_REQUIRED_FIELDS = {
+    'CHAT': {'resume', 'character'},
+    'CUSTOM_INTRODUCE': {'resume', 'job_info'},
+    'JOB_FILTER': {'resume', 'job_info'},
+}
+_DEFAULT_PROMPTS = {key: globals()[key] for key in PROMPT_KEYS}
+_OVERRIDE_PATH = _Path(__file__).resolve().parent / 'prompt_overrides.json'
+
+
+def validate_prompt(name: str, content: str) -> None:
+    if name not in PROMPT_KEYS:
+        raise ValueError(f'不支持的提示词: {name}')
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError('提示词内容不能为空')
+    if len(content) > 50000:
+        raise ValueError('单个提示词不能超过 50000 字符')
+    try:
+        fields = {
+            field_name.split('.')[0].split('[')[0]
+            for _, field_name, _, _ in _Formatter().parse(content)
+            if field_name
+        }
+    except ValueError as error:
+        raise ValueError(f'花括号格式错误: {error}') from error
+    required = PROMPT_REQUIRED_FIELDS.get(name, set())
+    missing = required - fields
+    if missing:
+        raise ValueError(f'缺少必要占位符: {", ".join(sorted(missing))}')
+    allowed = required
+    unknown = fields - allowed
+    if unknown:
+        raise ValueError(f'包含不支持的占位符: {", ".join(sorted(unknown))}')
+    samples = {field: f'<{field}>' for field in allowed}
+    try:
+        content.format(**samples)
+    except (KeyError, ValueError, IndexError) as error:
+        raise ValueError(f'提示词格式化失败: {error}') from error
+
+
+def _load_prompt_overrides() -> dict[str, str]:
+    if not _OVERRIDE_PATH.exists():
+        return {}
+    try:
+        data = _json.loads(_OVERRIDE_PATH.read_text(encoding='utf-8'))
+    except (_json.JSONDecodeError, OSError):
+        return {}
+    return {
+        key: value.strip()
+        for key, value in data.items()
+        if key in PROMPT_KEYS and isinstance(value, str) and value.strip()
+    }
+
+
+def reload_prompt_overrides() -> dict[str, str]:
+    effective = dict(_DEFAULT_PROMPTS)
+    effective.update(_load_prompt_overrides())
+    globals().update(effective)
+    return effective
+
+
+def get_prompt_values() -> dict[str, str]:
+    return {key: globals()[key] for key in PROMPT_KEYS}
+
+
+def save_prompt_values(values: dict[str, str]) -> dict[str, str]:
+    if not isinstance(values, dict):
+        raise ValueError('提示词数据必须是对象')
+    overrides = _load_prompt_overrides()
+    for name, content in values.items():
+        validate_prompt(name, content)
+        normalized = content.strip()
+        if normalized == _DEFAULT_PROMPTS[name]:
+            overrides.pop(name, None)
+        else:
+            overrides[name] = normalized
+    temp_path = _OVERRIDE_PATH.with_suffix('.json.tmp')
+    temp_path.write_text(_json.dumps(overrides, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    temp_path.replace(_OVERRIDE_PATH)
+    return reload_prompt_overrides()
+
+
+reload_prompt_overrides()

@@ -120,7 +120,7 @@
 
 ### 本次修改
 
-- 修改了 [core.py](C:/Users/czc/Desktop/czc_code/goodjob/core.py)：
+- 修改了 `core.py`：
   - 保留 `calcJobScore(job, resume)` 接口不变。
   - 去掉岗位匹配度里的大模型计算逻辑。
   - 新增基于文本分段的字段提取逻辑，从请求文本中取出“岗位标题”和“职位描述”。
@@ -129,7 +129,7 @@
     - 岗位标题命中关键词，返回 `100`
     - 职位描述命中关键词，返回 `100`
     - 否则返回 `0`
-- 修改了 [config.py](C:/Users/czc/Desktop/czc_code/goodjob/config.py)：
+- 修改了 `config.py`：
   - 新增 `title_keywords`
   - 新增 `detail_keywords`
   - 后续可以直接在这里维护匹配词库
@@ -161,7 +161,7 @@
   - 固定打招呼文案，不再依赖 `/get-introduce`
   - 关闭自动聊天回复逻辑
   - 这样可以把本地大模型依赖进一步压缩到接近零
-- 需要调整匹配范围时，优先改 [config.py](C:/Users/czc/Desktop/czc_code/goodjob/config.py) 中的关键词列表。
+- 需要调整匹配范围时，优先改 `config.py` 中的关键词列表。
 
 ### 本次验证
 
@@ -180,7 +180,7 @@
 
 ### 修改策略
 
-- 只改 [web_script.js](C:/Users/czc/Desktop/czc_code/goodjob/web_script.js)。
+- 只改 `web_script.js`。
 - 不新增 Boss 页面元素依赖，只复用现有的 `STARTCHAT` 按钮元素。
 - 采用两层保护：
   - 主动识别：详情页读取按钮文案，不是“立即沟通”就直接标记跳过
@@ -188,7 +188,7 @@
 
 ### 本次修改
 
-- 在 [web_script.js](C:/Users/czc/Desktop/czc_code/goodjob/web_script.js) 的 `OPTIONS` 中新增：
+- 在 `web_script.js` 的 `OPTIONS` 中新增：
   - `detailTimeout`
   - `greetTimeout`
 - 在详情页 `getJobInfo()` 中新增：
@@ -227,7 +227,7 @@
 
 ### 本次修改
 
-- 修改了 [core.py](C:/Users/czc/Desktop/czc_code/goodjob/core.py)：
+- 修改了 `core.py`：
   - 新增 `evaluateJobMatch(job)`，返回匹配明细
   - 明细包括：
     - `title`
@@ -235,7 +235,7 @@
     - `keyword`
     - `score`
 - `calcJobScore()` 改为复用 `evaluateJobMatch()` 的结果，保持原有返回分数逻辑不变
-- 修改了 [main.py](C:/Users/czc/Desktop/czc_code/goodjob/main.py)：
+- 修改了 `main.py`：
   - `/get-job-score` 在返回前会打印结构化终端日志
   - 日志内容包括：
     - 时间
@@ -287,7 +287,7 @@
 
 ### 代码变更
 
-- 修改了 [config.py](C:/Users/czc/Desktop/czc_code/goodjob/config.py)
+- 修改了 `config.py`
   - 删除原来的简单 `title_keywords` / `detail_keywords`
   - 新增：
     - `title_negative_keywords`
@@ -296,10 +296,10 @@
     - `detail_infra_keywords`
     - `detail_support_keywords`
     - `detail_negative_keywords`
-- 修改了 [core.py](C:/Users/czc/Desktop/czc_code/goodjob/core.py)
+- 修改了 `core.py`
   - `evaluateJobMatch()` 现在返回完整打分明细
   - `calcJobScore()` 改为返回这套规则算法的最终分数
-- 修改了 [main.py](C:/Users/czc/Desktop/czc_code/goodjob/main.py)
+- 修改了 `main.py`
   - 终端日志新增：
     - `title_score`
     - `detail_score`
@@ -405,7 +405,7 @@
 
 这在短时测试时合理，但对“挂机省时间”目标不合理。
 
-因此本次已修改原项目 [web_script.js](C:/Users/czc/Desktop/czc_code/goodjob/web_script.js)：
+因此本次已修改原项目 `web_script.js`：
 - 当连续空轮达到阈值时
 - **不再停止脚本**
 - 而是：
@@ -456,7 +456,7 @@
 - 两边共存
 
 曾复制出独立副本目录：
-- `C:\Users\czc\Desktop\czc_code\goodjob-chrome`
+- 原项目的浏览器配置目录
 
 并做了：
 - 后端端口切到 `8001`

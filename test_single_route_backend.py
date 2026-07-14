@@ -95,6 +95,11 @@ def install_fastapi_stub():
                 return fn
             return decorator
 
+        def put(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
     class HTTPException(Exception):
         pass
 
@@ -142,7 +147,7 @@ class SingleRouteBackendTests(unittest.TestCase):
         from config import Config
 
         job = '# 职位名称\nAI产品工程师\n\n# 薪资范围\n20-30K\n\n# 职位描述\n负责 Claude Code、Codex、智能体、工作流与代码生成调试部署'
-        result = evaluateSingleRouteDelivery(job)
+        result = asyncio.run(evaluateSingleRouteDelivery(job))
 
         self.assertEqual(result['introduce'], Config.introduce)
         self.assertEqual(result['resumeIndex'], Config.frontend.get('resumeIndex', 0))

@@ -2,8 +2,27 @@
   "resume_name": "resume.md",
   "think_model": "qwen3:0.6b",
   "chat_model": "qwen3:0.6b",
-  "introduce": "您好，我主要做 AI 产品工程方向，长期重度使用 Claude Code、Cursor、Codex 做工具与工作流，能独立跑通需求→提示词→代码生成→调试部署上线，Python 更熟。若方便，想请您看下我的简历。",
+  "introduce": "您好，我对这个岗位很感兴趣，相关方向有一定项目经验。若方便，想进一步了解岗位要求，也请您看一下我的简历。",
   "character": "简洁 直接 礼貌",
+  "llm": {
+    "enabled": false,
+    "api_base": "",
+    "api_key": "",
+    "model": "gpt-4o-mini",
+    "timeout": 30,
+    "job_filter": false,
+    "max_concurrent_requests": 1,
+    "min_request_interval": 0.8,
+    "retry_count": 2,
+    "retry_base_delay": 1.0,
+    "retry_max_delay": 8.0,
+    "circuit_failure_threshold": 3,
+    "circuit_open_seconds": 60,
+    "cache_ttl_seconds": 1800,
+    "introduce_max_tokens": 256,
+    "filter_max_tokens": 128,
+    "verbose_errors": false
+  },
   "tags": [
     "AI产品工程师",
     "AI应用工程师",
@@ -16,10 +35,12 @@
   ],
   "backend": {
     "job_score_delay_base_ms": 4000,
-    "job_score_delay_jitter_ms": 500
+    "job_score_delay_jitter_ms": 500,
+    "daily_greet_limit": 90,
+    "delivery_db_path": "delivery_state.db"
   },
   "frontend": {
-    "serverHost": "http://127.0.0.1:8000",
+    "serverHost": "http://127.0.0.1:47999",
     "resumeIndex": 0,
     "thread": 50,
     "timestampTimeout": 3000,
