@@ -7,6 +7,7 @@
 - failover     故障转移：固定用第一个可用接口，熔断/连续失败后才切到下一个。
 - round_robin  轮询：每次请求轮转到下一个可用接口，做负载分摊。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -74,6 +75,7 @@ class LLMProvider:
         }
 
     def is_usable(self) -> bool:
+        """判断接口必填项是否完整，且启用代理时已配置代理地址。"""
         return bool(
             self.api_base
             and self.api_key
@@ -86,6 +88,7 @@ class LLMProvider:
         return self.gateway.snapshot().get('state') != 'open'
 
     def snapshot(self) -> dict:
+        """合并接口基本信息与网关运行指标，供管理面板展示。"""
         gate = self.gateway.snapshot()
         return {
             'index': self.index,
@@ -105,6 +108,8 @@ class LLMProvider:
 
 
 class LLMManager:
+    """维护启用的接口列表，并按策略完成调度、故障转移和批量测活。"""
+
     def __init__(self):
         self._lock = threading.Lock()
         self._providers: list[LLMProvider] = []
@@ -117,6 +122,7 @@ class LLMManager:
     # ------------------------------------------------------------------ 配置
 
     def reload(self) -> None:
+        """从 .env 重建可用接口列表，并重置轮询起点。"""
         config = llm_env_store.load_llm_config()
         providers = []
         for item in config['providers']:
@@ -143,10 +149,12 @@ class LLMManager:
 
     @property
     def job_filter_enabled(self) -> bool:
+        """线程安全地返回当前是否启用 AI 职位二次筛选。"""
         with self._lock:
             return self._job_filter
 
     def available(self) -> bool:
+        """返回当前是否至少有一个配置完整且启用的接口。"""
         with self._lock:
             return bool(self._providers)
 
@@ -209,6 +217,7 @@ class LLMManager:
 
     @staticmethod
     async def _test_provider_config(target: dict, timeout: int) -> dict:
+        """用最小聊天请求测试一份已解析配置，并返回延迟和连接方式。"""
         if not (target['api_base'] and target['api_key'] and target['model']):
             return {'ok': False, 'error': '接口地址、模型或 API Key 未配置完整'}
         if target.get('proxy_enabled') and not target.get('proxy_url'):
@@ -226,9 +235,10 @@ class LLMManager:
             'temperature': 0,
         }
         started = time.monotonic()
+        # 与正式请求保持一致：开关关闭时传 None，且禁用环境代理，确保真正直连。
         proxy = target.get('proxy_url') if target.get('proxy_enabled') else None
         try:
-            async with httpx.AsyncClient(timeout=min(30, timeout), proxy=proxy) as client:
+            async with httpx.AsyncClient(timeout=min(30, timeout), proxy=proxy, trust_env=False) as client:
                 response = await client.post(url, json=body, headers=headers)
             latency = round((time.monotonic() - started) * 1000)
             if response.status_code >= 400:
@@ -250,11 +260,12 @@ class LLMManager:
                 'model': model,
                 'viaProxy': bool(proxy),
             }
-        except (httpx.HTTPError, ValueError) as error:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, ImportError) as error:
             latency = round((time.monotonic() - started) * 1000)
             return {'ok': False, 'latencyMs': latency, 'error': f'{type(error).__name__}: {error}'}
 
     async def test_all(self) -> list[dict]:
+        """并发测试所有已保存接口，单个异常不会中断其余结果收集。"""
         config = llm_env_store.load_llm_config()
         results = await asyncio.gather(
             *(self.test_provider(item['index']) for item in config['providers']),
@@ -273,12 +284,14 @@ class LLMManager:
     # ------------------------------------------------------------------ 快照
 
     def reset_circuits(self, clear_cache: bool = False) -> None:
+        """重置所有 provider 的熔断状态，可选清除各自缓存。"""
         with self._lock:
             providers = list(self._providers)
         for provider in providers:
             provider.gateway.reset_circuit(clear_cache=clear_cache)
 
     def snapshot(self) -> dict:
+        """汇总管理器配置和每个接口的网关指标，供面板展示。"""
         with self._lock:
             providers = list(self._providers)
             strategy = self._strategy

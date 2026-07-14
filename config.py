@@ -1,3 +1,9 @@
+"""项目运行配置的默认值、兼容迁移和热加载入口。
+
+配置以本模块的默认值为基础，再由 ``user_config.json`` 覆盖；`.env` 只补充
+当前进程尚未显式设置的环境变量，避免覆盖部署环境传入的敏感配置。
+"""
+
 import copy
 import json
 import os
@@ -32,10 +38,11 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(ROOT / '.env')
 
 
+# 这里定义可直接启动项目的完整配置；网页保存的 user_config.json 只需包含覆盖项。
 DEFAULT_USER_CONFIG = {
+    'resume_name': 'resume.md',
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
     'character': '简洁 直接 礼貌',
-    'resume_content': '',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
     'backend': {
         'job_score_delay_base_ms': 4000,
@@ -260,7 +267,7 @@ DEFAULT_USER_CONFIG = {
 
 
 def _unify_scoring_rules(scoring: dict, policy: dict | None = None) -> dict:
-    """Convert legacy score rules into deduction-only 1–5 star maps."""
+    """把旧版百分制评分规则转换为当前 1 至 5 星的纯扣分规则。"""
     if all(key in scoring for key in ('title_deduction_keywords', 'detail_deduction_keywords')):
         return copy.deepcopy(scoring)
     policy = policy or {}
@@ -301,6 +308,7 @@ DEFAULT_USER_CONFIG.pop('scoring_policy', None)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并配置字典，忽略值为 ``None`` 的覆盖项。"""
     result = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
@@ -311,6 +319,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _apply_legacy_compat(config: dict, user_config: dict) -> dict:
+    """将仍受支持的旧版顶层字段迁移到新的分组结构。"""
     legacy_top_level_to_nested = {
         'job_score_delay_base_ms': ('backend', 'job_score_delay_base_ms'),
         'job_score_delay_jitter_ms': ('backend', 'job_score_delay_jitter_ms'),
@@ -323,6 +332,7 @@ def _apply_legacy_compat(config: dict, user_config: dict) -> dict:
 
 
 def _load_raw_user_config():
+    """读取未经默认值合并的用户配置，不存在时返回空字典。"""
     config_path = ROOT / 'user_config.json'
     if config_path.exists():
         with config_path.open('r', encoding='utf-8') as f:
@@ -333,17 +343,18 @@ def _load_raw_user_config():
 
 
 def load_user_config():
+    """加载、迁移并合并用户配置，返回可直接使用的完整配置。"""
     config = copy.deepcopy(DEFAULT_USER_CONFIG)
     user_config = _load_raw_user_config()
     if isinstance(user_config, dict) and user_config:
+        user_config = copy.deepcopy(user_config)
+        # 旧版内联简历已停用，简历内容统一由 resumes/ 目录和 resume_name 管理。
+        user_config.pop('resume_content', None)
         if isinstance(user_config.get('scoring'), dict):
-            user_config = copy.deepcopy(user_config)
             user_config['scoring'] = _unify_scoring_rules(user_config['scoring'], user_config.get('scoring_policy'))
             user_config.pop('scoring_policy', None)
         config = _deep_merge(config, user_config)
-        # Keyword maps are complete user-managed collections. They must replace
-        # defaults as a whole so that deleting a card does not make the default
-        # keyword reappear after reload or process restart.
+        # 关键词集合由用户完整管理，必须整组替换；否则删除的卡片会在重载后被默认值补回。
         user_scoring = user_config.get('scoring')
         if isinstance(user_scoring, dict):
             for group_name, keyword_scores in user_scoring.items():
@@ -358,6 +369,8 @@ USER_CONFIG = load_user_config()
 
 
 class Config:
+    """保存当前生效配置的进程级只读视图，并提供热加载能力。"""
+    resume_name = USER_CONFIG['resume_name']
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
@@ -371,14 +384,15 @@ class Config:
     frontend = USER_CONFIG['frontend']
     backend = USER_CONFIG['backend']
     scoring = USER_CONFIG['scoring']
-    resume_content = USER_CONFIG['resume_content']
 
     @classmethod
     def get_default_introduce(cls):
+        """返回 LLM 不可用时使用的固定招呼语。"""
         return cls.introduce
 
     @classmethod
     def get_client_config(cls):
+        """返回允许浏览器脚本读取的运行配置子集。"""
         return {
             'introduce': cls.get_default_introduce(),
             'character': cls.character,
@@ -392,6 +406,7 @@ class Config:
         global RAW_USER_CONFIG, USER_CONFIG
         RAW_USER_CONFIG = _load_raw_user_config()
         USER_CONFIG = load_user_config()
+        cls.resume_name = USER_CONFIG['resume_name']
         cls.introduce = USER_CONFIG['introduce']
         cls.character = USER_CONFIG['character']
         cls.tags = USER_CONFIG['tags']
@@ -402,5 +417,4 @@ class Config:
         cls.frontend = USER_CONFIG['frontend']
         cls.backend = USER_CONFIG['backend']
         cls.scoring = USER_CONFIG['scoring']
-        cls.resume_content = USER_CONFIG['resume_content']
         return copy.deepcopy(USER_CONFIG)

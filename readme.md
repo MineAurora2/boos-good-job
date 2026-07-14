@@ -42,7 +42,7 @@
 
 ```mermaid
 flowchart TD
-    Start(["脚本启动"]) --> Cfg["读取配置：tags 关键词 / thread 阈值 / resumeIndex"]
+    Start(["脚本启动"]) --> Cfg["读取配置：tags 关键词 / thread 阈值 / BOSS 在线简历序号 resumeIndex"]
     Cfg --> Loop{"遍历搜索关键词的岗位列表"}
     Loop -->|取出一个岗位| Extract["提取 公司 / 岗位 / 薪资 / 详情"]
     Extract --> Claim["POST /delivery/claim 原子领取投递权"]
@@ -122,7 +122,9 @@ sequenceDiagram
 
 - `user_config.example.json`：用户配置模板
 
-- `resume-example.md`：简历模板
+- `resumes/`：网页管理并提供给 LLM 使用的真实简历目录
+
+- `resume-example.md`：简历模板，仅用于创建真实简历，不在网页管理页展示
 
 - `PROJECT_MEMORY.md`：长期项目背景与关键决策
 
@@ -132,7 +134,7 @@ sequenceDiagram
 
 **配置文件**
 
-- `user_config.json`、`resume.md`、日志文件等本地文件默认不进入仓库
+- `user_config.json`、`resumes/` 中的真实简历、日志文件等本地文件默认不进入仓库
 - `user_config.example.json` 是公开模板，不建议直接提交真实配置
 - `.env.example` 是公开的环境变量模板，真实 `.env` 只保存在本机
 
@@ -150,12 +152,19 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-然后在 `.env` 中填写自己的服务地址和 API Key：
+推荐启动服务后，在网页面板的「系统管理 → 接口管理」中配置；也可以直接编辑 `.env`：
 
 ```env
-GOODJOB_LLM_API_BASE=https://your-provider.example/v1
-GOODJOB_LLM_API_KEY=your-api-key
+GOODJOB_LLM_1_NAME=主接口
+GOODJOB_LLM_1_API_BASE=https://your-provider.example/v1
+GOODJOB_LLM_1_API_KEY=your-api-key
+GOODJOB_LLM_1_MODEL=gpt-4.1-mini
+GOODJOB_LLM_1_PROXY_URL=http://127.0.0.1:7890
+GOODJOB_LLM_1_PROXY_ENABLED=true
+GOODJOB_LLM_1_ENABLED=true
 ```
+
+代理按接口独立配置，当前支持 `http://` 和 `https://`。关闭代理开关后，该接口强制直连，不读取系统代理环境变量。代理地址含用户名和密码时，网页只显示脱敏值。
 
 ### 3. 准备用户配置
 
@@ -166,18 +175,19 @@ cp user_config.example.json user_config.json
 首次最少只需要改这些字段：
 - `introduce`：固定打招呼语
 - `tags`：搜索关键词列表
-- `frontend.resumeIndex`：发第几份简历，从 0 开始
+- `frontend.resumeIndex`：BOSS 页面发送在线简历时使用的序号，从 0 开始；与 LLM 读取的本地简历无关
 - `frontend.thread`：投递阈值
 
 ### 4. （可选）准备简历文件
 
 ```bash
-cp resume-example.md resume.md
+cp resume-example.md resumes/resume.md
 ```
 
 说明：
-- 当前自动投递主链并不依赖 `resume.md` 做岗位打分
-- 它主要用于你自己管理简历内容，或保留给遗留接口扩展使用
+- `resumes/` 只存放真实简历，网页简历管理页可在该目录中选择、新建和编辑 Markdown/TXT 文件
+- 网页设置的当前简历会作为 LLM 生成定制招呼语和执行 AI 岗位筛选时的默认简历
+- `resume-example.md` 是项目模板，不会出现在简历管理页，也不会作为 LLM 的简历输入
 
 ### 5. 启动后端
 
@@ -193,7 +203,7 @@ http://127.0.0.1:47999/dashboard
 
 统计面板同时提供：
 - 本机配置管理：编辑 `user_config.json` 常用参数与高级评分规则
-- 简历管理：选择、新建和编辑项目内的 Markdown/TXT 简历
+- 简历管理：选择、新建和编辑 `resumes/` 中的 Markdown/TXT 简历，并设置 LLM 使用的当前简历
 - 提示词管理：通过 `prompt_overrides.json` 安全覆盖固定提示词，不直接改 Python 源码
 - 实时监控：展示脚本版本、在线实例、当前阶段、计数器和实时日志
 - 高级统计：真实中国省级地图、行业 TOP 10，以及城市、经验、学历、薪资上下限和关键词筛选
@@ -206,11 +216,12 @@ http://127.0.0.1:47999/dashboard
 
 1. 复制 `.env.example` 为 `.env`，按需配置外部 LLM
 2. 复制 `user_config.example.json` 为 `user_config.json`
-3. 修改：
+3. 复制 `resume-example.md` 为 `resumes/resume.md`
+4. 修改：
    - `introduce`
    - `tags`
-   - `frontend.resumeIndex`
+   - `frontend.resumeIndex`（BOSS 在线简历序号）
    - `frontend.thread`
-4. 启动后端 `python main.py`
-5. 浏览器装入 `web_script.js`
-6. 打开 Boss 直聘页面测试
+5. 启动后端 `python main.py`
+6. 浏览器装入 `web_script.js`
+7. 打开 Boss 直聘页面测试

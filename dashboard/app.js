@@ -30,6 +30,8 @@ const state = {
     columnWidths: {},
     density: 'default',
     chinaGeo: null,
+    cityGeo: null,
+    cityNameIndex: null,
     runtime: null,
     runtimeCursor: 0,
     liveEvents: [],
@@ -43,11 +45,14 @@ const state = {
     control: null,
     controlOnline: false,
     llm: null,
+    llmDirty: false,
+    configDirty: false,
 };
 
 const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)', 'var(--red)', 'var(--blue)'];
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
 const TODAY_TARGET_FALLBACK = 20;
+const GEOMETRY_PATH_CACHE = new WeakMap();
 
 function dailyTarget() {
     const quotas = state.control?.quotas;
@@ -161,10 +166,42 @@ function recordCity(record) {
     return location.split(/[·\s]/)[0].replace(/市$/, '') || '未知城市';
 }
 
+function normalizeCityName(value) {
+    const text = String(value || '').replace(/\s+/g, '');
+    const direct = { 北京市: '北京', 上海市: '上海', 天津市: '天津', 重庆市: '重庆', 香港特别行政区: '香港', 澳门特别行政区: '澳门', 台湾省: '台湾' };
+    return direct[text] || text.replace(/特别行政区$|(?:市|地区|盟|自治州)$/g, '') || '未知城市';
+}
+
+function buildCityNameIndex(features) {
+    const byAlias = new Map();
+    const addAlias = (alias, city) => { const clean = String(alias || '').replace(/\s+/g, ''); if (clean && clean !== '未知城市') byAlias.set(clean, city); };
+    features.forEach((feature) => {
+        const raw = feature.properties?.name || '';
+        const city = normalizeCityName(raw);
+        addAlias(raw, city); addAlias(city, city);
+        Object.keys(CITY_COORDINATES).filter((name) => raw.startsWith(name)).forEach((name) => addAlias(name, city));
+    });
+    return {
+        byAlias,
+        aliases: [...byAlias.entries()].sort((a, b) => b[0].length - a[0].length || a[0].localeCompare(b[0], 'zh-CN')),
+    };
+}
+
 function mapCityName(record) {
+    const values = [record.city, record.location, recordCity(record)].filter(Boolean).map((value) => String(value).replace(/\s+/g, ''));
+    const index = state.cityNameIndex;
+    if (index) {
+        for (const value of values) {
+            const normalized = normalizeCityName(value);
+            if (index.byAlias.has(value)) return index.byAlias.get(value);
+            if (index.byAlias.has(normalized)) return index.byAlias.get(normalized);
+            const match = index.aliases.find(([alias]) => value.includes(alias));
+            if (match) return match[1];
+        }
+    }
     const city = recordCity(record).replace(/市$/, '');
     if (CITY_COORDINATES[city]) return city;
-    return Object.keys(CITY_COORDINATES).find((name) => city.startsWith(name) || String(record.location || '').startsWith(name)) || '未知城市';
+    return Object.keys(CITY_COORDINATES).find((name) => city.startsWith(name) || String(record.location || '').includes(name)) || '未知城市';
 }
 
 function getRangeRecords() {
@@ -363,7 +400,8 @@ function cityStats(records) {
     const stats = new Map(); let unknown = 0;
     records.forEach((record) => {
         const city = mapCityName(record);
-        if (city === '未知城市' || !CITY_COORDINATES[city]) { unknown += 1; return; }
+        const mappedBoundary = state.cityNameIndex?.byAlias.has(city);
+        if (city === '未知城市' || (!mappedBoundary && !CITY_COORDINATES[city])) { unknown += 1; return; }
         const item = stats.get(city) || { count: 0, salaries: [] };
         item.count += 1;
         if (Number.isFinite(record.salaryK)) item.salaries.push(record.salaryK);
@@ -390,11 +428,102 @@ function projectCoordinate([longitude, latitude]) {
 }
 
 function geometryPath(geometry) {
+    if (GEOMETRY_PATH_CACHE.has(geometry)) return GEOMETRY_PATH_CACHE.get(geometry);
     const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
-    return polygons.map((polygon) => polygon.map((ring) => ring.map((coordinate, index) => {
+    const path = polygons.map((polygon) => polygon.map((ring) => ring.map((coordinate, index) => {
         const [x, y] = projectCoordinate(coordinate);
         return `${index ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ') + ' Z').join(' ')).join(' ');
+    GEOMETRY_PATH_CACHE.set(geometry, path);
+    return path;
+}
+
+function geometryBounds(geometry) {
+    const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
+    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    polygons.forEach((polygon) => polygon.forEach((ring) => ring.forEach((coordinate) => {
+        const [x, y] = projectCoordinate(coordinate);
+        bounds.minX = Math.min(bounds.minX, x); bounds.maxX = Math.max(bounds.maxX, x);
+        bounds.minY = Math.min(bounds.minY, y); bounds.maxY = Math.max(bounds.maxY, y);
+    })));
+    return Number.isFinite(bounds.minX) ? bounds : null;
+}
+
+function clampValue(value, minimum, maximum) { return Math.max(minimum, Math.min(maximum, value)); }
+
+function percentile(values, ratio) {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))];
+}
+
+function boxesOverlap(left, right, gap = 1.2) {
+    return left.x < right.x + right.width + gap && left.x + left.width + gap > right.x && left.y < right.y + right.height + gap && left.y + left.height + gap > right.y;
+}
+
+function markerBox(marker, dx, dy, sizeScale = 1) {
+    const fontSize = marker.fontSize * sizeScale;
+    const height = marker.height * sizeScale;
+    const width = Math.max(height, marker.display.length * fontSize * .62 + 5 * sizeScale);
+    return {
+        x: marker.x + dx - width / 2,
+        y: marker.y + dy - height / 2,
+        width, height, dx, dy, fontSize,
+        radius: Math.max(2.2, marker.anchorRadius * sizeScale),
+    };
+}
+
+function layoutCityMarkers(markers) {
+    const ordered = [...markers].sort((left, right) => Number(right.selected) - Number(left.selected) || right.value - left.value || left.city.localeCompare(right.city, 'zh-CN'));
+    const placed = [];
+    const directions = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [1, 1], [-1, 1], [-1, -1]];
+    ordered.forEach((marker) => {
+        const candidates = [{ dx: 0, dy: 0 }];
+        [9, 15, 23, 33, 45, 56].forEach((distance) => directions.forEach(([x, y]) => candidates.push({ dx: x * distance, dy: y * distance })));
+        let chosen = null; let fallback = null;
+        for (const sizeScale of [1, .88, .76, .66]) {
+            for (const candidate of candidates) {
+                const box = markerBox(marker, candidate.dx, candidate.dy, sizeScale);
+                if (box.x < 4 || box.y < 4 || box.x + box.width > 666 || box.y + box.height > 396) continue;
+                const collisions = placed.filter((item) => boxesOverlap(box, item));
+                const coveredAnchors = markers.filter((item) => item !== marker && item.x > box.x - 1.5 && item.x < box.x + box.width + 1.5 && item.y > box.y - 1.5 && item.y < box.y + box.height + 1.5);
+                const overlapArea = collisions.reduce((sum, item) => {
+                    const width = Math.max(0, Math.min(box.x + box.width, item.x + item.width) - Math.max(box.x, item.x));
+                    const height = Math.max(0, Math.min(box.y + box.height, item.y + item.height) - Math.max(box.y, item.y));
+                    return sum + width * height;
+                }, 0);
+                const penalty = collisions.length * 500 + coveredAnchors.length * 800 + overlapArea * 20 + Math.hypot(candidate.dx, candidate.dy);
+                if (!fallback || penalty < fallback.penalty) fallback = { ...box, penalty };
+                if (!collisions.length && !coveredAnchors.length) { chosen = box; break; }
+            }
+            if (chosen) break;
+        }
+        if (!chosen) {
+            let nearestOpen = null;
+            for (let centerY = 10; centerY <= 390; centerY += 10) {
+                for (let centerX = 10; centerX <= 660; centerX += 10) {
+                    const box = markerBox(marker, centerX - marker.x, centerY - marker.y, .66);
+                    if (box.x < 4 || box.y < 4 || box.x + box.width > 666 || box.y + box.height > 396 || placed.some((item) => boxesOverlap(box, item))) continue;
+                    const coversAnchor = markers.some((item) => item !== marker && item.x > box.x - 1.5 && item.x < box.x + box.width + 1.5 && item.y > box.y - 1.5 && item.y < box.y + box.height + 1.5);
+                    if (coversAnchor) continue;
+                    const distance = Math.hypot(box.dx, box.dy);
+                    if (!nearestOpen || distance < nearestOpen.distance) nearestOpen = { ...box, distance };
+                }
+            }
+            chosen = nearestOpen;
+        }
+        if (!chosen) {
+            for (let centerY = 10; centerY <= 390 && !chosen; centerY += 10) {
+                for (let centerX = 10; centerX <= 660; centerX += 10) {
+                    const box = markerBox(marker, centerX - marker.x, centerY - marker.y, .66);
+                    if (box.x >= 4 && box.y >= 4 && box.x + box.width <= 666 && box.y + box.height <= 396 && !placed.some((item) => boxesOverlap(box, item))) { chosen = box; break; }
+                }
+            }
+        }
+        marker.badge = chosen || fallback || markerBox(marker, 0, 0, .66);
+        placed.push(marker.badge);
+    });
+    return ordered;
 }
 
 async function ensureChinaGeo() {
@@ -405,12 +534,39 @@ async function ensureChinaGeo() {
     return state.chinaGeo;
 }
 
+async function ensureCityGeo() {
+    if (state.cityGeo) return state.cityGeo;
+    const response = await fetch('/dashboard/china-cities.json', { cache: 'force-cache' });
+    if (!response.ok) throw new Error('地级市地图数据加载失败');
+    state.cityGeo = await response.json();
+    state.cityNameIndex = buildCityNameIndex(state.cityGeo.features || []);
+    return state.cityGeo;
+}
+
+function renderSpecialRegions(features, stats, metric, max, visible) {
+    const container = $('#mapSpecialRegions');
+    container.hidden = !visible;
+    if (!visible) { container.replaceChildren(); return; }
+    const cards = ['香港', '澳门'].map((name) => {
+        const feature = features.find((item) => normalizeProvince(item.properties?.name) === name);
+        if (!feature) return '';
+        const bounds = geometryBounds(feature.geometry); if (!bounds) return '';
+        const width = Math.max(.1, bounds.maxX - bounds.minX), height = Math.max(.1, bounds.maxY - bounds.minY), padding = Math.max(width, height) * .2;
+        const item = stats.get(name) || { count: 0, salaries: [] }; const value = mapMetricValue(item, metric);
+        const display = metric === 'salary' ? (value ? `${value.toFixed(0)}K` : '—') : `${item.count}份`;
+        const title = metric === 'salary' ? `${name}平均薪资 ${value ? value.toFixed(1) + 'K' : '暂无数据'}` : `${name}${item.count}份投递`;
+        return `<button type="button" class="map-special-region ${state.mapProvince === name ? 'is-active' : ''}" data-province="${name}" aria-pressed="${state.mapProvince === name}" aria-label="${title}，点击筛选"><svg viewBox="${(bounds.minX - padding).toFixed(2)} ${(bounds.minY - padding).toFixed(2)} ${(width + padding * 2).toFixed(2)} ${(height + padding * 2).toFixed(2)}" aria-hidden="true"><path d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path></svg><span>${name}</span><strong>${display}</strong></button>`;
+    }).join('');
+    container.innerHTML = `<small>港澳放大</small><div>${cards}</div>`;
+}
+
 async function renderMap(records) {
     const container = $('#chinaMap');
     try {
-        const geo = await ensureChinaGeo();
         const metric = $('#mapMetric').value;
         const level = state.mapLevel === 'city' ? 'city' : 'province';
+        const geo = await ensureChinaGeo();
+        const cityGeo = level === 'city' ? await ensureCityGeo() : null;
         const { stats, unknown } = level === 'city' ? cityStats(records) : provinceStats(records);
         const values = [...stats.values()].map((item) => mapMetricValue(item, metric));
         const max = Math.max(...values, 0);
@@ -425,23 +581,49 @@ async function renderMap(records) {
             }).join('');
             labels = features.map((feature) => {
                 const name = normalizeProvince(feature.properties.name), center = feature.properties.centroid || feature.properties.center;
-                if (!center) return '';
+                if (!center || name === '香港' || name === '澳门') return '';
                 const [x, y] = projectCoordinate(center), hot = stats.get(name)?.count;
                 return `<text class="geo-label ${hot ? 'hot' : ''}" x="${x}" y="${y}">${name.length > 3 ? name.slice(0, 3) : name}</text>`;
             }).join('');
+            renderSpecialRegions(features, stats, metric, max, true);
         } else {
-            paths = features.map((feature) => `<path class="geo-province city-layer" d="${geometryPath(feature.geometry)}" fill-rule="evenodd"></path>`).join('');
-            heatLayer = [...stats.entries()]
-                .sort((a, b) => mapMetricValue(a[1], metric) - mapMetricValue(b[1], metric))
-                .map(([city, item]) => {
-                    const value = mapMetricValue(item, metric), ratio = max ? value / max : 0;
-                    const [x, y] = projectCoordinate(CITY_COORDINATES[city]);
-                    const radius = 4.2 + Math.sqrt(ratio) * 8.8;
-                    const title = metric === 'salary' ? `${city}：平均 ${value.toFixed(1)}K，${item.count} 份投递` : `${city}：${item.count} 份投递`;
-                    const displayValue = metric === 'salary' ? value.toFixed(0) : item.count;
-                    return `<g class="city-heat-point ${state.mapCity === city ? 'is-active' : ''}" data-city="${escapeHtml(city)}"><circle class="city-heat-halo" cx="${x}" cy="${y}" r="${(radius + 5).toFixed(1)}"></circle><circle class="city-heat-core" cx="${x}" cy="${y}" r="${radius.toFixed(1)}" fill="${mapColor(value, max)}"><title>${title}，点击筛选</title></circle><text class="city-heat-value" x="${x}" y="${(y + 1.9).toFixed(1)}">${displayValue}</text><text class="city-heat-label ${ratio > .45 ? 'hot' : ''}" x="${x}" y="${(y + radius + 8).toFixed(1)}">${city}</text></g>`;
-                }).join('');
-            if (!heatLayer) heatLayer = '<text class="city-unknown-note" x="335" y="205" text-anchor="middle">暂无可定位的地级市投递数据</text>';
+            renderSpecialRegions(features, stats, metric, max, false);
+            const cityFeatures = (cityGeo?.features || []).filter((feature) => feature.properties?.name);
+            const cityFeatureMap = new Map(cityFeatures.map((feature) => [normalizeCityName(feature.properties.name), feature]));
+            const cityBoundaries = cityFeatures.map((feature) => {
+                const city = normalizeCityName(feature.properties.name), item = stats.get(city) || { count: 0, salaries: [] };
+                const value = mapMetricValue(item, metric), hasData = item.count > 0;
+                const title = metric === 'salary' ? `${city}：${value ? `平均 ${value.toFixed(1)}K` : '暂无薪资'}，${item.count} 份投递` : `${city}：${item.count} 份投递`;
+                return `<path class="geo-city-boundary ${hasData ? 'has-data' : ''} ${state.mapCity === city ? 'is-active' : ''}" ${hasData ? `data-city="${escapeHtml(city)}" tabindex="0" role="button"` : ''} d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"><title>${title}${hasData ? '，点击筛选' : ''}</title></path>`;
+            }).join('');
+            const provinceOutlines = features.map((feature) => `<path class="geo-province-outline" d="${geometryPath(feature.geometry)}" fill-rule="evenodd"></path>`).join('');
+            paths = `<g class="city-boundary-layer">${cityBoundaries}</g><g class="province-outline-layer">${provinceOutlines}</g>`;
+
+            const positiveValues = values.filter((value) => value > 0), cap = percentile(positiveValues, .95) || max || 1;
+            const markers = [...stats.entries()].map(([city, item]) => {
+                const feature = cityFeatureMap.get(city);
+                const center = feature?.properties?.centroid || feature?.properties?.center || CITY_COORDINATES[city];
+                if (!center || !item.count) return null;
+                const value = mapMetricValue(item, metric), intensity = clampValue(Math.log1p(Math.min(value || item.count, cap)) / Math.log1p(cap), 0, 1);
+                const [x, y] = projectCoordinate(center), display = metric === 'salary' ? (value ? `${Math.round(value)}K` : '—') : String(item.count);
+                return {
+                    city, item, value, x, y, display, selected: state.mapCity === city,
+                    fontSize: 4.15 + Math.sqrt(intensity) * 1.65,
+                    height: 8 + Math.sqrt(intensity) * 2.8,
+                    anchorRadius: 2.3 + Math.sqrt(intensity) * 1.8,
+                    color: mapColor(value, max),
+                };
+            }).filter(Boolean);
+            const laidOut = layoutCityMarkers(markers), inverseScale = (1 / state.mapView.scale).toFixed(4);
+            const connectors = laidOut.filter((marker) => Math.hypot(marker.badge.dx, marker.badge.dy) > 2).map((marker) => `<g transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><line class="city-marker-connector" x1="0" y1="0" x2="${marker.badge.dx.toFixed(2)}" y2="${marker.badge.dy.toFixed(2)}"></line></g></g>`).join('');
+            const anchors = laidOut.map((marker) => `<g transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><circle class="city-marker-anchor ${marker.selected ? 'is-active' : ''}" r="${marker.badge.radius.toFixed(2)}" fill="${marker.color}"></circle></g></g>`).join('');
+            const badges = laidOut.map((marker) => {
+                const badge = marker.badge;
+                const title = metric === 'salary' ? `${marker.city}：平均 ${marker.value ? marker.value.toFixed(1) + 'K' : '暂无薪资'}，${marker.item.count} 份投递` : `${marker.city}：${marker.item.count} 份投递`;
+                return `<g class="city-count-marker ${marker.selected ? 'is-active' : ''}" data-city="${escapeHtml(marker.city)}" tabindex="0" role="button" aria-label="${title}，点击筛选" transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><g transform="translate(${badge.dx.toFixed(2)} ${badge.dy.toFixed(2)})"><rect x="${(-badge.width / 2).toFixed(2)}" y="${(-badge.height / 2).toFixed(2)}" width="${badge.width.toFixed(2)}" height="${badge.height.toFixed(2)}" rx="${(badge.height / 2).toFixed(2)}" fill="${marker.color}"></rect><text x="0" y="${(badge.fontSize * .34).toFixed(2)}" style="font-size:${badge.fontSize.toFixed(2)}px">${escapeHtml(marker.display)}</text><title>${title}，点击筛选</title></g></g></g>`;
+            }).join('');
+            heatLayer = `<g class="city-connector-layer">${connectors}</g><g class="city-anchor-layer">${anchors}</g><g class="city-badge-layer">${badges}</g>`;
+            if (!markers.length) heatLayer += '<text class="city-unknown-note" x="335" y="205" text-anchor="middle">暂无可定位的地级市投递数据</text>';
         }
         const { scale, x, y } = state.mapView;
         container.innerHTML = `<svg viewBox="0 0 670 400" preserveAspectRatio="xMidYMid meet"><g class="map-viewport" transform="translate(${x} ${y}) scale(${scale})">${paths}${labels}${heatLayer}</g></svg>`;
@@ -449,9 +631,10 @@ async function renderMap(records) {
         const known = Math.max(0, records.length - unknown);
         $('#knownLocationRate').textContent = `已识别 ${records.length ? Math.round(known / records.length * 100) : 0}%`;
         $('#locationRankingTitle').textContent = level === 'city' ? '热门地级市' : '热门省份';
-        $('#mapInteractionHint').textContent = level === 'city' ? '地级市热力 · 点击城市筛选 · 滚轮缩放 · 按住拖动' : '省份热力 · 点击筛选 · 滚轮缩放 · 按住拖动';
-        $('#mapScaleMin').textContent = metric === 'salary' ? '低' : '少';
-        $('#mapScaleMax').textContent = metric === 'salary' ? '高' : '多';
+        $('#mapInteractionHint').textContent = level === 'city' ? '地级市边界热力 · 数量自动避让 · 点击筛选 · 缩放查看' : '省份热力 · 港澳放大可点击 · 缩放查看';
+        const nonzeroValues = values.filter((value) => value > 0), minimum = nonzeroValues.length ? Math.min(...nonzeroValues) : 0;
+        $('#mapScaleMin').textContent = metric === 'salary' ? `${minimum ? minimum.toFixed(0) : 0}K` : `${minimum}份`;
+        $('#mapScaleMax').textContent = metric === 'salary' ? `${max ? max.toFixed(0) : 0}K` : `${max}份`;
         const ranked = [...stats.entries()].filter(([, item]) => item.count).sort((a, b) => mapMetricValue(b[1], metric) - mapMetricValue(a[1], metric)).slice(0, 7);
         const rankingMax = ranked.length ? Math.max(...ranked.map(([, item]) => mapMetricValue(item, metric)), 1) : 1;
         $('#locationList').innerHTML = ranked.length ? ranked.map(([name, item], index) => {
@@ -476,6 +659,8 @@ function applyMapTransform() {
     clampMapView();
     const viewport = $('#chinaMap .map-viewport');
     if (viewport) viewport.setAttribute('transform', `translate(${state.mapView.x} ${state.mapView.y}) scale(${state.mapView.scale})`);
+    const inverseScale = String(1 / state.mapView.scale);
+    $$('#chinaMap .city-marker-visual').forEach((marker) => marker.setAttribute('transform', `scale(${inverseScale})`));
     updateMapZoomLabel();
 }
 
@@ -502,6 +687,16 @@ function resetMapView() {
 function initMapNavigation() {
     const map = $('#chinaMap');
     let pointer = null;
+    const selectCity = (city) => {
+        if (!city) return;
+        state.mapCity = state.mapCity === city ? '' : city; state.mapProvince = '';
+        state.page = 1; updateDashboard(); showToast(state.mapCity ? `已筛选地级市 ${state.mapCity}` : '已取消城市筛选');
+    };
+    const selectProvince = (province) => {
+        if (!province) return;
+        state.mapProvince = state.mapProvince === province ? '' : province; state.mapCity = '';
+        state.page = 1; updateDashboard(); showToast(state.mapProvince ? `已筛选 ${state.mapProvince}` : '已取消地图筛选');
+    };
     map.addEventListener('wheel', (event) => {
         event.preventDefault();
         const svg = map.querySelector('svg'); if (!svg) return;
@@ -532,18 +727,21 @@ function initMapNavigation() {
     };
     map.addEventListener('pointerup', finishPan); map.addEventListener('pointercancel', finishPan);
     map.addEventListener('click', (event) => {
-        const city = event.target.closest('.city-heat-point');
+        const city = event.target.closest('[data-city]');
         if (city && !state.mapView.suppressClick) {
-            state.mapCity = state.mapCity === city.dataset.city ? '' : city.dataset.city;
-            state.mapProvince = '';
-            state.page = 1; updateDashboard(); showToast(state.mapCity ? `已筛选地级市 ${state.mapCity}` : '已取消城市筛选');
-            return;
+            selectCity(city.dataset.city); return;
         }
         const province = event.target.closest('.geo-province');
         if (!province?.dataset.province || state.mapView.suppressClick) return;
-        state.mapProvince = state.mapProvince === province.dataset.province ? '' : province.dataset.province;
-        state.mapCity = '';
-        state.page = 1; updateDashboard(); showToast(state.mapProvince ? `已筛选 ${state.mapProvince}` : '已取消地图筛选');
+        selectProvince(province.dataset.province);
+    });
+    map.addEventListener('keydown', (event) => {
+        if (!['Enter', ' '].includes(event.key)) return;
+        const city = event.target.closest('[data-city]');
+        if (city) { event.preventDefault(); selectCity(city.dataset.city); }
+    });
+    $('#mapSpecialRegions').addEventListener('click', (event) => {
+        const region = event.target.closest('[data-province]'); if (region) selectProvince(region.dataset.province);
     });
     map.addEventListener('dblclick', (event) => { event.preventDefault(); resetMapView(); showToast('地图视图已复位'); });
     $('#mapZoomIn').addEventListener('click', () => zoomMap(state.mapView.scale * 1.3));
@@ -1203,15 +1401,106 @@ async function apiJson(url, options = {}) {
 }
 
 const CONFIG_LABELS = {
-    introduce: '固定打招呼语', character: '回复风格', resume_content: '兼容简历内容', tags: '搜索关键词',
+    introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
-    frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: '简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
+    frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
 };
 
+const CONFIG_TAG_LIMIT = 80;
+const CONFIG_TAG_MAX_LENGTH = 80;
+
 function configLabel(key) { return CONFIG_LABELS[key] || key; }
 
+function normalizeConfigTag(value) { return String(value || '').trim().toLocaleLowerCase(); }
+
+function refreshAdminSaveState(tab = $('#adminTabs .active')?.dataset.adminTab || 'config') {
+    const badge = $('#adminSaveState');
+    let text = '配置已载入'; let pending = false;
+    if (tab === 'config') { pending = state.configDirty; text = pending ? '参数配置待保存' : '参数配置已载入'; }
+    else if (tab === 'llm') { pending = state.llmDirty; text = pending ? '接口配置待保存' : '接口配置已载入'; }
+    else if (tab === 'resume') text = state.currentResume ? `当前简历 · ${state.currentResume}` : '暂无简历';
+    else if (tab === 'prompts') text = state.currentPrompt ? `当前提示词 · ${state.currentPrompt}` : '提示词已载入';
+    badge.textContent = text; badge.classList.toggle('pending', pending);
+}
+
+function markConfigDirty() {
+    state.configDirty = true;
+    if ($('#adminTabs .active')?.dataset.adminTab === 'config') refreshAdminSaveState('config');
+}
+
+function renderTagEditor(path, values) {
+    const editor = document.createElement('div'); editor.className = 'config-tags-field'; editor.dataset.configPath = path; editor.dataset.valueType = 'tag-cards';
+    const heading = document.createElement('div'); heading.className = 'config-tags-heading';
+    const idPrefix = `config-${path.replace(/[^a-z0-9_-]/gi, '-')}`;
+    const title = document.createElement('span'); title.id = `${idPrefix}-label`; title.textContent = configLabel('tags');
+    const count = document.createElement('small'); count.id = `${idPrefix}-status`; count.setAttribute('role', 'status'); count.setAttribute('aria-live', 'polite'); count.setAttribute('aria-atomic', 'true'); heading.append(title, count);
+    const grid = document.createElement('div'); grid.id = `${idPrefix}-list`; grid.className = 'config-tag-grid'; grid.setAttribute('role', 'list'); grid.setAttribute('aria-label', '搜索关键词列表');
+    const addButton = document.createElement('button'); addButton.type = 'button'; addButton.className = 'config-tag-add'; addButton.innerHTML = '<span aria-hidden="true">＋</span> 新增关键词';
+    addButton.setAttribute('aria-controls', grid.id); addButton.setAttribute('aria-describedby', count.id);
+    editor.setAttribute('role', 'group'); editor.setAttribute('aria-labelledby', title.id); editor.setAttribute('aria-describedby', count.id);
+    const update = () => {
+        const cards = [...grid.querySelectorAll('.config-tag-card')];
+        const normalizedCounts = new Map();
+        cards.forEach((card) => { const normalized = normalizeConfigTag(card.querySelector('input').value); if (normalized) normalizedCounts.set(normalized, (normalizedCounts.get(normalized) || 0) + 1); });
+        let emptyCount = 0; let duplicateCount = 0; let tooLongCount = 0;
+        cards.forEach((card, index) => {
+            const input = card.querySelector('input'); const remove = card.querySelector('button'); const value = input.value.trim(); const normalized = normalizeConfigTag(value);
+            const empty = !value; const duplicate = Boolean(normalized && normalizedCounts.get(normalized) > 1); const tooLong = [...value].length > CONFIG_TAG_MAX_LENGTH; const invalid = empty || duplicate || tooLong;
+            if (empty) emptyCount += 1; if (duplicate) duplicateCount += 1; if (tooLong) tooLongCount += 1;
+            card.classList.toggle('empty', empty); card.classList.toggle('duplicate', duplicate); card.classList.toggle('too-long', tooLong); card.classList.toggle('invalid', invalid);
+            input.setAttribute('aria-label', `搜索关键词 ${index + 1}`); input.setAttribute('aria-describedby', count.id); input.setAttribute('aria-invalid', String(invalid));
+            remove.setAttribute('aria-label', `删除搜索关键词 ${index + 1}`);
+        });
+        const problems = [];
+        if (!cards.length) problems.push('至少保留 1 个');
+        if (emptyCount) problems.push(`${emptyCount} 个空项`);
+        if (duplicateCount) problems.push('存在重复');
+        if (tooLongCount) problems.push(`单项不能超过 ${CONFIG_TAG_MAX_LENGTH} 字`);
+        const status = `${cards.length} / ${CONFIG_TAG_LIMIT}${problems.length ? ` · ${problems.join(' · ')}` : ''}`;
+        if (count.textContent !== status) count.textContent = status;
+        count.classList.toggle('bad', problems.length > 0); addButton.disabled = cards.length >= CONFIG_TAG_LIMIT;
+    };
+    const addCard = (value = '', focus = false, before = null) => {
+        if (grid.children.length >= CONFIG_TAG_LIMIT) return null;
+        const card = document.createElement('div'); card.className = 'config-tag-card'; card.setAttribute('role', 'listitem');
+        const input = document.createElement('input'); input.type = 'text'; input.className = 'config-tag-input'; input.maxLength = CONFIG_TAG_MAX_LENGTH; input.value = value; input.placeholder = '搜索关键词';
+        const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '×'; remove.title = '删除关键词'; remove.setAttribute('aria-label', '删除关键词');
+        remove.addEventListener('click', () => { const nextInput = card.nextElementSibling?.querySelector('input') || card.previousElementSibling?.querySelector('input'); card.remove(); update(); markConfigDirty(); (nextInput || addButton).focus(); });
+        input.addEventListener('input', update);
+        input.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' || event.isComposing || event.keyCode === 229) return;
+            event.preventDefault(); if (!input.value.trim()) return;
+            const emptyInput = [...grid.querySelectorAll('.config-tag-input')].find((item) => !item.value.trim());
+            if (emptyInput) emptyInput.focus(); else if (addCard('', true, card.nextElementSibling)) markConfigDirty();
+        });
+        input.addEventListener('paste', (event) => {
+            const pastedText = event.clipboardData?.getData('text') || '';
+            if (!/[\r\n,，]/.test(pastedText)) return;
+            event.preventDefault();
+            const parts = pastedText.split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean);
+            if (!parts.length) return;
+            let changed = false;
+            const selectionStart = input.selectionStart ?? input.value.length; const selectionEnd = input.selectionEnd ?? selectionStart;
+            if (!input.value.trim() || selectionEnd > selectionStart) {
+                const replacement = parts.shift(); const nextValue = input.value.trim() ? `${input.value.slice(0, selectionStart)}${replacement}${input.value.slice(selectionEnd)}` : replacement;
+                changed = nextValue !== input.value; input.value = nextValue;
+            }
+            const available = Math.max(0, CONFIG_TAG_LIMIT - grid.children.length); const accepted = parts.slice(0, available); const dropped = parts.length - accepted.length; const insertBefore = card.nextElementSibling;
+            accepted.forEach((item) => addCard(item, false, insertBefore)); changed = changed || accepted.length > 0;
+            update(); if (changed) markConfigDirty();
+            if (dropped) showToast(`搜索关键词最多 ${CONFIG_TAG_LIMIT} 个，另有 ${dropped} 个未添加`);
+        });
+        card.append(input, remove); grid.insertBefore(card, before); update(); if (focus) input.focus(); return input;
+    };
+    values.slice(0, CONFIG_TAG_LIMIT).forEach((value) => addCard(value));
+    update();
+    addButton.addEventListener('click', () => { const emptyInput = [...grid.querySelectorAll('.config-tag-input')].find((item) => !item.value.trim()); if (emptyInput) emptyInput.focus(); else if (addCard('', true)) markConfigDirty(); });
+    editor.append(heading, grid, addButton); return editor;
+}
+
 function makeConfigControl(path, key, value) {
+    if (key === 'tags' && Array.isArray(value)) return renderTagEditor(path, value);
     const label = document.createElement('label'); label.className = 'config-field';
     const caption = document.createElement('span'); caption.textContent = configLabel(key); label.appendChild(caption);
     let input;
@@ -1221,8 +1510,8 @@ function makeConfigControl(path, key, value) {
         input = document.createElement('textarea'); input.rows = Math.min(8, Math.max(3, value.length)); input.value = value.join('\n'); input.dataset.valueType = 'array';
     } else if (typeof value === 'number') {
         input = document.createElement('input'); input.type = 'number'; input.value = value; input.dataset.valueType = 'number';
-    } else if (key === 'introduce' || key === 'character' || key === 'resume_content') {
-        input = document.createElement('textarea'); input.rows = key === 'resume_content' ? 6 : 3; input.value = value || '';
+    } else if (key === 'introduce' || key === 'character') {
+        input = document.createElement('textarea'); input.rows = 3; input.value = value || ''; label.classList.add('config-field-textarea');
     } else {
         input = document.createElement('input'); input.type = /Host|api_base/.test(key) ? 'url' : 'text'; input.value = value ?? '';
     }
@@ -1242,101 +1531,252 @@ function renderScoringGroup(container, key, values) {
         const result = document.createElement('span'); result.className = 'deduction-star-result';
         const starButtons = Array.from({ length: 5 }, (_, index) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'deduction-star'; button.textContent = '✕'; button.dataset.stars = String(index + 1); button.setAttribute('role', 'radio'); button.setAttribute('aria-label', `扣除 ${index + 1} 星`); selector.appendChild(button); return button; });
         const setStars = (value) => { const selected = Math.max(1, Math.min(5, Number(value) || 1)); scoreInput.value = String(selected); starButtons.forEach((button, index) => { const active = index < selected; button.classList.toggle('active', active); button.setAttribute('aria-checked', String(Number(button.dataset.stars) === selected)); button.tabIndex = Number(button.dataset.stars) === selected ? 0 : -1; }); result.textContent = `扣 ${selected} 星`; card.dataset.deduction = String(selected); };
-        starButtons.forEach((button) => button.addEventListener('click', () => setStars(button.dataset.stars)));
+        starButtons.forEach((button) => button.addEventListener('click', () => { setStars(button.dataset.stars); markConfigDirty(); }));
         selector.addEventListener('keydown', (event) => { const current = Number(scoreInput.value); if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') { event.preventDefault(); setStars(current - 1); } else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') { event.preventDefault(); setStars(current + 1); } else if (event.key === 'Home') { event.preventDefault(); setStars(1); } else if (event.key === 'End') { event.preventDefault(); setStars(5); } });
-        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'score-card-remove'; remove.textContent = '×'; remove.title = '删除关键词'; remove.addEventListener('click', () => { card.remove(); summary.textContent = `${configLabel(key)}（${grid.children.length} 条）`; });
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'score-card-remove'; remove.textContent = '×'; remove.title = '删除关键词'; remove.addEventListener('click', () => { card.remove(); summary.textContent = `${configLabel(key)}（${grid.children.length} 条）`; markConfigDirty(); });
         card.append(keywordInput, scoreInput, remove, selector, result); setStars(score); grid.appendChild(card); summary.textContent = `${configLabel(key)}（${grid.children.length} 条）`;
     };
     Object.entries(values).forEach(([keyword, score]) => addCard(keyword, score));
-    const addButton = document.createElement('button'); addButton.type = 'button'; addButton.className = 'score-card-add'; addButton.textContent = '＋ 新增关键词'; addButton.addEventListener('click', () => { addCard(); grid.lastElementChild?.querySelector('.score-keyword')?.focus(); });
+    const addButton = document.createElement('button'); addButton.type = 'button'; addButton.className = 'score-card-add'; addButton.textContent = '＋ 新增关键词'; addButton.addEventListener('click', () => { addCard(); grid.lastElementChild?.querySelector('.score-keyword')?.focus(); markConfigDirty(); });
     details.append(grid, addButton); container.appendChild(details);
 }
 
 function fillConfigForm(data) {
-    const config = data.config; state.adminConfig = config;
+    const config = data.config; state.adminConfig = config; state.configDirty = false;
     const form = $('#visualConfigForm'); form.replaceChildren();
-    const basics = document.createElement('fieldset'); basics.innerHTML = '<legend>基础资料</legend><div class="config-field-grid"></div>'; const basicGrid = basics.querySelector('div');
-    Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
+    const basics = document.createElement('fieldset'); basics.innerHTML = '<legend>基础资料</legend><div class="config-field-grid config-basic-grid"></div>'; const basicGrid = basics.querySelector('div');
+    Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring', 'resume_name'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
     ['backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value))); fieldset.appendChild(grid); form.appendChild(fieldset); });
     const scoring = document.createElement('fieldset'); const scoringLegend = document.createElement('legend'); scoringLegend.textContent = configLabel('scoring'); scoring.appendChild(scoringLegend); const scoringHint = document.createElement('p'); scoringHint.className = 'scoring-model-hint'; scoringHint.textContent = '每个岗位初始为 5 星。命中关键词后按规则扣星；同一段文字优先匹配更长的关键词。剩余星级小于 0 时直接丢弃岗位。'; scoring.appendChild(scoringHint); Object.entries(config.scoring || {}).forEach(([key, values]) => renderScoringGroup(scoring, key, values)); form.appendChild(scoring);
-    $('#adminSaveState').textContent = '配置已载入';
+    refreshAdminSaveState();
 }
 
 const LLM_KEEP_SECRET = '__KEEP__';
+const LLM_STRATEGY_HINTS = {
+    failover: '按列表顺序调用，失败后切换',
+    round_robin: '在可用接口之间轮流调用',
+};
+
+function setLlmStrategy(value, markDirty = false) {
+    const strategy = value === 'round_robin' ? 'round_robin' : 'failover';
+    const control = $('#llmStrategy');
+    control.dataset.value = strategy;
+    $$('[data-llm-strategy]').forEach((button) => {
+        const active = button.dataset.llmStrategy === strategy;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-checked', String(active));
+    });
+    $('#llmStrategyHint').textContent = LLM_STRATEGY_HINTS[strategy];
+    if (markDirty) markLlmDirty();
+}
+
+function setLlmTestState(card, tone, text) {
+    const badge = card.querySelector('.llm-provider-test');
+    const label = badge.querySelector('span');
+    const fullText = String(text || '未测试');
+    badge.className = `llm-provider-test${tone ? ` ${tone}` : ''}`;
+    badge.title = fullText;
+    label.textContent = fullText.length > 64 ? `${fullText.slice(0, 61)}...` : fullText;
+    card.dataset.testState = tone || 'idle';
+}
+
+function updateLlmSecretState(card, kind) {
+    const isKey = kind === 'key';
+    const fieldName = isKey ? 'api_key' : 'proxy_url';
+    const configuredKey = isKey ? 'keyConfigured' : 'proxyConfigured';
+    const dirtyKey = isKey ? 'keyDirty' : 'proxyDirty';
+    const maskedKey = isKey ? 'keyMasked' : 'proxyMasked';
+    const input = card.querySelector(`[data-llm-field="${fieldName}"]`);
+    const meta = card.querySelector(`[data-llm-secret-state="${kind}"]`);
+    const reveal = card.querySelector(`[data-llm-action="reveal-${kind}"]`);
+    const clear = card.querySelector(`[data-llm-action="clear-${kind}"]`);
+    const configured = card.dataset[configuredKey] === '1';
+    const dirty = card.dataset[dirtyKey] === '1';
+    const value = input.value.trim();
+    if (dirty && value) meta.textContent = '待更新';
+    else if (dirty && configured) meta.textContent = '保存后清除';
+    else if (configured) meta.textContent = `已配置 · ${card.dataset[maskedKey] || '******'}`;
+    else meta.textContent = '未配置';
+    reveal.disabled = !value;
+    clear.disabled = !configured && !value;
+}
+
+function refreshLlmCard(card, stale = false) {
+    const field = (name) => card.querySelector(`[data-llm-field="${name}"]`);
+    const name = field('name').value.trim() || '未命名接口';
+    const model = field('model').value.trim() || '未选择模型';
+    const enabled = field('enabled').checked;
+    const proxyEnabled = field('proxy_enabled').checked;
+    card.querySelector('[data-llm-summary="name"]').textContent = name;
+    card.querySelector('[data-llm-summary="route"]').textContent = `${model} · ${proxyEnabled ? '代理连接' : '直接连接'}`;
+    card.querySelector('.llm-card-toggle em').textContent = enabled ? '已启用' : '已停用';
+    card.classList.toggle('is-disabled', !enabled);
+    field('proxy_url').disabled = !proxyEnabled;
+    updateLlmSecretState(card, 'key');
+    updateLlmSecretState(card, 'proxy');
+    if (stale && !card.classList.contains('is-testing')) setLlmTestState(card, 'stale', '配置已修改');
+}
+
+function updateLlmSummary() {
+    const cards = $$('#llmProviderList .llm-provider-card');
+    const enabled = cards.filter((card) => card.querySelector('[data-llm-field="enabled"]').checked).length;
+    const proxyCount = cards.filter((card) => card.querySelector('[data-llm-field="proxy_enabled"]').checked).length;
+    const summary = $('#llmProviderSummary');
+    summary.classList.toggle('empty', cards.length === 0);
+    summary.innerHTML = `<i></i>${cards.length} 个接口 · ${enabled} 个启用${proxyCount ? ` · ${proxyCount} 个代理` : ''}`;
+}
+
+function refreshLlmOrder() {
+    const cards = $$('#llmProviderList .llm-provider-card');
+    cards.forEach((card, index) => {
+        card.querySelector('.llm-provider-order').textContent = String(index + 1).padStart(2, '0');
+        card.querySelector('[data-llm-action="move-up"]').disabled = index === 0;
+        card.querySelector('[data-llm-action="move-down"]').disabled = index === cards.length - 1;
+    });
+    updateLlmSummary();
+}
+
+function markLlmDirty(card = null) {
+    state.llmDirty = true;
+    if ($('#adminTabs .active')?.dataset.adminTab === 'llm') refreshAdminSaveState('llm');
+    if (card) refreshLlmCard(card, true);
+    updateLlmSummary();
+}
 
 function llmProviderCard(provider = {}) {
-    const card = document.createElement('div'); card.className = 'llm-provider-card';
-    const configured = Boolean(provider.apiKeyConfigured);
-    // index 用于保存时让后端定位旧 key；新建卡片没有 index。
+    const card = document.createElement('article'); card.className = 'llm-provider-card';
+    const keyConfigured = Boolean(provider.apiKeyConfigured);
+    const proxyConfigured = Boolean(provider.proxyUrlConfigured);
+    const proxyEnabled = Boolean(provider.proxyEnabled);
     card.dataset.index = provider.index != null ? String(provider.index) : '';
-    card.dataset.keyConfigured = configured ? '1' : '';
-    card.dataset.keyDirty = '';
-    const test = provider.__test;
-    const testClass = test ? (test.ok ? 'ok' : 'bad') : '';
-    const testText = test
-        ? (test.ok ? `可用 · ${test.latencyMs ?? '—'}ms` : `失败 · ${escapeHtml(String(test.error || test.status || '未知'))}`)
-        : '尚未测活';
-    const keyPlaceholder = configured ? `已配置（${escapeHtml(provider.apiKeyMasked || '******')}），留空保留` : '输入 API Key';
+    card.dataset.keyConfigured = keyConfigured ? '1' : '0';
+    card.dataset.keyDirty = '0';
+    card.dataset.keyMasked = provider.apiKeyMasked || '';
+    card.dataset.proxyConfigured = proxyConfigured ? '1' : '0';
+    card.dataset.proxyDirty = '0';
+    card.dataset.proxyMasked = provider.proxyUrlMasked || '';
+    const keyPlaceholder = keyConfigured ? '留空保留已配置的 API Key' : 'sk-...';
+    const proxyPlaceholder = proxyConfigured ? '留空保留已配置的代理地址' : 'http://127.0.0.1:7890';
     card.innerHTML = `
         <div class="llm-provider-top">
-            <label class="llm-enable"><input type="checkbox" data-llm-field="enabled" ${provider.enabled !== false ? 'checked' : ''}><span>启用</span></label>
-            <span class="llm-provider-test ${testClass}">${testText}</span>
+            <span class="llm-provider-order">01</span>
+            <div class="llm-provider-identity"><strong data-llm-summary="name"></strong><small data-llm-summary="route"></small></div>
+            <span class="llm-provider-test" role="status" aria-live="polite"><i></i><span>未测试</span></span>
+            <label class="llm-card-toggle" title="启用或停用这个接口">
+                <input type="checkbox" data-llm-field="enabled" ${provider.enabled !== false ? 'checked' : ''}>
+                <span class="llm-toggle" aria-hidden="true"><i></i></span><em>已启用</em>
+            </label>
             <div class="llm-provider-tools">
-                <button type="button" data-llm-action="test">测活</button>
-                <button type="button" class="danger-action" data-llm-action="remove">删除</button>
+                <button type="button" class="llm-icon-action" data-llm-action="move-up" title="上移接口" aria-label="上移接口">↑</button>
+                <button type="button" class="llm-icon-action" data-llm-action="move-down" title="下移接口" aria-label="下移接口">↓</button>
+                <button type="button" class="llm-test-action" data-llm-action="test"><span aria-hidden="true">↻</span><b>测试</b></button>
+                <button type="button" class="llm-icon-action danger-action" data-llm-action="remove" title="删除接口" aria-label="删除接口">×</button>
             </div>
         </div>
         <div class="llm-provider-grid">
-            <label><span>名称</span><input type="text" data-llm-field="name" value="${escapeHtml(provider.name || '')}" placeholder="例如 SenseNova"></label>
-            <label><span>接口地址</span><input type="url" data-llm-field="api_base" value="${escapeHtml(provider.api_base || '')}" placeholder="https://.../v1"></label>
-            <label><span>模型名称</span><input type="text" data-llm-field="model" value="${escapeHtml(provider.model || '')}" placeholder="例如 deepseek-v4-flash"></label>
-            <label><span>API Key</span><input type="password" data-llm-field="api_key" placeholder="${keyPlaceholder}" autocomplete="off"></label>
-        </div>`;
-    // 标记 key 输入被改动，保存时才发送真实值，否则发送哨兵保留原 key。
-    card.querySelector('[data-llm-field="api_key"]').addEventListener('input', () => { card.dataset.keyDirty = '1'; });
+            <label class="llm-field llm-span-4"><span>接口名称</span><input type="text" data-llm-field="name" maxlength="60" value="${escapeHtml(provider.name || '')}" placeholder="例如 OpenAI 主接口"></label>
+            <label class="llm-field llm-span-4"><span>模型名称</span><input type="text" data-llm-field="model" maxlength="120" value="${escapeHtml(provider.model || '')}" placeholder="例如 gpt-4.1-mini"></label>
+            <div class="llm-field llm-span-4">
+                <div class="llm-field-label"><span>API Key</span><small data-llm-secret-state="key"></small></div>
+                <div class="llm-input-shell"><input type="password" data-llm-field="api_key" placeholder="${keyPlaceholder}" autocomplete="new-password"><button type="button" data-llm-action="reveal-key">显示</button><button type="button" data-llm-action="clear-key">清除</button></div>
+            </div>
+            <label class="llm-field llm-span-6"><span>接口地址</span><input type="url" data-llm-field="api_base" value="${escapeHtml(provider.api_base || '')}" placeholder="https://api.example.com/v1"><small>OpenAI 兼容 API 地址</small></label>
+            <div class="llm-field llm-span-6 llm-proxy-field">
+                <div class="llm-field-label">
+                    <span>HTTP(S) 代理</span><small data-llm-secret-state="proxy"></small>
+                    <label class="llm-inline-toggle"><input type="checkbox" data-llm-field="proxy_enabled" ${proxyEnabled ? 'checked' : ''}><span class="llm-toggle" aria-hidden="true"><i></i></span><em>使用代理</em></label>
+                </div>
+                <div class="llm-input-shell"><input type="password" data-llm-field="proxy_url" placeholder="${proxyPlaceholder}" autocomplete="new-password"><button type="button" data-llm-action="reveal-proxy">显示</button><button type="button" data-llm-action="clear-proxy">清除</button></div>
+            </div>
+        </div>
+        <p class="llm-card-error" role="alert" hidden></p>`;
+    const test = provider.__test;
+    if (test) setLlmTestState(card, test.ok ? 'ok' : 'bad', test.ok ? `可用 · ${test.latencyMs ?? '—'}ms` : `失败 · ${test.error || test.status || '未知'}`);
+    refreshLlmCard(card);
     return card;
 }
 
 function renderLlmProviders() {
     const list = $('#llmProviderList'); list.replaceChildren();
     const providers = state.llm.providers || [];
-    if (!providers.length) { list.innerHTML = '<div class="llm-empty">还没有配置任何接口，点击下方按钮添加。</div>'; return; }
+    if (!providers.length) { list.innerHTML = '<div class="llm-empty"><span>＋</span><strong>还没有大模型接口</strong><small>添加接口后可配置模型与连接方式</small></div>'; updateLlmSummary(); return; }
     providers.forEach((provider) => list.appendChild(llmProviderCard(provider)));
+    refreshLlmOrder();
+}
+
+function collectLlmProvider(card) {
+    const field = (name) => card.querySelector(`[data-llm-field="${name}"]`);
+    const secretValue = (kind, fieldName) => {
+        const dirty = card.dataset[`${kind}Dirty`] === '1';
+        const configured = card.dataset[`${kind}Configured`] === '1';
+        return dirty ? field(fieldName).value.trim() : (configured ? LLM_KEEP_SECRET : '');
+    };
+    const indexRaw = card.dataset.index;
+    return {
+        index: indexRaw === '' ? null : Number(indexRaw),
+        name: field('name').value.trim(),
+        api_base: field('api_base').value.trim(),
+        model: field('model').value.trim(),
+        enabled: field('enabled').checked,
+        api_key: secretValue('key', 'api_key'),
+        proxy_enabled: field('proxy_enabled').checked,
+        proxy_url: secretValue('proxy', 'proxy_url'),
+    };
 }
 
 function collectLlmPayload() {
-    const cards = $$('#llmProviderList .llm-provider-card');
-    const providers = cards.map((card) => {
-        const field = (name) => card.querySelector(`[data-llm-field="${name}"]`);
-        const keyInput = field('api_key');
-        const keyConfigured = card.dataset.keyConfigured === '1';
-        const keyDirty = card.dataset.keyDirty === '1';
-        // 未改动且原本已配置 → 用哨兵让后端保留；否则发送输入框实际内容。
-        const api_key = keyDirty ? keyInput.value : (keyConfigured ? LLM_KEEP_SECRET : '');
-        const indexRaw = card.dataset.index;
-        return {
-            index: indexRaw === '' ? null : Number(indexRaw),
-            name: field('name').value.trim(),
-            api_base: field('api_base').value.trim(),
-            model: field('model').value.trim(),
-            enabled: field('enabled').checked,
-            api_key,
-        };
-    });
     return {
-        strategy: $('#llmStrategy').value,
+        strategy: $('#llmStrategy').dataset.value || 'failover',
         timeout: Number($('#llmTimeout').value) || 180,
         jobFilter: $('#llmJobFilter').checked,
-        providers,
+        providers: $$('#llmProviderList .llm-provider-card').map(collectLlmProvider),
     };
+}
+
+function validateLlmCard(card, testMode = false) {
+    const field = (name) => card.querySelector(`[data-llm-field="${name}"]`);
+    const required = testMode || field('enabled').checked;
+    const missing = [];
+    const invalidFields = [];
+    const apiKeyAvailable = card.dataset.keyDirty === '1' ? Boolean(field('api_key').value.trim()) : card.dataset.keyConfigured === '1';
+    const proxyAvailable = card.dataset.proxyDirty === '1' ? Boolean(field('proxy_url').value.trim()) : card.dataset.proxyConfigured === '1';
+    card.querySelectorAll('[aria-invalid="true"]').forEach((input) => input.removeAttribute('aria-invalid'));
+    if (required && !field('api_base').value.trim()) { missing.push('接口地址'); invalidFields.push(field('api_base')); }
+    if (required && !field('model').value.trim()) { missing.push('模型名称'); invalidFields.push(field('model')); }
+    if (required && !apiKeyAvailable) { missing.push('API Key'); invalidFields.push(field('api_key')); }
+    if (required && field('proxy_enabled').checked && !proxyAvailable) { missing.push('代理地址'); invalidFields.push(field('proxy_url')); }
+    const apiBase = field('api_base').value.trim();
+    const proxyUrl = field('proxy_url').value.trim();
+    if (apiBase && !/^https?:\/\/\S+$/i.test(apiBase)) { missing.push('有效的 HTTP(S) 接口地址'); invalidFields.push(field('api_base')); }
+    if (proxyUrl && !/^https?:\/\/\S+$/i.test(proxyUrl)) { missing.push('有效的 HTTP(S) 代理地址'); invalidFields.push(field('proxy_url')); }
+    const error = card.querySelector('.llm-card-error');
+    const unique = [...new Set(missing)];
+    error.textContent = unique.length ? `请检查：${unique.join('、')}` : '';
+    error.hidden = unique.length === 0;
+    card.classList.toggle('has-error', unique.length > 0);
+    invalidFields.forEach((input) => input.setAttribute('aria-invalid', 'true'));
+    return unique.length === 0;
+}
+
+function validateLlmCards() {
+    const invalid = $$('#llmProviderList .llm-provider-card').filter((card) => !validateLlmCard(card));
+    if (invalid.length) {
+        invalid[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        invalid[0].querySelector('[aria-invalid="true"]')?.focus({ preventScroll: true });
+        return false;
+    }
+    return true;
 }
 
 function applyLlmConfig(data) {
     state.llm = { providers: (data.providers || []).map((item) => ({ ...item })) };
-    $('#llmStrategy').value = data.strategy || 'failover';
+    state.llmDirty = false;
+    setLlmStrategy(data.strategy || 'failover');
     $('#llmTimeout').value = data.timeout || 180;
     $('#llmJobFilter').checked = Boolean(data.jobFilter);
+    $('#llmJobFilterState').textContent = data.jobFilter ? '已启用' : '已关闭';
     renderLlmProviders();
+    refreshAdminSaveState();
 }
 
 async function loadLlm() {
@@ -1345,31 +1785,43 @@ async function loadLlm() {
 }
 
 async function saveLlm() {
-    const button = $('#saveLlm'); button.disabled = true;
-    try { applyLlmConfig(await apiJson('/api/admin/llm', { method: 'PUT', body: JSON.stringify(collectLlmPayload()) })); showToast('接口配置已保存到 .env 并热加载'); }
+    if (!validateLlmCards()) return showToast('请先补全或修正接口配置');
+    const button = $('#saveLlm'); button.disabled = true; button.classList.add('loading');
+    try { applyLlmConfig(await apiJson('/api/admin/llm', { method: 'PUT', body: JSON.stringify(collectLlmPayload()) })); showToast('接口配置已保存并热加载'); }
     catch (error) { showToast(`保存失败：${error.message}`); }
-    finally { button.disabled = false; }
+    finally { button.disabled = false; button.classList.remove('loading'); }
 }
 
 function addLlmProvider() {
+    if ($$('#llmProviderList .llm-provider-card').length >= 20) return showToast('最多支持 20 个大模型接口');
     const list = $('#llmProviderList'); const empty = list.querySelector('.llm-empty'); if (empty) list.replaceChildren();
-    list.appendChild(llmProviderCard({ enabled: true }));
+    const card = llmProviderCard({ enabled: true });
+    list.appendChild(card); refreshLlmOrder(); markLlmDirty(card);
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.querySelector('[data-llm-field="name"]').focus({ preventScroll: true });
 }
 
 async function testLlmProvider(card) {
-    const badge = card.querySelector('.llm-provider-test'); badge.className = 'llm-provider-test'; badge.textContent = '测活中…';
-    const indexRaw = card.dataset.index;
-    if (indexRaw === '') { badge.classList.add('bad'); badge.textContent = '请先保存后再测活'; return; }
+    if (!validateLlmCard(card, true)) { setLlmTestState(card, 'bad', '配置不完整'); return false; }
+    const button = card.querySelector('[data-llm-action="test"]');
+    button.disabled = true; card.classList.add('is-testing'); setLlmTestState(card, 'testing', '连接中...');
     try {
-        const result = await apiJson('/api/admin/llm/test', { method: 'POST', body: JSON.stringify({ index: Number(indexRaw) }) });
-        if (result.ok) { badge.classList.add('ok'); badge.textContent = `可用 · ${result.latencyMs ?? '—'}ms`; }
-        else { badge.classList.add('bad'); badge.textContent = `失败 · ${result.error || result.status || '未知'}`; }
-    } catch (error) { badge.classList.add('bad'); badge.textContent = `失败 · ${error.message}`; }
+        const result = await apiJson('/api/admin/llm/test', { method: 'POST', body: JSON.stringify({ provider: collectLlmProvider(card) }) });
+        if (result.ok) { setLlmTestState(card, 'ok', `${result.viaProxy ? '代理' : '直连'}可用 · ${result.latencyMs ?? '—'}ms`); return true; }
+        setLlmTestState(card, 'bad', `失败 · ${result.error || result.status || '未知错误'}`); return false;
+    } catch (error) { setLlmTestState(card, 'bad', `失败 · ${error.message}`); return false; }
+    finally { button.disabled = false; card.classList.remove('is-testing'); }
 }
 
 async function testAllLlm() {
     const cards = $$('#llmProviderList .llm-provider-card');
-    await Promise.all(cards.map((card) => card.dataset.index !== '' ? testLlmProvider(card) : Promise.resolve()));
+    if (!cards.length) return showToast('请先添加大模型接口');
+    const button = $('#llmTestAll'); button.disabled = true; button.classList.add('loading');
+    try {
+        const results = await Promise.all(cards.map(testLlmProvider));
+        const successCount = results.filter(Boolean).length;
+        showToast(`测活完成：${successCount} / ${cards.length} 个接口可用`);
+    } finally { button.disabled = false; button.classList.remove('loading'); }
 }
 
 async function loadAdmin() {
@@ -1377,7 +1829,6 @@ async function loadAdmin() {
         const [config, resumes, promptData, llm] = await Promise.all([apiJson('/api/admin/config'), apiJson('/api/admin/resumes'), apiJson('/api/admin/prompts'), apiJson('/api/admin/llm')]);
         fillConfigForm(config); renderResumeOptions(resumes); state.prompts = promptData.items || []; renderPromptOptions(); applyLlmConfig(llm);
     } catch (error) { $('#adminSaveState').textContent = '管理接口不可用'; $('#configNotice').textContent = error.message; }
-    loadLlm();
 }
 
 async function saveAdminConfig() {
@@ -1388,6 +1839,18 @@ async function saveAdminConfig() {
             let value;
             if (input.type === 'checkbox') value = input.checked;
             else if (input.dataset.valueType === 'number') value = Number(input.value);
+            else if (input.dataset.valueType === 'tag-cards') {
+                const tagInputs = [...input.querySelectorAll('.config-tag-input')]; const values = tagInputs.map((item) => item.value.trim());
+                const fail = (message, field) => { field?.focus(); throw new Error(message); };
+                if (!values.length) fail('至少需要 1 个搜索关键词');
+                if (values.length > CONFIG_TAG_LIMIT) fail(`搜索关键词最多 ${CONFIG_TAG_LIMIT} 个`);
+                const emptyIndex = values.findIndex((item) => !item); if (emptyIndex >= 0) fail('搜索关键词中存在空项', tagInputs[emptyIndex]);
+                const tooLongIndex = values.findIndex((item) => [...item].length > CONFIG_TAG_MAX_LENGTH); if (tooLongIndex >= 0) fail(`每个搜索关键词不能超过 ${CONFIG_TAG_MAX_LENGTH} 字`, tagInputs[tooLongIndex]);
+                const seen = new Map(); let duplicateIndex = -1;
+                values.some((item, index) => { const normalized = normalizeConfigTag(item); if (seen.has(normalized)) { duplicateIndex = index; return true; } seen.set(normalized, index); return false; });
+                if (duplicateIndex >= 0) fail(`搜索关键词不能重复：${values[duplicateIndex]}`, tagInputs[duplicateIndex]);
+                value = values;
+            }
             else if (input.dataset.valueType === 'array') value = input.value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean);
             else if (input.dataset.valueType === 'score-cards') { value = {}; input.querySelectorAll('.score-keyword-card').forEach((card) => { const keyword = card.querySelector('.score-keyword').value.trim(); const score = Number(card.querySelector('.score-value').value); if (!keyword) throw new Error('扣星规则中存在空关键词'); if (!Number.isInteger(score) || score < 1 || score > 5) throw new Error(`关键词「${keyword}」的扣星数必须为 1～5`); if (Object.hasOwn(value, keyword)) throw new Error(`扣星关键词重复：${keyword}`); value[keyword] = score; }); }
             else value = input.value.trim();
@@ -1399,22 +1862,44 @@ async function saveAdminConfig() {
 
 function renderResumeOptions(data) {
     const select = $('#resumeSelect'); select.replaceChildren();
-    (data.items || []).forEach((item) => { const option = document.createElement('option'); option.value = item.name; option.textContent = `${item.name}${item.exists ? '' : '（新文件）'}`; select.appendChild(option); });
-    state.currentResume = data.selected || select.value; select.value = state.currentResume; if (state.currentResume) loadResume(state.currentResume);
+    const items = data.items || [];
+    if (!items.length) {
+        const option = document.createElement('option'); option.textContent = '暂无简历'; option.value = ''; select.appendChild(option); select.disabled = true;
+        state.currentResume = ''; $('#resumeEditor').value = ''; $('#resumeMeta').textContent = 'resumes/ 中暂无简历'; refreshAdminSaveState(); return;
+    }
+    select.disabled = false;
+    items.forEach((item) => { const option = document.createElement('option'); option.value = item.name; option.textContent = item.name; select.appendChild(option); });
+    state.currentResume = data.selected || items[0].name; select.value = state.currentResume; loadResume(state.currentResume); refreshAdminSaveState();
 }
 
 async function loadResume(name) {
-    try { const data = await apiJson(`/api/admin/resumes/${encodeURIComponent(name)}`); state.currentResume = name; $('#resumeEditor').value = data.content || ''; $('#resumeMeta').textContent = `${data.size || 0} bytes`; } catch (error) { showToast(`读取简历失败：${error.message}`); }
+    if (!name) return;
+    try { const data = await apiJson(`/api/admin/resumes/${encodeURIComponent(name)}`); state.currentResume = name; $('#resumeEditor').value = data.content || ''; $('#resumeMeta').textContent = `resumes/${name} · ${data.size || 0} bytes`; refreshAdminSaveState(); } catch (error) { showToast(`读取简历失败：${error.message}`); }
+}
+
+async function selectCurrentResume(name) {
+    if (!name || name === state.currentResume) return;
+    const select = $('#resumeSelect'); select.disabled = true;
+    try {
+        const data = await apiJson('/api/admin/resumes/current', { method: 'PUT', body: JSON.stringify({ name }) });
+        renderResumeOptions(data); showToast(`已将 ${name} 设为 LLM 当前简历`);
+    } catch (error) { select.value = state.currentResume; showToast(`切换失败：${error.message}`); }
+    finally { select.disabled = false; }
 }
 
 async function createResume() {
-    const name = $('#newResumeName').value.trim(); if (!name) return showToast('请输入简历文件名');
-    state.currentResume = name; $('#resumeEditor').value = ''; $('#resumeMeta').textContent = '新文件，保存后创建'; showToast(`已切换到 ${name}`);
+    let name = $('#newResumeName').value.trim(); if (!name) return showToast('请输入简历文件名');
+    if (!/\.[^.]+$/.test(name)) name += '.md';
+    if (!/\.(md|txt)$/i.test(name)) return showToast('简历只支持 .md 或 .txt 文件');
+    const select = $('#resumeSelect'); select.disabled = false;
+    let option = [...select.options].find((item) => item.value === name);
+    if (!option) { option = document.createElement('option'); option.value = name; option.textContent = `${name}（新文件）`; select.appendChild(option); }
+    state.currentResume = name; select.value = name; $('#newResumeName').value = name; $('#resumeEditor').value = ''; $('#resumeMeta').textContent = '新文件 · 保存后设为 LLM 当前简历'; showToast(`已新建 ${name} 编辑页`);
 }
 
 async function saveCurrentResume() {
     if (!state.currentResume) return showToast('请先选择简历');
-    try { const result = await apiJson(`/api/admin/resumes/${encodeURIComponent(state.currentResume)}`, { method: 'PUT', body: JSON.stringify({ content: $('#resumeEditor').value, select: true }) }); $('#resumeMeta').textContent = `${result.size} bytes · 已保存`; showToast('简历已保存并设为当前简历'); const list = await apiJson('/api/admin/resumes'); renderResumeOptions(list); } catch (error) { showToast(`保存失败：${error.message}`); }
+    try { const result = await apiJson(`/api/admin/resumes/${encodeURIComponent(state.currentResume)}`, { method: 'PUT', body: JSON.stringify({ content: $('#resumeEditor').value, select: true }) }); $('#resumeMeta').textContent = `resumes/${state.currentResume} · ${result.size} bytes · 当前简历`; $('#newResumeName').value = ''; showToast('简历已保存并设为 LLM 当前简历'); const list = await apiJson('/api/admin/resumes'); renderResumeOptions(list); } catch (error) { showToast(`保存失败：${error.message}`); }
 }
 
 function renderPromptOptions() {
@@ -1468,10 +1953,41 @@ function bindEvents() {
         localStorage.removeItem(TABLE_PREFS_KEY); state.visibleColumns = new Set(Object.keys(TABLE_COLUMNS)); state.columnOrder = Object.keys(TABLE_COLUMNS); state.columnWidths = {}; state.density = 'default'; state.sort = { key: 'loggedAt', direction: 'desc' }; restoreTablePreferences(); renderRecords(getFilteredRecords()); showToast('表格视图已重置');
     });
     $$('.nav-item').forEach((button) => button.addEventListener('click', () => { $$('.nav-item').forEach((item) => item.classList.toggle('active', item === button)); document.getElementById(button.dataset.scroll)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); $('#sidebar').classList.remove('open'); }));
-    $$('#adminTabs button').forEach((button) => button.addEventListener('click', () => { $$('#adminTabs button').forEach((item) => item.classList.toggle('active', item === button)); $$('.admin-view').forEach((view) => view.classList.toggle('active', view.dataset.adminView === button.dataset.adminTab)); }));
-    $('#saveConfig').addEventListener('click', saveAdminConfig); $('#resumeSelect').addEventListener('change', (event) => loadResume(event.target.value)); $('#createResume').addEventListener('click', createResume); $('#saveResume').addEventListener('click', saveCurrentResume); $('#promptSelect').addEventListener('change', (event) => showPrompt(event.target.value)); $('#savePrompt').addEventListener('click', saveCurrentPrompt);
-    $('#saveLlm').addEventListener('click', saveLlm); $('#llmAddProvider').addEventListener('click', addLlmProvider); $('#llmTestAll').addEventListener('click', () => $$('#llmProviderList .llm-provider-card').forEach((card) => testLlmProvider(card)));
-    $('#llmProviderList').addEventListener('click', (event) => { const button = event.target.closest('[data-llm-action]'); if (!button) return; const card = button.closest('.llm-provider-card'); if (button.dataset.llmAction === 'remove') { card.remove(); if (!$$('#llmProviderList .llm-provider-card').length) $('#llmProviderList').innerHTML = '<div class="llm-empty">还没有配置任何接口，点击下方按钮添加。</div>'; } else if (button.dataset.llmAction === 'test') { testLlmProvider(card); } });
+    $$('#adminTabs button').forEach((button) => button.addEventListener('click', () => {
+        $$('#adminTabs button').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-selected', String(active)); });
+        $$('.admin-view').forEach((view) => view.classList.toggle('active', view.dataset.adminView === button.dataset.adminTab));
+        refreshAdminSaveState(button.dataset.adminTab);
+    }));
+    $('#visualConfigForm').addEventListener('input', markConfigDirty); $('#visualConfigForm').addEventListener('change', markConfigDirty);
+    $('#saveConfig').addEventListener('click', saveAdminConfig); $('#resumeSelect').addEventListener('change', (event) => selectCurrentResume(event.target.value)); $('#createResume').addEventListener('click', createResume); $('#saveResume').addEventListener('click', saveCurrentResume); $('#promptSelect').addEventListener('change', (event) => showPrompt(event.target.value)); $('#savePrompt').addEventListener('click', saveCurrentPrompt);
+    $('#saveLlm').addEventListener('click', saveLlm); $('#llmAddProvider').addEventListener('click', addLlmProvider); $('#llmTestAll').addEventListener('click', testAllLlm);
+    $('#llmStrategy').addEventListener('click', (event) => { const button = event.target.closest('[data-llm-strategy]'); if (button) setLlmStrategy(button.dataset.llmStrategy, true); });
+    $('#llmTimeout').addEventListener('input', () => markLlmDirty());
+    $('#llmJobFilter').addEventListener('input', (event) => { $('#llmJobFilterState').textContent = event.target.checked ? '已启用' : '已关闭'; markLlmDirty(); });
+    $('#llmProviderList').addEventListener('input', (event) => {
+        const card = event.target.closest('.llm-provider-card'); const fieldName = event.target.dataset.llmField; if (!card || !fieldName) return;
+        if (fieldName === 'api_key') card.dataset.keyDirty = '1';
+        if (fieldName === 'proxy_url') card.dataset.proxyDirty = '1';
+        const error = card.querySelector('.llm-card-error'); error.hidden = true; card.classList.remove('has-error');
+        markLlmDirty(card);
+        if (fieldName === 'proxy_enabled' && event.target.checked && card.dataset.proxyConfigured !== '1') card.querySelector('[data-llm-field="proxy_url"]').focus();
+    });
+    $('#llmProviderList').addEventListener('click', (event) => {
+        const button = event.target.closest('[data-llm-action]'); if (!button) return;
+        const card = button.closest('.llm-provider-card'); const action = button.dataset.llmAction; const list = $('#llmProviderList');
+        if (action === 'test') { testLlmProvider(card); return; }
+        if (action === 'remove') {
+            card.remove();
+            if (!$$('#llmProviderList .llm-provider-card').length) list.innerHTML = '<div class="llm-empty"><span>＋</span><strong>还没有大模型接口</strong><small>添加接口后可配置模型与连接方式</small></div>';
+            refreshLlmOrder(); markLlmDirty(); return;
+        }
+        if (action === 'move-up') { const previous = card.previousElementSibling; if (previous?.classList.contains('llm-provider-card')) list.insertBefore(card, previous); refreshLlmOrder(); markLlmDirty(card); return; }
+        if (action === 'move-down') { const next = card.nextElementSibling; if (next?.classList.contains('llm-provider-card')) next.after(card); refreshLlmOrder(); markLlmDirty(card); return; }
+        const secretMatch = action.match(/^(reveal|clear)-(key|proxy)$/); if (!secretMatch) return;
+        const [, command, kind] = secretMatch; const fieldName = kind === 'key' ? 'api_key' : 'proxy_url'; const input = card.querySelector(`[data-llm-field="${fieldName}"]`);
+        if (command === 'reveal') { input.type = input.type === 'password' ? 'text' : 'password'; button.textContent = input.type === 'password' ? '显示' : '隐藏'; return; }
+        card.dataset[kind === 'key' ? 'keyDirty' : 'proxyDirty'] = '1'; input.value = ''; input.type = 'password'; input.placeholder = '保存后清除'; markLlmDirty(card);
+    });
     $('#refreshControl').addEventListener('click', loadControlState);
     $('#controlSection').addEventListener('click', (event) => {
         const button = event.target.closest('[data-control-action]'); if (!button) return;

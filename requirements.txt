@@ -1,4 +1,7 @@
+# Web API、数据校验与 ASGI 服务器。
 fastapi==0.115.8
-httpx==0.28.1
 pydantic==2.10.6
 uvicorn==0.34.0
+
+# LLM 接口、代理连接和健康检查使用的异步 HTTP 客户端。
+httpx==0.28.1

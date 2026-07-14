@@ -1,3 +1,10 @@
+"""浏览器工作器运行态、控制策略、事件流与诊断信息的线程安全注册中心。
+
+客户端、事件、错误、审计和命令保存在当前进程内存中；安全开关、执行计划和账号策略
+可选持久化到 JSON 文件。所有共享容器由同一个 ``Condition`` 保护，返回给调用方的
+数据会深拷贝，避免外部修改内部状态。
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -35,7 +42,11 @@ DEFAULT_PLAN = {
 
 
 class RuntimeMonitor:
-    """Thread-safe runtime registry and control-center state store."""
+    """维护控制中心运行态和长轮询事件流的线程安全存储。
+
+    ``client_ttl_seconds`` 决定客户端离线判定时间，事件和命令使用有界队列保存；
+    ``state_path`` 为空时策略仅驻留内存，设置后策略变更会写入该 JSON 文件。
+    """
 
     def __init__(
         self,
@@ -45,6 +56,7 @@ class RuntimeMonitor:
         max_commands: int = 500,
         state_path: Path | str | None = None,
     ):
+        """初始化内存队列、并发锁及可选持久化状态，不启动后台线程。"""
         self.client_ttl_seconds = client_ttl_seconds
         self._clients: dict[str, dict] = {}
         self._events = deque(maxlen=max_events)
@@ -70,6 +82,7 @@ class RuntimeMonitor:
         return str(value or '').strip()[:limit]
 
     def _load_state(self) -> None:
+        """从 JSON 恢复允许持久化的字段；文件缺失、损坏时保留默认值。"""
         if not self._state_path or not self._state_path.exists():
             return
         try:
@@ -84,6 +97,7 @@ class RuntimeMonitor:
             self._account_policies = data['accounts']
 
     def _persist_state_locked(self) -> None:
+        """通过同目录临时文件替换持久化策略；调用时必须已持有条件锁。"""
         if not self._state_path:
             return
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +112,7 @@ class RuntimeMonitor:
         temporary.replace(self._state_path)
 
     def publish(self, event_type: str, payload: dict) -> dict:
+        """在线程锁内追加事件并唤醒长轮询者，返回与内部状态隔离的事件副本。"""
         with self._condition:
             self._cursor += 1
             event = {
@@ -111,6 +126,7 @@ class RuntimeMonitor:
             return deepcopy(event)
 
     def record_error(self, payload: dict) -> dict:
+        """记录一条经过长度限制的运行错误，同时发布 ``runtime_error`` 事件。"""
         error = {
             'id': f"err-{secrets.token_hex(6)}",
             'workerId': self._clean_text(payload.get('workerId'), 160),
@@ -128,6 +144,7 @@ class RuntimeMonitor:
         return deepcopy(error)
 
     def resolve_error(self, error_id: str, resolved: bool = True) -> dict:
+        """切换内存错误的解决状态，并追加审计和事件；找不到 ID 时抛 ``ValueError``。"""
         with self._condition:
             for error in self._errors:
                 if error['id'] == error_id:
@@ -141,6 +158,7 @@ class RuntimeMonitor:
         return result
 
     def audit(self, action: str, payload: dict | None = None, actor: str = 'dashboard') -> dict:
+        """追加控制操作审计并发布事件；记录仅在本进程有界队列中保留。"""
         record = {
             'id': f"audit-{secrets.token_hex(6)}",
             'action': self._clean_text(action, 100),
@@ -154,6 +172,11 @@ class RuntimeMonitor:
         return deepcopy(record)
 
     def enqueue_command(self, action: str, worker_id: str = '', payload: dict | None = None, actor: str = 'dashboard') -> dict:
+        """创建面向指定工作器或全局的内存命令，并返回可公开的命令副本。
+
+        部分全局快捷命令会立即更新并持久化安全开关；所有命令都会产生审计和事件。
+        空动作会抛 ``ValueError``。
+        """
         action = self._clean_text(action, 80)
         worker_id = self._clean_text(worker_id, 160)
         if not action:
@@ -170,7 +193,7 @@ class RuntimeMonitor:
         }
         with self._condition:
             self._commands.append(command)
-        # Global pause/resume and safety shortcuts are effective immediately.
+        # 全局暂停、恢复和扫描模式需要立即生效，不等待工作器下次领取命令。
         if not worker_id and action in {'pause', 'pause_all'}:
             self.update_safety({'globalPaused': True}, actor=actor, audit=False)
         elif not worker_id and action in {'resume', 'resume_all'}:
@@ -190,6 +213,7 @@ class RuntimeMonitor:
         }
 
     def _apply_command_results(self, worker_id: str, results: list) -> None:
+        """合并工作器回传的命令结果，并为每个有效结果发布状态事件。"""
         for result in results[-50:]:
             if not isinstance(result, dict):
                 continue
@@ -212,6 +236,7 @@ class RuntimeMonitor:
             self.publish('command_result', {'workerId': worker_id, 'command': public})
 
     def _commands_for_worker(self, worker_id: str) -> list[dict]:
+        """领取一小时内适用于工作器的未完成命令，并在锁内标记为已送达。"""
         now = time.monotonic()
         result = []
         with self._condition:
@@ -238,6 +263,11 @@ class RuntimeMonitor:
         return result
 
     def heartbeat(self, payload: dict) -> dict:
+        """接收工作器心跳并返回当前客户端快照。
+
+        输入中的日志、事件和错误会截断数量后写入内存事件流；客户端状态在条件锁内更新，
+        并发心跳按最后一次写入为准。当前响应不会向浏览器下发可执行命令。
+        """
         worker_id = self._clean_text(payload.get('workerId'), 160)
         if not worker_id:
             raise ValueError('missing_worker_id')
@@ -315,12 +345,12 @@ class RuntimeMonitor:
                 'message': safe_client['lastError'],
             })
         snapshot = self.snapshot()
-        # Heartbeats are monitoring-only. Browser automation is controlled
-        # locally and never receives executable commands from the backend.
+        # 心跳接口只用于监控；浏览器自动化由本地控制，不接收后端可执行命令。
         snapshot['commands'] = []
         return snapshot
 
     def record_action(self, action: dict) -> None:
+        """把业务动作投影为监控事件；失败类动作还会生成一条运行错误。"""
         payload = {
             key: action.get(key)
             for key in (
@@ -343,6 +373,10 @@ class RuntimeMonitor:
             })
 
     def update_safety(self, patch: dict, *, actor: str = 'dashboard', audit: bool = True) -> dict:
+        """校验并原子更新安全开关，持久化后返回完整开关副本。
+
+        不支持的字段会抛 ``ValueError``；默认同时记录审计并发布变更事件。
+        """
         if not isinstance(patch, dict):
             raise ValueError('invalid_safety_payload')
         with self._condition:
@@ -358,6 +392,7 @@ class RuntimeMonitor:
         return result
 
     def update_plan(self, patch: dict, *, actor: str = 'dashboard') -> dict:
+        """规范化并原子更新执行计划，持久化后发布审计和变更事件。"""
         if not isinstance(patch, dict):
             raise ValueError('invalid_plan_payload')
         integers = {'dailyTarget', 'hourlyLimit', 'maxConsecutiveFailures', 'minDelayMs', 'maxDelayMs'}
@@ -385,6 +420,10 @@ class RuntimeMonitor:
         return result
 
     def update_account(self, account_id: str, patch: dict, *, actor: str = 'dashboard') -> dict:
+        """更新单个账号策略并持久化，返回该账号策略的深拷贝。
+
+        账号为空或包含未支持字段时抛 ``ValueError``；成功后发布审计和变更事件。
+        """
         account_id = self._clean_text(account_id, 120)
         if not account_id:
             raise ValueError('missing_account_id')
@@ -410,6 +449,7 @@ class RuntimeMonitor:
         return result
 
     def effective_control(self, worker_id: str, account_id: str) -> dict:
+        """合并全局与账号策略，返回工作器当前应采用的只读控制快照。"""
         with self._condition:
             account = deepcopy(self._account_policies.get(account_id, {}))
             return {
@@ -421,6 +461,7 @@ class RuntimeMonitor:
             }
 
     def snapshot(self) -> dict:
+        """返回客户端在线状态快照；在线性依据单调时钟与 TTL 动态计算。"""
         now = time.monotonic()
         clients = []
         with self._condition:
@@ -443,6 +484,7 @@ class RuntimeMonitor:
         }
 
     def control_state(self, command_limit: int = 100) -> dict:
+        """汇总客户端、策略、命令、错误、审计和近期事件供控制台展示。"""
         snapshot = self.snapshot()
         with self._condition:
             commands = [self._public_command(item) for item in list(self._commands)[-max(1, min(command_limit, 300)):]]
@@ -464,6 +506,7 @@ class RuntimeMonitor:
         }
 
     def diagnostics(self) -> dict:
+        """返回服务存活时间及各类运行态计数，不修改内部状态。"""
         state = self.control_state(300)
         command_counts = {}
         for command in state['commands']:
@@ -486,6 +529,7 @@ class RuntimeMonitor:
         }
 
     def events_after(self, cursor: int, timeout: float = 15.0) -> list[dict]:
+        """长轮询游标后的事件，最多等待 ``timeout`` 秒；超时返回空列表。"""
         deadline = time.monotonic() + timeout
         with self._condition:
             while self._cursor <= cursor:
@@ -496,6 +540,7 @@ class RuntimeMonitor:
             return [deepcopy(event) for event in self._events if event['id'] > cursor]
 
     def recent_events(self, limit: int = 150) -> list[dict]:
+        """返回最近 1 到 500 条事件的深拷贝，读取过程由条件锁保护。"""
         with self._condition:
             return [deepcopy(item) for item in list(self._events)[-max(1, min(limit, 500)):]]
 

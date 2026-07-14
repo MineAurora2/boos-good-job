@@ -1,15 +1,23 @@
+# 本机环境变量；只提交不含真实凭据的示例文件。
 .env
 .env.*
 !.env.example
 
+# 用户配置与真实简历属于个人数据，模板和目录占位文件除外。
 user_config.json
+resumes/*.md
+resumes/*.txt
+!resumes/.gitkeep
 resume*.md
 !resume-example.md
 resume-lock.md
 简历*.md
 简历*.txt
 
+# SQLite 数据、运行日志和审计记录均由程序在本机生成。
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.jsonl
@@ -20,6 +28,7 @@ daily_greet_count.json
 prompt_overrides.json
 cache.json
 
+# Python、IDE 与 Codex/测试工具产生的缓存目录。
 __pycache__/
 .pytest_cache/
 .venv/
@@ -28,10 +37,12 @@ __pycache__/
 .codex-current-tests/
 .codex-test-temp/
 .test-tmp-codex/
+.test-llm-*/
 .tmp-tests/
 .test-run-tmp/
 .test-user-config-security.json
 
+# 本地启动日志、打包产物和仅供开发者使用的项目备忘。
 server.out.log
 server.err.log
 goodjobs.zip

@@ -1,3 +1,10 @@
+"""投递记录、账号每日额度与跨客户端去重的 SQLite 持久化层。
+
+本模块把“检查重复岗位、占用每日额度、更新投递状态”放在数据库事务中完成。
+每次操作使用独立连接，SQLite WAL 模式负责跨线程、跨进程协调；调用方不应绕过
+本模块直接修改相关数据表。
+"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -15,18 +22,19 @@ ACTIVE_STATUSES = {'reserved', 'queued', *FINAL_STATUSES}
 
 
 def normalize_company(company: str) -> str:
-    """生成稳定的公司唯一键，兼容全半角、空格和常见标点差异。"""
+    """将原始公司名规范化为可比较的键；返回空串表示公司名无有效字符。"""
     normalized = unicodedata.normalize('NFKC', company or '').casefold().strip()
     return re.sub(r'[\W_]+', '', normalized, flags=re.UNICODE)
 
 
 def normalize_title(title: str) -> str:
-    """生成稳定的岗位标题键，避免空格、大小写和全半角差异造成漏判。"""
+    """将原始岗位名规范化为可比较的键，不读取或修改持久化数据。"""
     normalized = unicodedata.normalize('NFKC', title or '').casefold().strip()
     return re.sub(r'[\W_]+', '', normalized, flags=re.UNICODE)
 
 
 def delivery_key(company: str, title: str) -> str:
+    """组合公司和岗位规范化键，供数据库判重；公司为空时返回空串。"""
     company_key = normalize_company(company)
     if not company_key:
         return ''
@@ -34,15 +42,21 @@ def delivery_key(company: str, title: str) -> str:
 
 
 class DeliveryStore:
-    """基于 SQLite 的跨线程、跨浏览器投递协调器。"""
+    """基于 SQLite 的跨线程、跨进程投递协调器。
+
+    ``db_path`` 指向持久化数据库，``daily_limit`` 是单账号每日上限。写操作使用
+    ``BEGIN IMMEDIATE`` 串行化关键检查，确保判重、额度校验和记录写入不会竞态。
+    """
 
     def __init__(self, db_path: Path | str, daily_limit: int = 90):
+        """创建存储实例并初始化表结构；必要时会创建目录及迁移旧格式记录。"""
         self.db_path = Path(db_path)
         self.daily_limit = max(1, int(daily_limit))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        """创建一次操作专用的连接，调用方负责关闭或交给 ``_connection`` 托管。"""
         connection = sqlite3.connect(
             self.db_path,
             timeout=30,
@@ -55,6 +69,7 @@ class DeliveryStore:
 
     @contextmanager
     def _connection(self):
+        """提供自动关闭的短连接上下文；不会自动开启显式事务。"""
         connection = self._connect()
         try:
             yield connection
@@ -62,6 +77,7 @@ class DeliveryStore:
             connection.close()
 
     def _initialize(self) -> None:
+        """创建表、索引并迁移旧判重键；构造实例时同步执行且会写数据库。"""
         with self._connection() as connection:
             connection.execute('PRAGMA journal_mode = WAL')
             connection.execute('PRAGMA synchronous = FULL')
@@ -118,8 +134,7 @@ class DeliveryStore:
                         'DELETE FROM company_deliveries WHERE company_key = ?',
                         (row['company_key'],),
                     )
-            # Two-phase key rewrite avoids UNIQUE collisions when upgrading a
-            # database whose rows still use the old company-only key format.
+            # 先改成随机临时键，再统一写入新键，避免旧版“仅公司键”迁移时触发唯一键冲突。
             pending_updates = []
             for expected, row in winners.items():
                 if row['company_key'] != expected:
@@ -144,6 +159,7 @@ class DeliveryStore:
         return datetime.now().strftime('%Y-%m-%d')
 
     def quota_status(self, account_id: str) -> dict:
+        """查询账号当日用量与剩余额度；仅执行数据库读取，不占用额度。"""
         account_id = (account_id or '').strip()
         if not account_id:
             return {
@@ -171,7 +187,11 @@ class DeliveryStore:
         }
 
     def increment_usage(self, account_id: str) -> dict:
-        """兼容旧客户端的原子计数接口。新客户端应使用 claim。"""
+        """为旧客户端原子增加一次当日用量并返回最新额度状态。
+
+        空账号会归入 ``legacy``。该方法会持久化计数但不会创建岗位记录；新客户端
+        应调用 :meth:`claim`，以便判重与占额在同一事务中完成。
+        """
         account_id = (account_id or '').strip() or 'legacy'
         today = self._today()
         now = self._now()
@@ -224,6 +244,12 @@ class DeliveryStore:
         worker_id: str,
         job_url: str = '',
     ) -> dict:
+        """原子申请一个岗位投递占位并占用账号当日额度。
+
+        输入公司、岗位、账号、工作器标识及可选岗位链接。返回 ``accepted``、原因和
+        成功时的 ``claimToken``；重复岗位、字段缺失或额度耗尽均以业务结果返回。
+        ``BEGIN IMMEDIATE`` 保证并发客户端无法同时通过判重或额度检查。
+        """
         company = (company or '').strip()
         title = (title or '').strip()
         account_id = (account_id or '').strip()
@@ -243,6 +269,7 @@ class DeliveryStore:
         claim_token = secrets.token_urlsafe(24)
         connection = self._connect()
         try:
+            # 在读取重复记录和额度前取得写锁，使后续检查与两项写入构成一个原子操作。
             connection.execute('BEGIN IMMEDIATE')
             existing = connection.execute(
                 'SELECT company, title, account_id, status, claimed_at FROM company_deliveries WHERE company_key = ?',
@@ -322,6 +349,11 @@ class DeliveryStore:
             connection.close()
 
     def mark(self, claim_token: str, status: str, error: str = '') -> dict:
+        """按占位令牌原子推进投递状态，并返回是否成功及是否为幂等更新。
+
+        ``status`` 仅允许 ``queued``、``sent``、``failed_unknown``。终态不会被普通
+        重试回退；错误文本最多持久化 1000 个字符。
+        """
         if status not in {'queued', 'sent', 'failed_unknown'}:
             raise ValueError(f'unsupported delivery status: {status}')
         claim_token = (claim_token or '').strip()
@@ -367,6 +399,7 @@ class DeliveryStore:
             connection.close()
 
     def claim_status(self, claim_token: str) -> dict:
+        """按占位令牌读取投递状态；返回 ``exists`` 与可选的 ``delivery`` 记录。"""
         claim_token = (claim_token or '').strip()
         if not claim_token:
             return {'exists': False, 'reason': 'missing_claim_token'}
@@ -383,7 +416,11 @@ class DeliveryStore:
         return {'exists': bool(row), 'delivery': dict(row) if row else None}
 
     def delete_history(self, claim_tokens=None, jobs=None) -> dict:
-        """删除已结束的投递历史；不返还每日额度，避免通过删记录绕过上限。"""
+        """按令牌或“公司、岗位”集合原子删除已结束的投递历史。
+
+        返回删除数量和原记录；发现 ``reserved``/``queued`` 记录时整批回滚并抛出
+        ``ValueError``。删除不会返还每日额度，避免通过删记录绕过上限。
+        """
         tokens = {str(token).strip() for token in (claim_tokens or []) if str(token).strip()}
         job_keys = {
             delivery_key(company, title)
@@ -432,7 +469,10 @@ class DeliveryStore:
             connection.close()
 
     def release(self, claim_token: str, reason: str = '') -> dict:
-        """仅释放确认尚未发起沟通的占位，并返还账号当日名额。"""
+        """原子释放尚未发起沟通的占位，并返还对应账号的当日名额。
+
+        仅 ``reserved`` 状态可释放；不存在或已经开始的记录以业务结果返回，不抛异常。
+        """
         claim_token = (claim_token or '').strip()
         connection = self._connect()
         try:
@@ -466,6 +506,7 @@ class DeliveryStore:
             connection.close()
 
     def company_status(self, company: str, title: str = '') -> dict:
+        """查询指定公司与岗位是否已有投递记录；该操作只读且不占用额度。"""
         company_key = delivery_key(company, title)
         if not company_key:
             return {'exists': False, 'reason': 'missing_company'}
@@ -483,7 +524,10 @@ class DeliveryStore:
         return {'exists': bool(row), 'delivery': dict(row) if row else None}
 
     def record_legacy_sent(self, company: str, title: str, account_id: str = 'legacy') -> dict:
-        """兼容旧客户端：原子写入公司+岗位记录，但不重复占用每日额度。"""
+        """兼容旧客户端，幂等写入已投递记录但不占用或修改每日额度。
+
+        返回 ``success`` 和 ``duplicate``；数据库唯一键负责并发导入时的去重。
+        """
         company = (company or '').strip()
         title = (title or '').strip()
         company_key = delivery_key(company, title)
@@ -504,6 +548,7 @@ class DeliveryStore:
         return {'success': True, 'duplicate': cursor.rowcount == 0}
 
     def import_legacy_jsonl(self, path: Path | str) -> int:
+        """从旧 JSONL 文件导入公司和岗位，跳过坏行并返回新增记录数。"""
         path = Path(path)
         if not path.exists():
             return 0
@@ -520,7 +565,11 @@ class DeliveryStore:
         return imported
 
     def import_action_log(self, path: Path | str) -> int:
-        """从历史动作日志恢复可能已经发起过沟通的公司，采用宁可少投、不重复投。"""
+        """从历史动作 JSONL 恢复可能已沟通的岗位，并返回新增记录数。
+
+        仅识别投递相关动作，坏行会被忽略。导入会写数据库但不占每日额度，策略上采用
+        “宁可少投、不重复投”。
+        """
         path = Path(path)
         if not path.exists():
             return 0

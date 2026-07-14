@@ -1,3 +1,9 @@
+"""内置 LLM 提示词及网页自定义覆盖的加载、校验与持久化逻辑。
+
+内置常量是恢复默认值的基线；网页修改只写入 ``prompt_overrides.json``，
+运行时再将覆盖内容合并到模块全局变量，避免直接改写 Python 源文件。
+"""
+
 INTRODUCE = """你是一名求职者，正在找工作
 # 场景 Background
 你现在在网上看到了一个感兴趣的职位，需要发送一段打招呼的话，根据自己的简历内容，精准地提炼出核心信息，展现个人优势与职业经历。
@@ -239,12 +245,14 @@ _OVERRIDE_PATH = _Path(__file__).resolve().parent / 'prompt_overrides.json'
 
 
 def validate_prompt(name: str, content: str) -> None:
+    """校验提示词名称、长度及格式化占位符是否符合该场景约束。"""
     if name not in PROMPT_KEYS:
         raise ValueError(f'不支持的提示词: {name}')
     if not isinstance(content, str) or not content.strip():
         raise ValueError('提示词内容不能为空')
     if len(content) > 50000:
         raise ValueError('单个提示词不能超过 50000 字符')
+    # 占位符采用白名单校验，防止保存后因字段缺失或意外属性访问导致运行时失败。
     try:
         fields = {
             field_name.split('.')[0].split('[')[0]
@@ -269,6 +277,7 @@ def validate_prompt(name: str, content: str) -> None:
 
 
 def _load_prompt_overrides() -> dict[str, str]:
+    """读取有效的提示词覆盖；文件损坏时安全回退到内置默认值。"""
     if not _OVERRIDE_PATH.exists():
         return {}
     try:
@@ -283,6 +292,7 @@ def _load_prompt_overrides() -> dict[str, str]:
 
 
 def reload_prompt_overrides() -> dict[str, str]:
+    """重新合并内置提示词和磁盘覆盖，并更新当前进程中的生效值。"""
     effective = dict(_DEFAULT_PROMPTS)
     effective.update(_load_prompt_overrides())
     globals().update(effective)
@@ -290,10 +300,12 @@ def reload_prompt_overrides() -> dict[str, str]:
 
 
 def get_prompt_values() -> dict[str, str]:
+    """返回全部当前生效的提示词。"""
     return {key: globals()[key] for key in PROMPT_KEYS}
 
 
 def save_prompt_values(values: dict[str, str]) -> dict[str, str]:
+    """保存与默认值不同的提示词覆盖，并立即重新加载生效值。"""
     if not isinstance(values, dict):
         raise ValueError('提示词数据必须是对象')
     overrides = _load_prompt_overrides()
@@ -304,6 +316,7 @@ def save_prompt_values(values: dict[str, str]) -> dict[str, str]:
             overrides.pop(name, None)
         else:
             overrides[name] = normalized
+    # 先写临时文件再替换，避免中途退出留下半份 JSON 配置。
     temp_path = _OVERRIDE_PATH.with_suffix('.json.tmp')
     temp_path.write_text(_json.dumps(overrides, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     temp_path.replace(_OVERRIDE_PATH)

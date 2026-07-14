@@ -1,15 +1,15 @@
+"""处理大模型纯文本响应的轻量解析工具。"""
+
 import re
 
 
 def getLLMReply(content: str) -> str:
-    """
-    获取大模型的回复
-    """
+    """移除部分推理模型返回的 ``<think>`` 前缀，只保留最终回复。"""
     return content.split('</think>\n')[-1].strip()
 
 
 def getMatchScore(text: str) -> int | None:
-    """从文本直接获取匹配度数值"""
+    """从纯数字或包含“匹配”字样的文本中提取匹配分数。"""
     # 如果只有数值
     if re.search(r'^\d+$', text):
         return int(text)

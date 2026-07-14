@@ -1,3 +1,9 @@
+"""OpenAI 兼容接口的底层请求网关。
+
+该模块集中处理单个大模型接口的并发限制、请求节流、失败重试、结果缓存、
+相同请求合并和熔断状态。上层的多接口选择与故障转移由 ``llm_manager`` 负责。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +23,7 @@ RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 def _response_text(value) -> str:
-    """Normalize text returned by OpenAI-compatible providers."""
+    """把不同兼容服务返回的字符串或内容分片统一整理为纯文本。"""
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, list):
@@ -34,6 +40,8 @@ def _response_text(value) -> str:
 
 
 class LLMGatewayError(RuntimeError):
+    """包装请求失败，并携带 HTTP 状态码和熔断拒绝标记。"""
+
     def __init__(self, message: str, *, status_code: int | None = None, circuit_open: bool = False):
         super().__init__(message)
         self.status_code = status_code
@@ -41,11 +49,13 @@ class LLMGatewayError(RuntimeError):
 
 
 class LLMGateway:
-    """Process-wide LLM concurrency gate with retry, cache and circuit breaker."""
+    """单个接口的进程级并发网关，提供重试、缓存和熔断保护。"""
 
     def __init__(self, client_factory: Callable | None = None):
+        # trust_env=False 很重要：只有显式启用的 provider 代理才会生效，避免系统环境
+        # 中的 HTTP_PROXY/HTTPS_PROXY 悄悄改变“关闭代理”接口的连接路径。
         self._client_factory = client_factory or (
-            lambda timeout, proxy: httpx.AsyncClient(timeout=timeout, proxy=proxy)
+            lambda timeout, proxy: httpx.AsyncClient(timeout=timeout, proxy=proxy, trust_env=False)
         )
         self._lock = threading.Lock()
         self._semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
@@ -80,6 +90,7 @@ class LLMGateway:
             return default
 
     def _semaphore(self, limit: int) -> asyncio.Semaphore:
+        """按事件循环和并发上限复用信号量，避免跨事件循环使用异步原语。"""
         loop_key = id(asyncio.get_running_loop())
         key = (loop_key, limit)
         with self._lock:
@@ -91,6 +102,7 @@ class LLMGateway:
 
     @staticmethod
     def _cache_key(config: dict, payload: dict, purpose: str) -> str:
+        """根据接口、模型、业务用途和请求体生成稳定的缓存键。"""
         source = json.dumps(
             {
                 'purpose': purpose,
@@ -105,6 +117,7 @@ class LLMGateway:
         return hashlib.sha256(source.encode('utf-8')).hexdigest()
 
     def _get_cached(self, key: str, ttl: float) -> dict | None:
+        """读取未过期缓存，并更新 LRU 顺序和命中计数。"""
         if ttl <= 0:
             return None
         now = time.monotonic()
@@ -121,6 +134,7 @@ class LLMGateway:
             return value
 
     def _put_cached(self, key: str, value: dict, ttl: float) -> None:
+        """写入有过期时间的结果；最多保留 512 条，防止常驻进程无限增长。"""
         if ttl <= 0:
             return
         with self._lock:
@@ -130,6 +144,7 @@ class LLMGateway:
                 self._cache.popitem(last=False)
 
     def _check_circuit(self) -> None:
+        """检查熔断状态，并在冷却结束后只放行一个半开探测请求。"""
         now = time.monotonic()
         with self._lock:
             if self._open_until > now:
@@ -140,12 +155,15 @@ class LLMGateway:
                     circuit_open=True,
                 )
             if self._open_until:
+                # 冷却期结束后进入半开状态。并发请求中只有第一个负责探测上游，
+                # 其余请求立即失败，避免故障服务刚恢复时被瞬时流量再次压垮。
                 if self._half_open_in_progress:
                     self._circuit_rejections += 1
                     raise LLMGatewayError('LLM circuit half-open probe in progress', circuit_open=True)
                 self._half_open_in_progress = True
 
     def _record_success(self) -> None:
+        """记录成功并关闭熔断器；半开探测成功也在这里恢复正常流量。"""
         with self._lock:
             self._successes += 1
             self._consecutive_failures = 0
@@ -155,6 +173,7 @@ class LLMGateway:
             self._last_success_at = datetime.now().isoformat(timespec='seconds')
 
     def _record_failure(self, config: dict, error: Exception) -> None:
+        """累计连续失败，达到阈值后在配置的冷却时间内打开熔断器。"""
         threshold = self._int(config, 'circuit_failure_threshold', 3, 1)
         open_seconds = self._float(config, 'circuit_open_seconds', 60, 1)
         with self._lock:
@@ -167,6 +186,7 @@ class LLMGateway:
                 self._open_until = time.monotonic() + open_seconds
 
     def _reserve_request_slot(self, interval: float) -> float:
+        """原子预订下一个发送时刻，使并发任务也遵守最小请求间隔。"""
         if interval <= 0:
             return 0.0
         now = time.monotonic()
@@ -177,6 +197,7 @@ class LLMGateway:
 
     @staticmethod
     def _retry_after(response: httpx.Response | None) -> float:
+        """解析服务端 Retry-After 秒数；无效值按无需额外等待处理。"""
         if response is None:
             return 0.0
         value = response.headers.get('Retry-After', '').strip()
@@ -186,6 +207,7 @@ class LLMGateway:
             return 0.0
 
     async def _request(self, config: dict, payload: dict) -> dict:
+        """执行一次逻辑请求，包含限流、重试、响应校验和熔断统计。"""
         max_concurrent = self._int(config, 'max_concurrent_requests', 1, 1)
         retries = self._int(config, 'retry_count', 2, 0)
         base_delay = self._float(config, 'retry_base_delay', 1.0)
@@ -204,7 +226,13 @@ class LLMGateway:
             with self._lock:
                 self._requests += 1
             last_error: Exception | None = None
-            async with self._client_factory(timeout, proxy) as client:
+            try:
+                client_context = self._client_factory(timeout, proxy)
+            except (httpx.InvalidURL, ValueError, ImportError) as error:
+                final_error = LLMGatewayError(f'{type(error).__name__}: {error}')
+                self._record_failure(config, final_error)
+                raise final_error from error
+            async with client_context as client:
                 for attempt in range(retries + 1):
                     wait_for_slot = self._reserve_request_slot(min_interval)
                     if wait_for_slot:
@@ -243,6 +271,8 @@ class LLMGateway:
                         with self._lock:
                             self._retries += 1
                         retry_after = self._retry_after(response)
+                        # 指数退避叠加少量随机抖动，减少多个任务同时重试造成的尖峰；
+                        # 服务端明确给出的 Retry-After 拥有更高优先级。
                         delay = min(max_delay, base_delay * (2 ** attempt))
                         delay = max(retry_after, delay + random.uniform(0, max(0.05, delay * 0.2)))
                         await asyncio.sleep(delay)
@@ -252,6 +282,7 @@ class LLMGateway:
             raise final_error
 
     async def chat_completions(self, config: dict, payload: dict, purpose: str) -> dict:
+        """返回聊天补全结果，并合并同一事件循环中的相同在途请求。"""
         cache_ttl = self._float(config, 'cache_ttl_seconds', 1800)
         cache_key = self._cache_key(config, payload, purpose)
         cached = self._get_cached(cache_key, cache_ttl)
@@ -261,6 +292,7 @@ class LLMGateway:
         loop_key = id(asyncio.get_running_loop())
         inflight_key = (loop_key, cache_key)
         with self._lock:
+            # owner 创建真实网络任务，后续相同请求只等待该任务，避免重复计费。
             task = self._inflight.get(inflight_key)
             owner = task is None
             if owner:
@@ -272,8 +304,8 @@ class LLMGateway:
             finish_reason = choices[0].get('finish_reason') if choices and isinstance(choices[0], dict) else None
             message = choices[0].get('message') if choices and isinstance(choices[0], dict) else None
             has_final_content = isinstance(message, dict) and bool(_response_text(message.get('content')))
-            # Reasoning-only responses are valid upstream responses and must not
-            # trip the circuit, but they are not reusable final answers.
+            # 仅含推理内容的响应仍是合法上游响应，不应触发熔断；但它没有可直接复用的
+            # 最终答案。因长度截断的响应同样不进入缓存，避免后续命中不完整结果。
             if owner and finish_reason != 'length' and has_final_content:
                 self._put_cached(cache_key, result, cache_ttl)
             return result
@@ -283,6 +315,7 @@ class LLMGateway:
                     self._inflight.pop(inflight_key, None)
 
     def reset_circuit(self, clear_cache: bool = False) -> None:
+        """手动重置熔断状态，并可选择同时清空结果缓存。"""
         with self._lock:
             self._consecutive_failures = 0
             self._open_until = 0.0
@@ -292,6 +325,7 @@ class LLMGateway:
                 self._cache.clear()
 
     def snapshot(self) -> dict:
+        """返回供管理面板展示的只读运行状态和累计指标。"""
         now = time.monotonic()
         with self._lock:
             remaining = max(0, int(self._open_until - now + 0.999))

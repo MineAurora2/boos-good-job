@@ -1,3 +1,9 @@
+"""将投递动作日志与 SQLite 最终状态整理为仪表盘可直接消费的数据。
+
+本模块只读取 JSONL 日志和投递数据库，不修改源数据。解析时对损坏日志、数据库暂时
+不可用和不规范的城市/薪资文本采用容错降级，避免统计接口因单条历史数据失败。
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -26,6 +32,7 @@ CITY_PREFIXES = sorted({
 
 
 def extract_city(value: str | None) -> str:
+    """从地点文本提取城市前缀并去掉“市”后缀；无法识别时返回空串。"""
     text = re.sub(r'\s+', '', str(value or '')).strip()
     if not text:
         return ''
@@ -39,6 +46,7 @@ def extract_city(value: str | None) -> str:
 
 
 def _read_jsonl(path: Path) -> list[dict]:
+    """读取 JSONL 中的对象记录；文件不存在或单行损坏时静默跳过。"""
     if not path.exists():
         return []
     records = []
@@ -54,7 +62,7 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def parse_salary_k(salary: str | None) -> float | None:
-    """将 12-20K、15K、8-12K·13薪等格式折算为月薪中位数（K）。"""
+    """将常见薪资文本折算为月薪区间中位数（K）；无法解析时返回 ``None``。"""
     if not salary:
         return None
     text = str(salary).upper().replace('Ｋ', 'K').replace(',', '')
@@ -72,6 +80,11 @@ def parse_salary_k(salary: str | None) -> float | None:
 
 
 def parse_salary_details(salary: str | None) -> dict:
+    """解析月薪上下限、中位数和薪数，返回仪表盘使用的四个标准字段。
+
+    支持 K 制区间、元/月区间和单值 K；无法识别月薪时三个薪资值为 ``None``，
+    未注明薪数时按 12 薪展示。该函数无文件或数据库副作用。
+    """
     text = str(salary or '').upper().replace('Ｋ', 'K').replace(',', '')
     values: list[float] = []
     range_match = re.search(r'(\d+(?:\.\d+)?)\s*K?\s*[-~—至]\s*(\d+(?:\.\d+)?)\s*K', text)
@@ -97,6 +110,7 @@ def parse_salary_details(salary: str | None) -> dict:
 
 
 def _database_statuses(db_path: Path) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+    """只读加载投递状态，并分别按令牌及“公司、岗位”建立索引。"""
     if not db_path.exists():
         return {}, {}
     by_token: dict[str, dict] = {}
@@ -125,6 +139,7 @@ def _database_statuses(db_path: Path) -> tuple[dict[str, dict], dict[tuple[str, 
 
 
 def _record_status(record: dict, final_by_token: dict[str, str], db_by_token: dict[str, dict], db_by_job: dict[tuple[str, str], dict]) -> str:
+    """按动作终态、令牌数据库记录、岗位记录的优先级推导展示状态。"""
     action = record.get('action')
     if action == 'chat_greet_sent':
         return 'sent'
@@ -142,7 +157,10 @@ def _record_status(record: dict, final_by_token: dict[str, str], db_by_token: di
 
 
 def delivery_sources(actions: list[dict]) -> list[dict]:
-    """Return the source action behind each visible delivery row."""
+    """筛选每条可见投递的源动作，并按 ``claimToken`` 去重且保留原顺序。
+
+    返回项包含稳定展示 ID、原列表下标和原记录引用；函数不会修改传入动作列表。
+    """
     sources = []
     seen_tokens: set[str] = set()
     for index, record in enumerate(actions):
@@ -168,9 +186,15 @@ def delivery_sources(actions: list[dict]) -> list[dict]:
 
 
 def load_dashboard_data(action_log_path: Path, delivery_db_path: Path) -> dict:
+    """聚合动作 JSONL 与投递数据库，返回统计摘要和倒序投递明细。
+
+    两个路径均为只读输入。数据库状态用于弥补异步日志中的中间态；源文件缺失或数据库
+    暂不可读时仍返回结构完整的空数据或日志侧结果。
+    """
     actions = _read_jsonl(action_log_path)
     db_by_token, db_by_job = _database_statuses(delivery_db_path)
 
+    # 同一令牌可能有多条动作；按日志顺序保留最后出现的终态，再与数据库状态交叉校正。
     final_by_token: dict[str, str] = {}
     for record in actions:
         token = record.get('claimToken') or ''

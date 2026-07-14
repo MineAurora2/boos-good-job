@@ -1,22 +1,34 @@
+"""管理后台的配置、简历选择和提示词持久化适配层。
+
+该模块负责校验管理端提交的完整配置，并通过临时文件替换方式写入
+``user_config.json``；简历文件与提示词的具体读写分别委托给对应存储模块。
+文件写入不提供多写者锁，HTTP/调用层应避免对同一资源并发保存。
+"""
+
 from __future__ import annotations
 
 import copy
 import json
 import os
 from pathlib import Path
-import re
 
 from config import Config
 import prompts
+from resume_store import (
+    list_resume_files,
+    read_resume_file,
+    require_resume_file,
+    save_resume_file,
+    validate_resume_name,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / 'user_config.json'
-RESUME_SUFFIXES = {'.md', '.txt'}
-MAX_RESUME_SIZE = 2 * 1024 * 1024
 
 
 def _read_json(path: Path, default):
+    """读取 JSON；文件缺失或损坏时返回 ``default`` 的深拷贝，避免共享可变默认值。"""
     if not path.exists():
         return copy.deepcopy(default)
     try:
@@ -26,6 +38,7 @@ def _read_json(path: Path, default):
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    """刷新临时文件后原子替换目标文件；调用方应串行处理同一路径的写入。"""
     temp_path = path.with_name(f'.{path.name}.tmp')
     with temp_path.open('w', encoding='utf-8', newline='\n') as file:
         file.write(content)
@@ -35,12 +48,18 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _validate_number(container: dict, key: str, minimum: float, maximum: float) -> None:
+    """校验字典中的数值字段范围；布尔值不按整数接受，失败时抛 ``ValueError``。"""
     value = container.get(key)
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not minimum <= value <= maximum:
         raise ValueError(f'{key} 必须在 {minimum} 到 {maximum} 之间')
 
 
 def validate_config(config: dict) -> None:
+    """校验一份完整的用户配置，不修改传入对象或磁盘内容。
+
+    检查基础分组、关键词、简历名、前后端参数和扣星规则；任一字段不合法时抛出
+    面向管理端展示的 ``ValueError``。
+    """
     if not isinstance(config, dict):
         raise ValueError('配置必须是 JSON 对象')
     for key in ('frontend', 'backend', 'scoring'):
@@ -51,9 +70,13 @@ def validate_config(config: dict) -> None:
         raise ValueError('tags 必须是 1 到 80 个关键词的数组')
     if any(not isinstance(tag, str) or not tag.strip() or len(tag) > 80 for tag in tags):
         raise ValueError('tags 中存在无效关键词')
-    for key in ('introduce', 'character', 'resume_content'):
+    normalized_tags = [tag.strip().casefold() for tag in tags]
+    if len(set(normalized_tags)) != len(normalized_tags):
+        raise ValueError('tags 中存在重复关键词')
+    for key in ('introduce', 'character', 'resume_name'):
         if not isinstance(config.get(key), str):
             raise ValueError(f'{key} 必须是字符串')
+    validate_resume_name(config['resume_name'])
 
     frontend = config['frontend']
     if not isinstance(frontend.get('serverHost'), str) or not frontend['serverHost'].strip():
@@ -89,6 +112,10 @@ def validate_config(config: dict) -> None:
 
 
 def get_public_config() -> dict:
+    """重新加载磁盘配置并返回可公开副本、修订号及需重启字段列表。
+
+    调用会刷新 ``Config`` 的进程内有效值，但不会写文件。
+    """
     effective = Config.reload()
     public = copy.deepcopy(effective)
     return {
@@ -99,16 +126,22 @@ def get_public_config() -> dict:
 
 
 def save_config(payload: dict) -> dict:
+    """校验并原子替换 ``user_config.json``，随后热加载并返回最新公开配置。
+
+    ``payload`` 必须含完整 ``config`` 对象。旧版简历内容和 LLM 字段会被丢弃，避免
+    敏感接口配置写入普通 JSON；多请求并发保存时应由上层串行化。
+    """
     incoming = payload.get('config') if isinstance(payload, dict) else None
     if not isinstance(incoming, dict):
         raise ValueError('缺少 config 对象')
-    # The admin page submits the complete visual form. Treat it as a replacement
-    # instead of recursively merging keyword maps; otherwise deleted scoring
-    # keywords are silently restored from the previous JSON/default config.
+    # 管理页提交完整表单，因此直接替换；若递归合并，已删除的扣星关键词会被旧值恢复。
     merged = copy.deepcopy(incoming)
+    merged.pop('resume_content', None)
+    if isinstance(merged.get('tags'), list):
+        merged['tags'] = [tag.strip() if isinstance(tag, str) else tag for tag in merged['tags']]
     # 大模型接口已迁移到 .env，绝不写回 user_config.json。
     merged.pop('llm', None)
-    for legacy_key in ('resume_name', 'think_model', 'chat_model'):
+    for legacy_key in ('think_model', 'chat_model'):
         merged.pop(legacy_key, None)
     validate_config(merged)
     _atomic_write_text(CONFIG_PATH, json.dumps(merged, ensure_ascii=False, indent=2) + '\n')
@@ -116,63 +149,43 @@ def save_config(payload: dict) -> dict:
     return get_public_config()
 
 
-def _safe_resume_path(name: str) -> Path:
-    clean_name = Path(name or '').name
-    if clean_name != name or not clean_name or not re.fullmatch(r'[\w\-.\u4e00-\u9fff]+', clean_name):
-        raise ValueError('简历文件名无效')
-    path = (ROOT / clean_name).resolve()
-    if path.parent != ROOT.resolve() or path.suffix.lower() not in RESUME_SUFFIXES:
-        raise ValueError('只允许项目根目录下的 .md 或 .txt 简历')
-    return path
-
-
-def _auto_selected_resume(items: list[dict]) -> str:
-    """无简历指针后，按优先级自动选择：简历_精简.md → resume.md → 首个存在的文件。"""
-    for preferred in ('简历_精简.md', 'resume.md'):
-        if any(item['name'] == preferred and item['exists'] for item in items):
-            return preferred
-    return next((item['name'] for item in items if item['exists']), '')
-
-
 def list_resumes() -> dict:
-    names = set()
-    for path in ROOT.iterdir():
-        if not path.is_file() or path.suffix.lower() not in RESUME_SUFFIXES:
-            continue
-        lower = path.name.lower()
-        if 'resume' in lower or '简历' in path.name:
-            names.add(path.name)
-    items = []
-    for name in sorted(names):
-        path = _safe_resume_path(name)
-        items.append({
-            'name': name,
-            'exists': path.exists(),
-            'size': path.stat().st_size if path.exists() else 0,
-            'updatedAt': path.stat().st_mtime if path.exists() else None,
-        })
-    selected = _auto_selected_resume(items)
-    return {'selected': selected, 'configured': selected, 'items': items}
+    """列出可管理简历及当前选择；只读取目录和进程内配置。"""
+    return list_resume_files(Config.resume_name)
 
 
 def read_resume(name: str) -> dict:
-    path = _safe_resume_path(name)
-    content = path.read_text(encoding='utf-8') if path.exists() else ''
-    return {'name': name, 'content': content, 'size': len(content.encode('utf-8'))}
+    """读取指定简历的名称、内容和 UTF-8 字节数；非法路径由存储层拒绝。"""
+    return read_resume_file(name)
+
+
+def select_resume(name: str) -> dict:
+    """确认简历存在后持久化当前选择，并返回更新后的简历列表。
+
+    此操作会改写用户配置并热加载 ``Config``，不会修改简历文件本身。
+    """
+    selected = require_resume_file(name)
+    public = get_public_config()['config']
+    public['resume_name'] = selected
+    save_config({'config': public})
+    return list_resumes()
 
 
 def save_resume(name: str, content: str, select: bool = True) -> dict:
-    path = _safe_resume_path(name)
-    if not isinstance(content, str):
-        raise ValueError('简历内容必须是文本')
-    if len(content.encode('utf-8')) > MAX_RESUME_SIZE:
-        raise ValueError('简历文件不能超过 2MB')
-    _atomic_write_text(path, content)
-    # 简历不再有“当前选中”指针，保存即写入文件；自动选择逻辑见 _auto_selected_resume。
-    return read_resume(name)
+    """保存简历文本并可选设为当前简历，返回保存后的文件信息。
+
+    ``select=True`` 还会持久化用户配置，因此可能产生两次独立的文件替换；调用方应避免
+    对同一简历并发保存。
+    """
+    result = save_resume_file(name, content)
+    if select:
+        select_resume(name)
+        result['selected'] = True
+    return result
 
 
 def get_prompts() -> dict:
+    """返回提示词键、界面标签和当前内容；不修改提示词文件。"""
     return {
         'items': [
             {'key': key, 'label': prompts.PROMPT_LABELS[key], 'content': value}
@@ -182,5 +195,6 @@ def get_prompts() -> dict:
 
 
 def save_prompts(values: dict) -> dict:
+    """委托提示词模块校验并持久化内容，随后返回完整的最新提示词列表。"""
     prompts.save_prompt_values(values)
     return get_prompts()

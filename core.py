@@ -1,13 +1,19 @@
+"""岗位匹配与 LLM 辅助决策的核心业务逻辑。
+
+这里负责扣星规则计算、读取当前简历，以及生成招呼语和执行 AI 岗位筛选。
+LLM 不可用或返回内容不符合发送规范时，会按各业务场景采用明确的降级结果。
+"""
+
 import prompts
 from config import Config
 from llm_gateway import LLMGatewayError, _response_text
 from llm_manager import LLM_MANAGER
 import json
 import copy
-from pathlib import Path
 import re
 import threading
 import time
+from resume_store import load_resume_selection
 
 
 _LLM_LOG_LOCK = threading.Lock()
@@ -15,6 +21,7 @@ _LLM_LAST_LOGGED_AT: dict[str, float] = {}
 
 
 def _log_llm_fallback(operation: str, error: Exception, fallback: str) -> None:
+    """限频记录同类 LLM 异常，避免接口故障时持续刷屏。"""
     status_code = error.status_code if isinstance(error, LLMGatewayError) else None
     category = 'circuit' if isinstance(error, LLMGatewayError) and error.circuit_open else str(status_code or type(error).__name__)
     key = f'{operation}:{category}'
@@ -45,10 +52,12 @@ def __extract_job_fields(job: str) -> tuple[str, str]:
 
 
 def __normalize_text(text: str) -> str:
+    """统一关键词匹配使用的文本大小写。"""
     return text.lower()
 
 
 def __find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str, int]]:
+    """返回互不重叠的关键词及扣星值，优先保留更具体的长关键词。"""
     normalized = __normalize_text(text)
     candidates = []
     for keyword, score in keyword_scores.items():
@@ -57,8 +66,7 @@ def __find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str,
         while needle and start >= 0:
             candidates.append((start, start + len(needle), keyword, score))
             start = normalized.find(needle, start + 1)
-    # Prefer the most specific (longest) keyword and do not score overlapping
-    # text twice, e.g. "系统运维工程师" no longer also counts "系统"/"运维".
+    # 优先保留最长关键词，避免“系统运维工程师”同时命中“系统”“运维”而重复扣星。
     accepted = []
     occupied = []
     for start, end, keyword, score in sorted(candidates, key=lambda item: (-(item[1] - item[0]), item[0])):
@@ -70,7 +78,7 @@ def __find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str,
 
 
 def evaluateJobMatch(job: str):
-    """Start at five stars and apply deduction-only keyword rules."""
+    """从五星开始应用关键词扣星规则，并返回前端需要的完整评分明细。"""
     title, detail = __extract_job_fields(job)
     title_matches = __find_matches(title, Config.title_deduction_keywords)
     detail_matches = __find_matches(detail, Config.detail_deduction_keywords)
@@ -113,34 +121,16 @@ def evaluateJobMatch(job: str):
 
 
 def _load_resume() -> str:
-    """自动选择简历：优先内联内容，其次按优先级扫描项目根目录下的简历文件。"""
-    if Config.resume_content and Config.resume_content.strip():
-        return Config.resume_content.strip()
-    root = Path(__file__).resolve().parent
-    # 优先使用精简/标准简历文件名，其余按文件名排序兜底。
-    preferred = ['简历_精简.md', 'resume.md', '简历.md']
-    seen: set[str] = set()
-    candidates: list[Path] = []
-    for name in preferred:
-        path = root / name
-        if path.exists() and path.is_file():
-            candidates.append(path)
-            seen.add(path.name)
-    for path in sorted(root.iterdir()):
-        if path.name in seen or not path.is_file() or path.suffix.lower() not in {'.md', '.txt'}:
-            continue
-        lower = path.name.lower()
-        if 'resume' in lower or '简历' in path.name:
-            candidates.append(path)
-    for resume_path in candidates:
-        content = resume_path.read_text(encoding='utf-8').strip()
-        if content:
-            return content
-    return ''
+    """读取网页简历管理器选中的文件，作为所有 LLM 任务的简历来源。"""
+    selected_name, content = load_resume_selection(Config.resume_name)
+    return content.strip() if selected_name else ''
 
 
 async def generateCustomIntroduce(title: str, salary: str, detail: str, *, return_meta: bool = False) -> str | dict:
-    """调用 LLM API 生成定制化打招呼语，失败时返回固定 introduce。"""
+    """生成可直接发送的定制招呼语，失败时返回配置中的固定招呼语。
+
+    ``return_meta`` 为真时额外返回是否由模型生成及降级原因，供异步任务接口展示。
+    """
     def result(text: str, generated: bool, reason: str = '') -> str | dict:
         if return_meta:
             return {'introduce': text, 'generated': generated, 'fallbackReason': reason}
@@ -182,6 +172,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
     }
 
     def extract_content(data: dict) -> tuple[str, str, str]:
+        """从兼容 OpenAI 的响应中分别提取正文、推理内容和结束原因。"""
         choice = data['choices'][0]
         msg = choice['message']
         content = _response_text(msg.get('content'))
@@ -334,11 +325,13 @@ async def llmJobFilter(title: str, salary: str, detail: str) -> tuple[bool, str]
         print(f"[LLM] 岗位筛选: {title} → {'通过' if passed else '不通过'} | 原因: {reason}", flush=True)
         return passed, reason
     except Exception as e:
+        # AI 筛选属于附加关卡；服务异常时保持放行，避免外部接口故障阻断全部投递。
         _log_llm_fallback('岗位筛选', e, '默认通过')
         return True, f'筛选异常: {str(e)[:200]}'
 
 
 async def evaluateSingleRouteDelivery(job: str):
+    """组装单路投递需要的评分、默认招呼语和在线简历序号。"""
     match_result = evaluateJobMatch(job)
     return {
         **match_result,
@@ -348,5 +341,5 @@ async def evaluateSingleRouteDelivery(job: str):
 
 
 def calcJobScore(job: str, resume: str):
-    """计算职位匹配度"""
+    """计算职位匹配分数；``resume`` 参数仅为兼容旧调用签名。"""
     return evaluateJobMatch(job)['score']

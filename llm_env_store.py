@@ -16,6 +16,7 @@
 旧格式 GOODJOB_LLM_API_BASE / GOODJOB_LLM_API_KEY（无编号）会被当作 1 号接口
 读取，首次保存后自动迁移为编号格式。
 """
+
 from __future__ import annotations
 
 import json
@@ -44,6 +45,7 @@ _PROVIDER_RE = re.compile(
 
 
 def _unquote(value: str) -> str:
+    """解析 .env 中的单双引号值；非法 JSON 双引号值退回普通字符串。"""
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] == '"':
         try:
@@ -56,6 +58,7 @@ def _unquote(value: str) -> str:
 
 
 def _quote(value: str) -> str:
+    """仅在 .env 语法需要时给值加双引号并完成转义。"""
     text = str(value if value is not None else '')
     if text == '' or re.search(r'[\s#"\'=]', text):
         return json.dumps(text, ensure_ascii=False)
@@ -63,6 +66,7 @@ def _quote(value: str) -> str:
 
 
 def _to_bool(value, default: bool = True) -> bool:
+    """把网页布尔值和常见环境变量写法统一转换为 bool。"""
     if isinstance(value, bool):
         return value
     if value is None:
@@ -71,12 +75,14 @@ def _to_bool(value, default: bool = True) -> bool:
 
 
 def _read_lines() -> list[str]:
+    """按行读取 .env，文件不存在时视为空配置。"""
     if not ENV_PATH.exists():
         return []
     return ENV_PATH.read_text(encoding='utf-8').splitlines()
 
 
 def _parse_pairs(lines: list[str]) -> dict[str, str]:
+    """解析有效的 KEY=VALUE 行，同时跳过注释、空行和未知文本。"""
     pairs: dict[str, str] = {}
     for raw in lines:
         line = raw.strip()
@@ -106,15 +112,15 @@ def _mask_proxy_url(proxy_url: str) -> str:
         parsed = urlsplit(text)
     except ValueError:
         return '******'
-    if parsed.password is None or '@' not in parsed.netloc:
+    if '@' not in parsed.netloc:
         return text
-    userinfo, host = parsed.netloc.rsplit('@', 1)
-    username = userinfo.split(':', 1)[0]
-    netloc = f'{username}:******@{host}'
+    _, host = parsed.netloc.rsplit('@', 1)
+    netloc = f'******@{host}'
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def _validate_proxy_url(proxy_url: str, provider_name: str) -> None:
+    """限制代理为 http(s) URL，并拒绝容易混淆的查询参数和片段。"""
     try:
         parsed = urlsplit(proxy_url)
         port = parsed.port
@@ -223,6 +229,7 @@ def public_llm_config() -> dict:
 
 
 def _validate_incoming(payload: dict) -> dict:
+    """校验管理面板提交内容，并把保留哨兵还原为已保存的敏感值。"""
     if not isinstance(payload, dict):
         raise ValueError('接口配置必须是对象')
     strategy = str(payload.get('strategy') or DEFAULT_STRATEGY).strip().lower()
@@ -242,6 +249,8 @@ def _validate_incoming(payload: dict) -> dict:
     if len(incoming) > MAX_PROVIDERS:
         raise ValueError(f'最多支持 {MAX_PROVIDERS} 个接口')
 
+    # 前端只能看到脱敏结果，因此修改其他字段时会提交 KEEP_SECRET。这里必须按
+    # 原编号取回明文，不能把星号占位符或哨兵本身写入配置文件。
     existing = {item['index']: item for item in _load_raw()['providers']}
     cleaned = []
     for order, item in enumerate(incoming, start=1):
@@ -267,10 +276,16 @@ def _validate_incoming(payload: dict) -> dict:
             proxy_url = existing.get(old_index, {}).get('proxy_url', '') if isinstance(old_index, int) else ''
         else:
             proxy_url = str(proxy_url_input).strip()
-        proxy_enabled = _to_bool(item.get('proxy_enabled'), bool(proxy_url))
+        if 'proxy_enabled' in item:
+            proxy_enabled = _to_bool(item.get('proxy_enabled'), bool(proxy_url))
+        elif isinstance(old_index, int) and old_index in existing:
+            # 兼容尚未提交代理字段的旧版前端，不能在一次普通保存后误开启代理。
+            proxy_enabled = existing[old_index].get('proxy_enabled', False)
+        else:
+            proxy_enabled = bool(proxy_url)
         if proxy_url:
             _validate_proxy_url(proxy_url, name)
-        if proxy_enabled and not proxy_url:
+        if enabled and proxy_enabled and not proxy_url:
             raise ValueError(f'{name} 已启用代理，但代理地址为空')
         if enabled and (not api_base or not model or not api_key):
             raise ValueError(f'{name} 已启用，但接口地址、模型名称或 API Key 不完整')
@@ -340,6 +355,7 @@ def save_llm_config(payload: dict) -> dict:
 
     content = '\n'.join(lines).rstrip('\n') + '\n'
     temp_path = ENV_PATH.with_name('.env.tmp')
+    # 先完整写入并刷盘，再以原子替换覆盖 .env，避免进程中断留下半份配置。
     with temp_path.open('w', encoding='utf-8', newline='\n') as file:
         file.write(content)
         file.flush()
@@ -351,7 +367,8 @@ def save_llm_config(payload: dict) -> dict:
 
 
 def _sync_environ(config: dict) -> None:
-    """让当前进程立即生效：清掉旧的 GOODJOB_LLM_* 再写入新值。"""
+    """同步当前进程环境，使保存后的配置无需重启即可由管理器重新加载。"""
+    # 先整体清理可避免删除 provider 后，旧编号变量继续残留并被 _load_raw 读到。
     for key in [key for key in os.environ if key.startswith('GOODJOB_LLM')]:
         os.environ.pop(key, None)
     os.environ['GOODJOB_LLM_STRATEGY'] = config['strategy']

@@ -193,6 +193,7 @@
                     <div class="map-content">
                         <div class="map-stage" id="mapStage">
                             <div id="chinaMap" class="china-map" aria-label="可切换省份和地级市层级的中国投递热力地图"></div>
+                            <div id="mapSpecialRegions" class="map-special-regions" aria-label="香港和澳门放大地图"></div>
                             <div class="map-navigation" aria-label="地图缩放控制">
                                 <button id="mapZoomIn" title="放大地图" aria-label="放大地图">＋</button>
                                 <span id="mapZoomValue">100%</span>
@@ -337,9 +338,9 @@
                     <div class="admin-actions llm-save-bar"><span id="llmNotice">配置保存在本机 .env；API Key 与代理凭据不会回显。</span><button id="saveLlm" class="primary-action"><span aria-hidden="true">✓</span> 保存接口配置</button></div>
                 </div>
                 <div class="admin-view" data-admin-view="resume">
-                    <div class="editor-toolbar"><select id="resumeSelect" class="compact-select"></select><input id="newResumeName" type="text" placeholder="新建文件名，例如 resume.md"><button id="createResume">新建/切换</button><span id="resumeMeta"></span></div>
+                    <div class="editor-toolbar"><select id="resumeSelect" class="compact-select" aria-label="LLM 当前简历"></select><input id="newResumeName" type="text" placeholder="新建文件名，例如 运维工程师.md"><button id="createResume">新建简历</button><span id="resumeMeta"></span></div>
                     <textarea id="resumeEditor" class="large-editor" spellcheck="false" placeholder="在这里编辑 Markdown 简历"></textarea>
-                    <div class="admin-actions"><span>保存后将作为定制招呼语和 AI 筛选使用的简历。</span><button id="saveResume" class="primary-action">保存简历</button></div>
+                    <div class="admin-actions"><span>文件保存在 resumes/；当前简历用于定制招呼语和 AI 二次筛选。</span><button id="saveResume" class="primary-action">保存并设为当前</button></div>
                 </div>
                 <div class="admin-view" data-admin-view="prompts">
                     <div class="editor-toolbar"><select id="promptSelect" class="compact-select"></select><span id="promptHint">提示词中的占位符必须保留</span></div>
