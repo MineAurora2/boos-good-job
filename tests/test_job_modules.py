@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from config import Config
 from job_scoring import evaluate_job_match, parse_job_fields
 import llm_tasks
+from routes import delivery as delivery_routes
 
 
 JOB_TEXT = """# 职位名称
@@ -64,6 +65,33 @@ class JobScoringTests(unittest.TestCase):
         self.assertTrue(result['discarded'])
 
 class LLMTaskTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_llm_greeting_uses_fixed_text_without_calling_model(self):
+        payload = {'company': '示例公司', 'title': '平台工程师', 'salary': '20-30K', 'detail': '岗位描述'}
+        generator = AsyncMock()
+        with patch.object(Config, 'llm_greeting_enabled', False), patch.object(
+            Config, 'introduce', '固定招呼语'
+        ), patch.object(delivery_routes, 'generate_custom_introduce', generator):
+            result = await delivery_routes._generate_introduce_result(payload)
+
+        generator.assert_not_awaited()
+        self.assertEqual(result, {
+            'introduce': '固定招呼语',
+            'generated': False,
+            'fallbackReason': 'LLM 打招呼已关闭',
+        })
+
+    async def test_enabled_llm_greeting_keeps_existing_generation_flow(self):
+        payload = {'company': '示例公司', 'title': '平台工程师', 'salary': '20-30K', 'detail': '岗位描述'}
+        expected = {'introduce': '动态招呼语', 'generated': True, 'fallbackReason': None}
+        generator = AsyncMock(return_value=expected)
+        with patch.object(Config, 'llm_greeting_enabled', True), patch.object(
+            delivery_routes, 'generate_custom_introduce', generator
+        ):
+            result = await delivery_routes._generate_introduce_result(payload)
+
+        generator.assert_awaited_once_with('平台工程师', '20-30K', '岗位描述', return_meta=True)
+        self.assertEqual(result, expected)
+
     async def test_salary_is_in_job_filter_prompt_without_network(self):
         manager = SimpleNamespace(
             job_filter_enabled=True,

@@ -18,7 +18,9 @@ const state = {
     mapCity: '',
     mapLevel: 'province',
     mapView: { scale: 1, x: 0, y: 0, suppressClick: false },
+    mapHeatBreaks: [],
     mapRenderVersion: 0,
+    mapLabelTier: 0,
     industry: '',
     role: '',
     exactDate: '',
@@ -219,7 +221,7 @@ function getRangeRecords() {
     });
 }
 
-function getFilteredRecords(ignoreRange = false) {
+function getFilteredRecords(ignoreRange = false, ignoreMap = false) {
     const search = state.search.trim().toLowerCase();
     const keyword = state.keyword.trim().toLowerCase();
     return (ignoreRange ? state.records : getRangeRecords()).filter((record) => {
@@ -236,8 +238,8 @@ function getFilteredRecords(ignoreRange = false) {
         if (state.education !== 'all' && (record.education || '未知学历') !== state.education) return false;
         if (state.minSalary !== null && (!Number.isFinite(record.salaryMinK) || record.salaryMinK < state.minSalary)) return false;
         if (state.maxSalary !== null && (!Number.isFinite(record.salaryMaxK) || record.salaryMaxK > state.maxSalary)) return false;
-        if (state.mapProvince && normalizeProvince(record.city || record.location) !== state.mapProvince) return false;
-        if (state.mapCity && mapCityName(record) !== state.mapCity) return false;
+        if (!ignoreMap && state.mapProvince && normalizeProvince(record.city || record.location) !== state.mapProvince) return false;
+        if (!ignoreMap && state.mapCity && mapCityName(record) !== state.mapCity) return false;
         return true;
     });
 }
@@ -423,8 +425,53 @@ function mapMetricValue(item, metric) {
 
 function mapColor(value, max) {
     if (!value || !max) return 'var(--map-empty)';
+    const breaks = state.mapHeatBreaks;
+    if (breaks.length === 4) {
+        if (value > breaks[3]) return 'var(--map-5)';
+        if (value > breaks[2]) return 'var(--map-4)';
+        if (value > breaks[1]) return 'var(--map-3)';
+        if (value > breaks[0]) return 'var(--map-2)';
+        return 'var(--map-1)';
+    }
     const ratio = value / max;
     if (ratio > .8) return 'var(--map-5)'; if (ratio > .6) return 'var(--map-4)'; if (ratio > .35) return 'var(--map-3)'; if (ratio > .15) return 'var(--map-2)'; return 'var(--map-1)';
+}
+
+function heatBreaks(values) {
+    const sorted = values.filter((value) => value > 0).sort((a, b) => a - b);
+    if (sorted.length < 5) return [];
+    return [.2, .4, .6, .8].map((ratio) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio))]);
+}
+
+function chooseCityLabels(features, stats) {
+    const scale = state.mapView.scale;
+    const occupied = [];
+    const candidates = features.map((feature) => {
+        const center = feature.properties.centroid || feature.properties.center;
+        const city = normalizeCityName(feature.properties.name);
+        const item = stats.get(city);
+        return { feature, center, city, count: item?.count || 0, selected: state.mapCity === city };
+    }).filter((item) => item.center && (item.count || item.selected || scale >= 6));
+    candidates.sort((a, b) => Number(b.selected) - Number(a.selected) || b.count - a.count || a.feature.properties.name.length - b.feature.properties.name.length);
+    const limit = scale < 3.6 ? 22 : scale < 6 ? 45 : scale < 10 ? 90 : 150;
+    return candidates.filter((item) => {
+        if (occupied.length >= limit && !item.selected) return false;
+        const [baseX, baseY] = projectCoordinate(item.center);
+        const x = baseX * scale + state.mapView.x;
+        const y = baseY * scale + state.mapView.y;
+        const width = Math.max(28, item.feature.properties.name.length * 10);
+        const collision = occupied.some((box) => Math.abs(box.x - x) < (box.width + width) / 2 + 8 && Math.abs(box.y - y) < 17);
+        if (collision && !item.selected) return false;
+        occupied.push({ x, y, width });
+        return true;
+    });
+}
+
+function mapLabelTier(scale) {
+    if (scale >= 10) return 3;
+    if (scale >= 6) return 2;
+    if (scale >= 3.6) return 1;
+    return 0;
 }
 
 function projectCoordinate([longitude, latitude]) {
@@ -478,14 +525,14 @@ function selectMapProvince(province) {
 }
 
 function renderProvinceCallouts(features, stats, metric, max) {
-    const targets = { 香港: [502, 344], 澳门: [494, 369] };
+    const targets = { 香港: [466, 345], 澳门: [460, 367] };
     return Object.entries(targets).map(([name, [targetX, targetY]]) => {
         const feature = features.find((item) => normalizeProvince(item.properties?.name) === name);
         const center = feature?.properties?.centroid || feature?.properties?.center;
         if (!center) return '';
         const [x, y] = projectCoordinate(center);
         const value = mapMetricValue(stats.get(name), metric);
-        return `<g class="geo-region-callout ${state.mapProvince === name ? 'is-active' : ''}" data-province="${name}" tabindex="0" role="button" aria-label="${name}热力区域，点击筛选"><line x1="${x.toFixed(2)}" y1="${y.toFixed(2)}" x2="${(targetX - 7).toFixed(2)}" y2="${targetY.toFixed(2)}"></line><circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="3.2" fill="${mapColor(value, max)}"></circle><text x="${targetX}" y="${targetY + 4}">${name}</text></g>`;
+        return `<g class="geo-region-callout ${state.mapProvince === name ? 'is-active' : ''}" data-province="${name}" tabindex="0" role="button" aria-label="${name}热力区域，点击筛选"><line x1="${x.toFixed(2)}" y1="${y.toFixed(2)}" x2="${(targetX - 5).toFixed(2)}" y2="${targetY.toFixed(2)}"></line><circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="2.2" fill="${mapColor(value, max)}"></circle><text x="${targetX}" y="${targetY + 3}">${name}</text></g>`;
     }).join('');
 }
 
@@ -502,6 +549,7 @@ async function renderMap(records) {
         const { stats, unknown } = level === 'city' ? cityStats(records) : provinceStats(records);
         const values = [...stats.values()].map((item) => mapMetricValue(item, metric));
         const max = Math.max(...values, 0);
+        state.mapHeatBreaks = heatBreaks(values);
         const features = geo.features.filter((feature) => feature.properties?.name);
         container.dataset.mapLevel = level;
         let paths = '';
@@ -513,7 +561,7 @@ async function renderMap(records) {
                 const item = stats.get(name) || { count: 0, salaries: [] };
                 const value = mapMetricValue(item, metric);
                 const title = metric === 'salary' ? `${name}：${value ? value.toFixed(1) + 'K' : '暂无薪资'}` : `${name}：${value} 份`;
-                return `<path class="geo-province ${state.mapProvince === name ? 'is-active' : ''}" data-province="${escapeHtml(name)}" tabindex="0" role="button" aria-label="${title}，点击筛选" d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
+                return `<path class="geo-province ${state.mapProvince === name ? 'is-active' : ''}" data-province="${escapeHtml(name)}" data-map-label="${escapeHtml(name)}" data-map-value="${escapeHtml(title.split('：')[1] || '')}" tabindex="0" role="button" aria-label="${title}，点击筛选" d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
             }).join('');
             labels = features.map((feature) => {
                 const name = normalizeProvince(feature.properties.name);
@@ -534,17 +582,16 @@ async function renderMap(records) {
                 const title = metric === 'salary'
                     ? `${feature.properties.name}：${value ? `平均薪资 ${value.toFixed(1)}K` : '暂无薪资数据'}`
                     : `${feature.properties.name}热力区域${hasData ? '已着色' : '暂无数据'}`;
-                return `<path class="geo-city-boundary ${hasData ? 'has-data' : ''}" ${hasData ? `data-city="${escapeHtml(city)}" tabindex="0" role="button" aria-label="${title}，点击筛选"` : ''} d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
+                return `<path class="geo-city-boundary ${hasData ? 'has-data' : ''}" ${hasData ? `data-city="${escapeHtml(city)}" data-map-label="${escapeHtml(feature.properties.name)}" data-map-value="${escapeHtml(metric === 'salary' ? (value ? `平均 ${value.toFixed(1)}K` : '暂无薪资') : `${item.count} 份投递`)}" tabindex="0" role="button" aria-label="${title}，点击筛选"` : ''} d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
             }).join('');
             const provinceOutlines = features.map((feature) => `<path class="geo-province-outline" d="${geometryPath(feature.geometry)}" fill-rule="evenodd"></path>`).join('');
             paths = `<g class="city-boundary-layer">${cityBoundaries}</g><g class="province-outline-layer">${provinceOutlines}</g>`;
-            labels = cityFeatures.map((feature) => {
+            labels = chooseCityLabels(cityFeatures, stats).map(({ feature, city }) => {
                 const center = feature.properties.centroid || feature.properties.center;
                 if (!center) return '';
-                const city = normalizeCityName(feature.properties.name);
                 const [x, y] = projectCoordinate(center);
                 const length = feature.properties.name.length;
-                const fontSize = length > 10 ? 3.6 : (length > 6 ? 4.2 : 5.1);
+                const fontSize = length > 10 ? 8.5 : (length > 6 ? 9.2 : 10.5);
                 return `<g class="geo-city-label ${stats.get(city)?.count ? 'has-data' : ''}" transform="translate(${x.toFixed(2)} ${y.toFixed(2)})"><g class="map-fixed-visual" transform="scale(${inverseScale})"><text data-base-font-size="${fontSize}">${escapeHtml(feature.properties.name)}</text></g></g>`;
             }).join('');
         }
@@ -554,6 +601,9 @@ async function renderMap(records) {
         updateMapZoomLabel();
         if (renderVersion !== state.mapRenderVersion) return;
         const known = Math.max(0, records.length - unknown);
+        $('#mapKnownCount').textContent = `${values.filter((value) => value > 0).length} 个`;
+        $('#mapLevelLabel').textContent = level === 'city' ? '城市级' : '省级';
+        $('#mapActiveFilter').textContent = state.mapCity || state.mapProvince || '全国';
         $('#knownLocationRate').textContent = `已识别 ${records.length ? Math.round(known / records.length * 100) : 0}%`;
         $('#locationRankingTitle').textContent = level === 'city' ? '热门地级市' : '热门省份';
         $('#mapInteractionHint').textContent = level === 'city'
@@ -564,13 +614,13 @@ async function renderMap(records) {
         const hideCityCount = level === 'city' && metric === 'count';
         $('#mapScaleMin').textContent = hideCityCount ? '低' : (metric === 'salary' ? `${minimum ? minimum.toFixed(0) : 0}K` : `${minimum}份`);
         $('#mapScaleMax').textContent = hideCityCount ? '高' : (metric === 'salary' ? `${max ? max.toFixed(0) : 0}K` : `${max}份`);
-        const ranked = [...stats.entries()].filter(([, item]) => item.count).sort((a, b) => mapMetricValue(b[1], metric) - mapMetricValue(a[1], metric)).slice(0, 7);
+        const ranked = [...stats.entries()].filter(([, item]) => mapMetricValue(item, metric) > 0).sort((a, b) => mapMetricValue(b[1], metric) - mapMetricValue(a[1], metric)).slice(0, 7);
         const rankingMax = ranked.length ? Math.max(...ranked.map(([, item]) => mapMetricValue(item, metric)), 1) : 1;
         $('#locationList').innerHTML = ranked.length ? ranked.map(([name, item], index) => {
             const value = mapMetricValue(item, metric);
             const display = metric === 'salary' ? `${value.toFixed(1)}K` : item.count;
             const selectedLocation = level === 'city' ? state.mapCity : state.mapProvince;
-            return `<div class="ranking-item ${selectedLocation === name ? 'is-active' : ''}" data-map-location="${escapeHtml(name)}"><span>${index + 1}</span><span class="ranking-name">${escapeHtml(name)}</span>${hideCityCount ? '' : `<strong class="ranking-count">${display}</strong>`}<div class="ranking-bar"><i style="width:${value / rankingMax * 100}%"></i></div></div>`;
+            return `<button type="button" class="ranking-item ${selectedLocation === name ? 'is-active' : ''}" data-map-location="${escapeHtml(name)}" aria-pressed="${selectedLocation === name}"><span>${index + 1}</span><span class="ranking-name">${escapeHtml(name)}</span>${hideCityCount ? '' : `<strong class="ranking-count">${display}</strong>`}<span class="ranking-bar"><i style="width:${value / rankingMax * 100}%"></i></span></button>`;
         }).join('') : '<div class="empty-state" style="padding:38px 0"><strong>历史地区尚未采集</strong><p>新投递会自动进入热力地图</p></div>';
     } catch (error) {
         if (renderVersion !== state.mapRenderVersion) return;
@@ -614,10 +664,9 @@ function applyMapTransform() {
 }
 
 function updateCityLabelSizes() {
-    const boost = Math.min(1.85, 1 + Math.log2(Math.max(1, state.mapView.scale)) * .22);
     $$('#chinaMap .geo-city-label text').forEach((label) => {
-        const base = Number(label.dataset.baseFontSize || 5);
-        label.style.fontSize = `${(base * boost).toFixed(2)}px`;
+        const base = Number(label.dataset.baseFontSize || 10);
+        label.style.fontSize = `${base}px`;
     });
 }
 
@@ -628,7 +677,7 @@ function updateMapZoomLabel() {
 }
 
 function zoomMap(nextScale, centerX = 335, centerY = 200) {
-    const view = state.mapView, previousScale = view.scale;
+    const view = state.mapView, previousScale = view.scale, previousLabelTier = mapLabelTier(view.scale);
     const scale = Math.max(1, Math.min(MAP_MAX_SCALE, nextScale));
     if (scale === previousScale) return;
     view.x = centerX - ((centerX - view.x) / previousScale) * scale;
@@ -636,7 +685,9 @@ function zoomMap(nextScale, centerX = 335, centerY = 200) {
     view.scale = scale;
     const levelChanged = syncMapLevelWithScale();
     applyMapTransform();
+    const labelTierChanged = state.mapLevel === 'city' && previousLabelTier !== mapLabelTier(scale);
     if (levelChanged) updateDashboard();
+    else if (labelTierChanged) updateDashboard();
 }
 
 function resetMapView() {
@@ -662,8 +713,31 @@ function clientToSvgPoint(svg, clientX, clientY) {
 
 function initMapNavigation() {
     const map = $('#chinaMap');
+    const stage = $('#mapStage');
+    const tooltip = $('#mapTooltip');
     let pointer = null;
+    const showMapTooltip = (target, clientX, clientY) => {
+        if (!target?.dataset.mapLabel) { tooltip.hidden = true; return; }
+        tooltip.innerHTML = `<strong>${escapeHtml(target.dataset.mapLabel)}</strong><span>${escapeHtml(target.dataset.mapValue || '点击筛选')}</span>`;
+        tooltip.hidden = false;
+        const stageRect = stage.getBoundingClientRect();
+        const left = Math.min(stageRect.width - tooltip.offsetWidth - 18, Math.max(8, clientX - stageRect.left));
+        const top = Math.min(stageRect.height - tooltip.offsetHeight - 18, Math.max(8, clientY - stageRect.top));
+        tooltip.style.left = `${left}px`; tooltip.style.top = `${top}px`;
+    };
+    map.addEventListener('pointermove', (event) => {
+        if (pointer) return;
+        showMapTooltip(event.target.closest('[data-map-label]'), event.clientX, event.clientY);
+    });
+    map.addEventListener('pointerleave', () => { tooltip.hidden = true; });
+    map.addEventListener('focusin', (event) => {
+        const target = event.target.closest('[data-map-label]'); if (!target) return;
+        const rect = target.getBoundingClientRect(); showMapTooltip(target, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    });
+    map.addEventListener('focusout', () => { tooltip.hidden = true; });
     map.addEventListener('wheel', (event) => {
+        const zoomingIn = event.deltaY < 0;
+        if ((!zoomingIn && state.mapView.scale <= 1) || (zoomingIn && state.mapView.scale >= MAP_MAX_SCALE)) return;
         event.preventDefault();
         const svg = map.querySelector('svg'); if (!svg) return;
         const center = clientToSvgPoint(svg, event.clientX, event.clientY);
@@ -710,6 +784,21 @@ function initMapNavigation() {
         const province = event.target.closest('[data-province]');
         if (city) { event.preventDefault(); selectMapCity(city.dataset.city); }
         else if (province) { event.preventDefault(); selectMapProvince(province.dataset.province); }
+    });
+    stage.addEventListener('keydown', (event) => {
+        if (event.target.closest('[data-city], [data-province], button, select')) return;
+        const step = 34;
+        if (event.key === '+' || event.key === '=') { event.preventDefault(); zoomMap(state.mapView.scale * 1.35); }
+        else if (event.key === '-') { event.preventDefault(); zoomMap(state.mapView.scale / 1.35); }
+        else if (event.key === '0') { event.preventDefault(); resetMapView(); }
+        else if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key) && state.mapView.scale > 1) {
+            event.preventDefault();
+            if (event.key === 'ArrowLeft') state.mapView.x += step;
+            if (event.key === 'ArrowRight') state.mapView.x -= step;
+            if (event.key === 'ArrowUp') state.mapView.y += step;
+            if (event.key === 'ArrowDown') state.mapView.y -= step;
+            applyMapTransform();
+        }
     });
     $('#mapZoomIn').addEventListener('click', () => zoomMap(state.mapView.scale * 1.45));
     $('#mapZoomOut').addEventListener('click', () => zoomMap(state.mapView.scale / 1.45));
@@ -1098,7 +1187,7 @@ function closeDrawer() { $('#detailDrawer').classList.remove('open'); $('#drawer
 
 function updateDashboard() {
     const records = getFilteredRecords();
-    renderMetrics(records); renderTrend(getFilteredRecords(true)); renderFunnel(records); renderMap(records); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics(records);
+    renderMetrics(records); renderTrend(getFilteredRecords(true)); renderFunnel(records); renderMap(getFilteredRecords(false, true)); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics(records);
 }
 
 function updateMonitorMetrics(records = getFilteredRecords()) {
@@ -1353,7 +1442,7 @@ async function apiJson(url, options = {}) {
 }
 
 const CONFIG_LABELS = {
-    introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
+    llm_greeting_enabled: '使用 LLM 生成打招呼语', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
@@ -1458,6 +1547,7 @@ function makeConfigControl(path, key, value) {
     let input;
     if (typeof value === 'boolean') {
         label.classList.add('config-switch'); input = document.createElement('input'); input.type = 'checkbox'; input.checked = value; label.prepend(input);
+        if (key === 'llm_greeting_enabled') label.title = '关闭后直接使用固定打招呼语，不调用大模型';
     } else if (Array.isArray(value)) {
         input = document.createElement('textarea'); input.rows = Math.min(8, Math.max(3, value.length)); input.value = value.join('\n'); input.dataset.valueType = 'array';
     } else if (typeof value === 'number') {
@@ -1869,6 +1959,7 @@ async function saveCurrentPrompt() {
 
 function resetFilters() {
     Object.assign(state, { search: '', status: 'all', city: 'all', experience: 'all', education: 'all', minSalary: null, maxSalary: null, keyword: '', mapProvince: '', mapCity: '', industry: '', role: '', exactDate: '', page: 1 });
+    state.mapLevel = 'province'; Object.assign(state.mapView, { scale: 1, x: 0, y: 0, suppressClick: false });
     $('#searchInput').value = ''; $('#statusFilter').value = 'all'; $('#cityFilter').value = 'all'; $('#experienceFilter').value = 'all'; $('#educationFilter').value = 'all'; $('#minSalaryFilter').value = ''; $('#maxSalaryFilter').value = ''; $('#keywordFilter').value = ''; updateDashboard();
 }
 

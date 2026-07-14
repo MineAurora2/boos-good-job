@@ -177,18 +177,25 @@
                     <p class="insight" id="funnelInsight">数据越完整，转化分析越准确。</p>
                 </article>
                 <article id="mapSection" class="panel map-panel report-card report-full" data-widget-id="report-map">
-                    <div class="panel-head">
-                        <div><span class="eyebrow">地区分布</span><h2>投递热力地图</h2></div>
+                    <div class="panel-head map-panel-head">
+                        <div><span class="eyebrow">地区分布</span><h2>投递热力地图</h2><p>查看投递密度与薪资机会，缩放后自动进入城市视图</p></div>
                         <div class="map-head-tools">
+                            <span class="map-live-status"><i></i>实时联动筛选</span>
                             <select id="mapMetric" class="compact-select" aria-label="地图指标">
                                 <option value="count">投递数量</option>
                                 <option value="salary">平均薪资</option>
                             </select>
                         </div>
                     </div>
+                    <div class="map-summary" aria-label="地图数据摘要">
+                        <div><span>有效地区</span><strong id="mapKnownCount">0</strong></div>
+                        <div><span>当前层级</span><strong id="mapLevelLabel">省级</strong></div>
+                        <div><span>当前筛选</span><strong id="mapActiveFilter">全国</strong></div>
+                    </div>
                     <div class="map-content">
-                        <div class="map-stage" id="mapStage">
+                        <div class="map-stage" id="mapStage" tabindex="0" aria-label="地图操作区，可使用方向键平移，加号减号缩放">
                             <div id="chinaMap" class="china-map" aria-label="随缩放自动显示省份或地级市边界的中国投递热力地图"></div>
+                            <div class="map-tooltip" id="mapTooltip" aria-hidden="true" hidden></div>
                             <div class="map-navigation" aria-label="地图缩放控制">
                                 <button id="mapZoomIn" title="放大地图" aria-label="放大地图">＋</button>
                                 <span id="mapZoomValue">100%</span>
@@ -200,7 +207,7 @@
                         <div class="location-ranking">
                             <div class="ranking-title"><span id="locationRankingTitle">热门省份</span><small id="knownLocationRate">已识别 0%</small></div>
                             <div id="locationList" class="ranking-list"></div>
-                            <div class="map-scale"><span id="mapScaleMin">少</span><i></i><i></i><i></i><i></i><i></i><span id="mapScaleMax">多</span></div>
+                            <div class="map-scale-wrap"><span>热力强度</span><div class="map-scale"><span id="mapScaleMin">少</span><i></i><i></i><i></i><i></i><i></i><span id="mapScaleMax">多</span></div></div>
                         </div>
                     </div>
                 </article>

@@ -53,6 +53,8 @@ def validate_config(config: dict) -> None:
     for key in ('introduce', 'character', 'resume_name'):
         if not isinstance(config.get(key), str):
             raise ValueError(f'{key} 必须是字符串')
+    if not isinstance(config.get('llm_greeting_enabled'), bool):
+        raise ValueError('llm_greeting_enabled 必须是开关值')
     validate_resume_name(config['resume_name'])
 
     frontend = config['frontend']
@@ -122,6 +124,8 @@ def save_config(payload: dict) -> dict:
     # 管理页提交完整表单，因此直接替换；若递归合并，已删除的扣星关键词会被旧值恢复。
     merged = copy.deepcopy(incoming)
     merged.pop('resume_content', None)
+    # 兼容尚未提交新开关字段的旧版管理页面，升级后默认维持原有 LLM 行为。
+    merged.setdefault('llm_greeting_enabled', config.DEFAULT_USER_CONFIG['llm_greeting_enabled'])
     if isinstance(merged.get('tags'), list):
         merged['tags'] = [tag.strip() if isinstance(tag, str) else tag for tag in merged['tags']]
     # 大模型接口已迁移到 .env，绝不写回 user_config.json。

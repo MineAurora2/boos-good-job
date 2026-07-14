@@ -40,6 +40,8 @@ _load_env_file(ROOT / '.env')
 
 DEFAULT_USER_CONFIG = {
     'resume_name': 'resume.md',
+    # 开启时按岗位调用 LLM 生成招呼语；关闭时直接使用 introduce 固定文本。
+    'llm_greeting_enabled': True,
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
     'character': '简洁 直接 礼貌',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
@@ -244,6 +246,7 @@ class Config:
     """Process-wide view of the currently effective configuration."""
 
     resume_name = USER_CONFIG['resume_name']
+    llm_greeting_enabled = USER_CONFIG['llm_greeting_enabled']
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
@@ -271,6 +274,7 @@ class Config:
         global USER_CONFIG
         USER_CONFIG = load_user_config()
         cls.resume_name = USER_CONFIG['resume_name']
+        cls.llm_greeting_enabled = USER_CONFIG['llm_greeting_enabled']
         cls.introduce = USER_CONFIG['introduce']
         cls.character = USER_CONFIG['character']
         cls.tags = USER_CONFIG['tags']

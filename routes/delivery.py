@@ -109,6 +109,13 @@ def _validate_introduce_payload(payload: dict) -> dict:
 
 
 async def _generate_introduce_result(payload: dict) -> dict:
+    # 系统管理关闭 LLM 招呼语后，在这里统一短路同步和后台生成接口。
+    if not Config.llm_greeting_enabled:
+        return {
+            'introduce': Config.introduce,
+            'generated': False,
+            'fallbackReason': 'LLM 打招呼已关闭',
+        }
     print(
         f'[LLM] 所有投递条件已通过，开始生成最终招呼语 | '
         f'company={payload["company"]} | title={payload["title"]}',

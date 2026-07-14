@@ -176,6 +176,16 @@ class DashboardProjectionTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_llm_greeting_switch_requires_a_boolean(self):
+        enabled = copy.deepcopy(config.DEFAULT_USER_CONFIG)
+        enabled['llm_greeting_enabled'] = False
+        admin_store.validate_config(enabled)
+
+        invalid = copy.deepcopy(config.DEFAULT_USER_CONFIG)
+        invalid['llm_greeting_enabled'] = 'false'
+        with self.assertRaisesRegex(ValueError, 'llm_greeting_enabled'):
+            admin_store.validate_config(invalid)
+
     def test_example_uses_current_scoring_schema_and_passes_validation(self):
         payload = json.loads((ROOT / 'user_config.example.json').read_text(encoding='utf-8'))
         admin_store.validate_config(payload)

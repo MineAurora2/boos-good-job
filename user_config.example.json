@@ -1,5 +1,6 @@
 {
   "resume_name": "resume.md",
+  "llm_greeting_enabled": true,
   "introduce": "您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。",
   "character": "简洁 直接 礼貌",
   "tags": [
