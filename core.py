@@ -1,13 +1,7 @@
-try:
-    from ollama import chat, Message
-except ImportError:
-    chat = None
-    Message = None
 import prompts
 from config import Config
-from llm_gateway import LLM_GATEWAY, LLMGatewayError, _response_text
-from tools import getLLMReply
-from schema import InterestValue, NeedResume, NeedWorks
+from llm_gateway import LLMGatewayError, _response_text
+from llm_manager import LLM_MANAGER
 import json
 import copy
 from pathlib import Path
@@ -16,14 +10,6 @@ import threading
 import time
 
 
-# 默认参数
-options = {
-    "temperature": 0.6,
-    "num_ctx": 10240
-}
-
-
-LEGACY_OLLAMA_REQUIRED_MESSAGE = '当前接口依赖 ollama，但主链评分/固定招呼/直接发简历已支持在未安装 ollama 时启动运行'
 _LLM_LOG_LOCK = threading.Lock()
 _LLM_LAST_LOGGED_AT: dict[str, float] = {}
 
@@ -40,48 +26,6 @@ def _log_llm_fallback(operation: str, error: Exception, fallback: str) -> None:
         _LLM_LAST_LOGGED_AT[key] = now
     summary = str(error).replace('\n', ' ')[:400]
     print(f'[LLM] {operation}失败，{fallback}: {summary}', flush=True)
-    if Config.llm.get('verbose_errors'):
-        import traceback
-        traceback.print_exc()
-
-
-def isOllamaAvailable() -> bool:
-    return chat is not None and Message is not None
-
-
-def __ensure_ollama_available():
-    if not isOllamaAvailable():
-        raise RuntimeError(LEGACY_OLLAMA_REQUIRED_MESSAGE)
-
-
-def __streamChat(sys_prompt: str, prompt: str, options: dict = options, model: str | None = None) -> str:
-    """自定义的流式回复"""
-    __ensure_ollama_available()
-    content = ''
-    for i in chat(model or Config.think_model, [
-        Message(role='system', content=sys_prompt),
-        Message(role='user', content=prompt)
-    ], stream=True, options=options):
-        word = i.message.content
-        content += word
-        print(word, end="", flush=True)
-    print()
-    return getLLMReply(content)
-
-
-def getIntroduce(resume: str):
-    """生成自我介绍"""
-    return __streamChat(prompts.INTRODUCE, resume)
-
-
-def getTags(resume: str):
-    """获取匹配标签"""
-    return __streamChat(prompts.TAGS, resume).split(' ')
-
-
-def getCharacter(resume: str):
-    """获取性格特点"""
-    return __streamChat(prompts.CHARACTER, resume)
 
 
 def __extract_job_fields(job: str) -> tuple[str, str]:
@@ -169,18 +113,29 @@ def evaluateJobMatch(job: str):
 
 
 def _load_resume() -> str:
-    """读取网页管理端配置的简历，保留旧文件名作为兼容回退。"""
+    """自动选择简历：优先内联内容，其次按优先级扫描项目根目录下的简历文件。"""
     if Config.resume_content and Config.resume_content.strip():
         return Config.resume_content.strip()
     root = Path(__file__).resolve().parent
-    candidates = [Config.resume_name, '简历_精简.md', '简历.md']
-    for filename in candidates:
-        safe_name = Path(filename or '').name
-        if not safe_name:
+    # 优先使用精简/标准简历文件名，其余按文件名排序兜底。
+    preferred = ['简历_精简.md', 'resume.md', '简历.md']
+    seen: set[str] = set()
+    candidates: list[Path] = []
+    for name in preferred:
+        path = root / name
+        if path.exists() and path.is_file():
+            candidates.append(path)
+            seen.add(path.name)
+    for path in sorted(root.iterdir()):
+        if path.name in seen or not path.is_file() or path.suffix.lower() not in {'.md', '.txt'}:
             continue
-        resume_path = root / safe_name
-        if resume_path.exists() and resume_path.is_file():
-            return resume_path.read_text(encoding='utf-8').strip()
+        lower = path.name.lower()
+        if 'resume' in lower or '简历' in path.name:
+            candidates.append(path)
+    for resume_path in candidates:
+        content = resume_path.read_text(encoding='utf-8').strip()
+        if content:
+            return content
     return ''
 
 
@@ -191,13 +146,12 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
             return {'introduce': text, 'generated': generated, 'fallbackReason': reason}
         return text
 
-    llm_cfg = Config.llm
-    if not llm_cfg.get('enabled') or not llm_cfg.get('api_key'):
-        return result(Config.introduce, False, 'LLM 未启用或缺少 API Key')
+    if not LLM_MANAGER.available():
+        return result(Config.introduce, False, '没有可用的大模型接口')
 
     resume = _load_resume()
     if not resume:
-        print("[LLM] 未找到 简历.md，使用固定 introduce", flush=True)
+        print("[LLM] 未找到简历文件，使用固定 introduce", flush=True)
         return result(Config.introduce, False, '未找到简历')
 
     # 拼接岗位信息
@@ -213,7 +167,6 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
     )
 
     payload = {
-        'model': llm_cfg['model'],
         'messages': [
             {
                 'role': 'system',
@@ -225,7 +178,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
             {'role': 'user', 'content': prompt},
         ],
         'temperature': 0.2,
-        'max_tokens': int(llm_cfg.get('introduce_max_tokens', 1024)),
+        'max_tokens': 1024,
     }
 
     def extract_content(data: dict) -> tuple[str, str, str]:
@@ -287,7 +240,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
         return text, ''
 
     try:
-        data = await LLM_GATEWAY.chat_completions(llm_cfg, payload, 'introduce')
+        data = await LLM_MANAGER.chat_completions(payload, 'introduce')
         raw_content, reasoning, finish_reason = extract_content(data)
         content, invalid_reason = validate_content(raw_content, finish_reason)
         if not content:
@@ -297,10 +250,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
                 flush=True,
             )
             retry_payload = copy.deepcopy(payload)
-            retry_payload['max_tokens'] = max(
-                int(payload['max_tokens']),
-                int(llm_cfg.get('introduce_retry_max_tokens', 4096)),
-            )
+            retry_payload['max_tokens'] = max(int(payload['max_tokens']), 4096)
             retry_payload['messages'] = [
                 {
                     'role': 'system',
@@ -314,7 +264,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
                     'content': f'{prompt}\n\n在内部完成信息筛选，只回复最终要发送给招聘者的一段完整文字。',
                 },
             ]
-            data = await LLM_GATEWAY.chat_completions(llm_cfg, retry_payload, 'introduce_retry')
+            data = await LLM_MANAGER.chat_completions(retry_payload, 'introduce_retry')
             raw_content, reasoning, finish_reason = extract_content(data)
             content, invalid_reason = validate_content(raw_content, finish_reason)
         if not content:
@@ -331,8 +281,7 @@ async def generateCustomIntroduce(title: str, salary: str, detail: str, *, retur
 
 async def llmJobFilter(title: str, salary: str, detail: str) -> tuple[bool, str]:
     """调用 LLM 判断岗位是否适合求职者，返回 (是否通过, 原因)。"""
-    llm_cfg = Config.llm
-    if not llm_cfg.get('enabled') or not llm_cfg.get('job_filter') or not llm_cfg.get('api_key'):
+    if not LLM_MANAGER.job_filter_enabled or not LLM_MANAGER.available():
         return True, '未启用AI筛选'
 
     resume = _load_resume()
@@ -348,17 +297,16 @@ async def llmJobFilter(title: str, salary: str, detail: str) -> tuple[bool, str]
     prompt = prompts.JOB_FILTER.format(resume=resume, job_info=job_info)
 
     payload = {
-        'model': llm_cfg['model'],
         'messages': [
             {'role': 'system', 'content': '你是一个求职筛选助手。严格按格式输出：第一行true或false，第二行一句话原因。'},
             {'role': 'user', 'content': prompt},
         ],
         'temperature': 0.1,
-        'max_tokens': int(llm_cfg.get('filter_max_tokens', 128)),
+        'max_tokens': 128,
     }
 
     try:
-        data = await LLM_GATEWAY.chat_completions(llm_cfg, payload, 'job_filter')
+        data = await LLM_MANAGER.chat_completions(payload, 'job_filter')
         msg = data['choices'][0]['message']
         content = _response_text(msg.get('content'))
         reasoning = _response_text(msg.get('reasoning_content')) or _response_text(msg.get('reasoning'))
@@ -402,56 +350,3 @@ async def evaluateSingleRouteDelivery(job: str):
 def calcJobScore(job: str, resume: str):
     """计算职位匹配度"""
     return evaluateJobMatch(job)['score']
-
-
-def __calcInterestValue(msgs: list):
-    """计算兴趣值"""
-    __ensure_ollama_available()
-    msgs.insert(0, Message(role='system', content=prompts.INTERSET))
-    return json.loads(chat(Config.chat_model, msgs, format=InterestValue.model_json_schema(), options={
-        "temperature": 0.2,
-        "num_ctx": 10240,
-    }).message.content)['value']
-
-
-def replyMsg(msgs: list, resume: str, character: str):
-    __ensure_ollama_available()
-    # 计算兴趣值
-    interest = __calcInterestValue(list(msgs))
-    if not interest:
-        return ''
-    # 获取回复
-    content = ''
-    msgs.insert(0, Message(role='system', content=prompts.CHAT.format(
-        resume=resume,
-        character=character
-    )))
-    for i in chat(Config.chat_model, messages=msgs, stream=True, options={
-        "temperature": 0.4,
-        "num_ctx": 10240,
-    }):
-        word = i.message.content
-        content += word
-        print(word, end="", flush=True)
-    print()
-    return getLLMReply(content)
-
-
-def isNeedResume(msgs: list):
-    """判断是否需要简历"""
-    __ensure_ollama_available()
-    msgs.insert(0, Message(role='system', content=prompts.NEEDRESUME))
-    return json.loads(chat(Config.chat_model, msgs, format=NeedResume.model_json_schema(), options={
-        "temperature": 0.2,
-        "num_ctx": 10240,
-    }).message.content)['need']
-
-
-def isNeedWorks(msgs: list):
-    """判断是否需要作品集"""
-    __ensure_ollama_available()
-    msgs.insert(0, Message(role='system', content=prompts.NEEDWORKS))
-    return json.loads(chat(Config.chat_model, msgs, format=NeedWorks.model_json_schema(), options={
-        "temperature": 0.2,
-        "num_ctx": 10240,
-    }).message.content)['need']

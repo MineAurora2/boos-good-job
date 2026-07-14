@@ -44,7 +44,9 @@ class LLMGateway:
     """Process-wide LLM concurrency gate with retry, cache and circuit breaker."""
 
     def __init__(self, client_factory: Callable | None = None):
-        self._client_factory = client_factory or (lambda timeout: httpx.AsyncClient(timeout=timeout))
+        self._client_factory = client_factory or (
+            lambda timeout, proxy: httpx.AsyncClient(timeout=timeout, proxy=proxy)
+        )
         self._lock = threading.Lock()
         self._semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
         self._inflight: dict[tuple[int, str], asyncio.Task] = {}
@@ -190,6 +192,7 @@ class LLMGateway:
         max_delay = self._float(config, 'retry_max_delay', 8.0)
         min_interval = self._float(config, 'min_request_interval', 0.8)
         timeout = self._float(config, 'timeout', 30, 1)
+        proxy = str(config.get('proxy_url') or '').strip() if config.get('proxy_enabled') else None
         url = f"{str(config['api_base']).rstrip('/')}/chat/completions"
         headers = {
             'Authorization': f"Bearer {config['api_key']}",
@@ -201,7 +204,7 @@ class LLMGateway:
             with self._lock:
                 self._requests += 1
             last_error: Exception | None = None
-            async with self._client_factory(timeout) as client:
+            async with self._client_factory(timeout, proxy) as client:
                 for attempt in range(retries + 1):
                     wait_for_slot = self._reserve_request_slot(min_interval)
                     if wait_for_slot:
@@ -309,6 +312,3 @@ class LLMGateway:
                 'cacheSize': len(self._cache),
                 'inflight': len(self._inflight),
             }
-
-
-LLM_GATEWAY = LLMGateway()

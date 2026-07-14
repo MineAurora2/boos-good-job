@@ -9,11 +9,11 @@ import sqlite3
 import uuid
 from fastapi import FastAPI, Body, HTTPException
 from starlette.requests import Request
-from core import replyMsg, isNeedResume, isNeedWorks
-from schema import Msg
 from config import Config
 from delivery_store import DeliveryStore, delivery_key
-from llm_gateway import LLM_GATEWAY
+from llm_manager import LLM_MANAGER
+from llm_env_store import public_llm_config, save_llm_config
+import llm_env_store
 from dashboard_data import load_dashboard_data, delivery_sources
 from admin_store import get_public_config, save_config, list_resumes, read_resume, save_resume, get_prompts, save_prompts
 from runtime_monitor import RUNTIME_MONITOR
@@ -42,6 +42,10 @@ _DECISION_LOG_LOCK = threading.Lock()
 _ACTION_LOG_LOCK = threading.Lock()
 _AI_FILTER_LOG_LOCK = threading.Lock()
 _GREETED_LOG_LOCK = threading.Lock()
+_INTRODUCE_JOB_LOCK = threading.Lock()
+_INTRODUCE_JOBS: dict[str, dict] = {}
+_INTRODUCE_JOB_BY_CLAIM: dict[str, str] = {}
+_INTRODUCE_JOB_TTL_SECONDS = 15 * 60
 
 
 def _append_jsonl(path: Path, record: dict, lock: threading.Lock):
@@ -266,11 +270,7 @@ def runtime_snapshot():
     return {
         **RUNTIME_MONITOR.snapshot(),
         'events': RUNTIME_MONITOR.recent_events(120),
-        'llm': {
-            'enabled': bool(Config.llm.get('enabled')),
-            'model': Config.llm.get('model') or '',
-            **LLM_GATEWAY.snapshot(),
-        },
+        'llm': LLM_MANAGER.snapshot(),
     }
 
 
@@ -318,14 +318,14 @@ def control_resolve_error(error_id: str, request: Request, payload: dict = Body(
 @app.get('/api/control/health', summary='检查控制中心、数据库与配置健康状态')
 def control_health(request: Request):
     _require_local_admin(request)
-    llm_state = LLM_GATEWAY.snapshot()
+    llm_state = LLM_MANAGER.snapshot()
     checks = {
         'runtime': {'ok': True},
         'config': {'ok': True},
         'database': {'ok': False},
         'llm': {
-            'ok': not Config.llm.get('enabled') or llm_state['state'] != 'open',
-            'enabled': bool(Config.llm.get('enabled')),
+            # 没有启用任何接口视为“无需检查”，有接口时只要还有健康 provider 即通过。
+            'ok': not llm_state['enabled'] or any(p.get('circuit') != 'open' for p in llm_state['providers']),
             **llm_state,
         },
     }
@@ -356,10 +356,10 @@ def control_diagnostics(request: Request):
         },
         'config': {
             'tags': len(Config.tags),
-            'llmEnabled': bool(Config.llm.get('enabled')),
+            'llmEnabled': LLM_MANAGER.available(),
             'deliveryDatabase': str(DELIVERY_DB_PATH),
         },
-        'llm': LLM_GATEWAY.snapshot(),
+        'llm': LLM_MANAGER.snapshot(),
     }
 
 
@@ -367,7 +367,8 @@ def control_diagnostics(request: Request):
 def control_reload_config(request: Request):
     _require_local_admin(request)
     Config.reload()
-    LLM_GATEWAY.reset_circuit(clear_cache=True)
+    LLM_MANAGER.reload()
+    LLM_MANAGER.reset_circuits(clear_cache=True)
     DELIVERY_STORE.daily_limit = max(1, int(Config.backend.get('daily_greet_limit', DELIVERY_STORE.daily_limit)))
     RUNTIME_MONITOR.audit('config_reloaded', {})
     RUNTIME_MONITOR.publish('config_updated', {'restartRequired': []})
@@ -414,12 +415,42 @@ def admin_save_config(request: Request, payload: dict = Body(...)):
     _require_local_admin(request)
     try:
         result = save_config(payload)
-        LLM_GATEWAY.reset_circuit(clear_cache=True)
+        LLM_MANAGER.reset_circuits(clear_cache=True)
         DELIVERY_STORE.daily_limit = max(1, int(Config.backend.get('daily_greet_limit', DELIVERY_STORE.daily_limit)))
         RUNTIME_MONITOR.publish('config_updated', {'restartRequired': result['restartRequiredFields']})
         return result
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.get('/api/admin/llm', summary='读取大模型接口配置')
+def admin_get_llm(request: Request):
+    _require_local_admin(request)
+    return public_llm_config()
+
+
+@app.put('/api/admin/llm', summary='保存大模型接口配置到 .env')
+def admin_save_llm(request: Request, payload: dict = Body(...)):
+    _require_local_admin(request)
+    try:
+        result = save_llm_config(payload)
+        LLM_MANAGER.reload()
+        RUNTIME_MONITOR.publish('llm_updated', {'providerCount': len(result['providers'])})
+        return result
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post('/api/admin/llm/test', summary='测试大模型接口连通性')
+async def admin_test_llm(request: Request, payload: dict = Body(default={})):
+    _require_local_admin(request)
+    provider = payload.get('provider') if isinstance(payload, dict) else None
+    if isinstance(provider, dict):
+        return await LLM_MANAGER.test_provider_payload(provider)
+    index = payload.get('index') if isinstance(payload, dict) else None
+    if isinstance(index, int):
+        return await LLM_MANAGER.test_provider(index)
+    return {'results': await LLM_MANAGER.test_all()}
 
 
 @app.get('/api/admin/resumes', summary='列出可管理简历')
@@ -475,7 +506,7 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
         -Config.job_score_delay_jitter_ms,
         Config.job_score_delay_jitter_ms,
     ))
-    use_ai_filter = Config.llm.get('enabled') and Config.llm.get('job_filter')
+    use_ai_filter = LLM_MANAGER.available() and LLM_MANAGER.job_filter_enabled
     # 第二步：只执行岗位筛选和评分延迟。招呼语必须在全部条件通过后单独生成。
     (ai_pass, ai_reason), _ = await asyncio.gather(
         llmJobFilter(title, '', detail),
@@ -529,10 +560,7 @@ async def get_job_score(job: str = Body(..., description="职位信息")):
     }
 
 
-@app.post('/generate-introduce', summary='在投递条件全部通过后生成最终招呼语')
-async def generate_introduce(payload: dict = Body(..., description='岗位信息与已领取的投递令牌')):
-    from core import generateCustomIntroduce
-
+def _validate_introduce_payload(payload: dict) -> dict:
     claim_token = (payload.get('claimToken') or '').strip()
     claim = DELIVERY_STORE.claim_status(claim_token)
     if not claim.get('exists'):
@@ -546,48 +574,123 @@ async def generate_introduce(payload: dict = Body(..., description='岗位信息
     if delivery_key(company, title) != delivery_key(delivery.get('company') or '', delivery.get('title') or ''):
         raise HTTPException(status_code=409, detail='投递令牌与公司岗位不匹配')
 
-    print(f'[LLM] 所有投递条件已通过，开始生成最终招呼语 | company={company} | title={title}', flush=True)
+    return {
+        'claimToken': claim_token,
+        'company': company,
+        'title': title,
+        'salary': (payload.get('salary') or '').strip(),
+        'detail': (payload.get('detail') or '').strip(),
+    }
+
+
+async def _generate_introduce_result(payload: dict) -> dict:
+    from core import generateCustomIntroduce
+
+    print(
+        f"[LLM] 所有投递条件已通过，开始生成最终招呼语 | "
+        f"company={payload['company']} | title={payload['title']}",
+        flush=True,
+    )
     introduce_result = await generateCustomIntroduce(
-        title,
-        (payload.get('salary') or '').strip(),
-        (payload.get('detail') or '').strip(),
+        payload['title'],
+        payload['salary'],
+        payload['detail'],
         return_meta=True,
     )
     return introduce_result
+
+
+def _prune_introduce_jobs(now: float) -> None:
+    expired = []
+    for job_id, job in _INTRODUCE_JOBS.items():
+        if job['status'] != 'pending' and now - job['updatedAt'] >= _INTRODUCE_JOB_TTL_SECONDS:
+            expired.append(job_id)
+    for job_id in expired:
+        job = _INTRODUCE_JOBS.pop(job_id)
+        if _INTRODUCE_JOB_BY_CLAIM.get(job['claimToken']) == job_id:
+            _INTRODUCE_JOB_BY_CLAIM.pop(job['claimToken'], None)
+
+
+def _introduce_job_response(job_id: str, job: dict) -> dict:
+    response = {'jobId': job_id, 'status': job['status']}
+    if job['status'] == 'completed':
+        response.update(job['result'])
+    elif job['status'] == 'failed':
+        response['error'] = job['error']
+    return response
+
+
+async def _run_introduce_job(job_id: str, payload: dict) -> None:
+    try:
+        result = await _generate_introduce_result(payload)
+        status = 'completed'
+        error = ''
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        result = None
+        status = 'failed'
+        error = str(exc)
+        print(f'[LLM] 后台招呼语任务失败 | job={job_id} | error={error}', flush=True)
+
+    with _INTRODUCE_JOB_LOCK:
+        job = _INTRODUCE_JOBS.get(job_id)
+        if job is not None:
+            job.update(
+                status=status,
+                result=result,
+                error=error,
+                updatedAt=asyncio.get_running_loop().time(),
+                task=None,
+            )
+
+
+@app.post('/generate-introduce', summary='在投递条件全部通过后生成最终招呼语')
+async def generate_introduce(payload: dict = Body(..., description='岗位信息与已领取的投递令牌')):
+    return await _generate_introduce_result(_validate_introduce_payload(payload))
+
+
+@app.post('/generate-introduce/start', summary='启动后台招呼语生成任务')
+async def start_generate_introduce(payload: dict = Body(..., description='岗位信息与已领取的投递令牌')):
+    normalized = _validate_introduce_payload(payload)
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    with _INTRODUCE_JOB_LOCK:
+        _prune_introduce_jobs(now)
+        existing_id = _INTRODUCE_JOB_BY_CLAIM.get(normalized['claimToken'])
+        existing = _INTRODUCE_JOBS.get(existing_id) if existing_id else None
+        if existing is not None:
+            return _introduce_job_response(existing_id, existing)
+
+        job_id = uuid.uuid4().hex
+        job = {
+            'claimToken': normalized['claimToken'],
+            'status': 'pending',
+            'result': None,
+            'error': '',
+            'updatedAt': now,
+            'task': None,
+        }
+        _INTRODUCE_JOBS[job_id] = job
+        _INTRODUCE_JOB_BY_CLAIM[normalized['claimToken']] = job_id
+        job['task'] = loop.create_task(_run_introduce_job(job_id, normalized))
+        return _introduce_job_response(job_id, job)
+
+
+@app.get('/generate-introduce/status/{job_id}', summary='查询后台招呼语生成结果')
+async def generate_introduce_status(job_id: str):
+    with _INTRODUCE_JOB_LOCK:
+        _prune_introduce_jobs(asyncio.get_running_loop().time())
+        job = _INTRODUCE_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail='招呼语生成任务不存在或已过期')
+        return _introduce_job_response(job_id, job)
 
 
 @app.post("/log-action", summary="记录前端动作日志")
 async def log_action(action: dict = Body(..., description="动作日志")):
     append_job_action_log(action)
     return {'success': True}
-
-
-@app.post("/reply", summary="回复消息")
-async def reply(msgs: list[Msg] = Body(..., description="消息列表")):
-    try:
-        return replyMsg(msgs, '', Config.character)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-
-
-@app.post("/is-need-resume", summary="是否需要简历")
-async def is_need_resume(msgs: list[Msg] = Body(..., description="消息列表")):
-    try:
-        return {
-            'need': isNeedResume(msgs)
-        }
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-
-
-@app.post("/is-need-works", summary="是否需要作品集")
-async def is_need_works(msgs: list[Msg] = Body(..., description="消息列表")):
-    try:
-        return {
-            'need': isNeedWorks(msgs)
-        }
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.post("/delivery/claim", summary="原子领取公司与岗位投递权")

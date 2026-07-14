@@ -53,9 +53,9 @@
                 <div class="goal-track"><span id="goalBar"></span></div>
                 <small id="goalHint">保持节奏，比盲目海投更重要</small>
             </div>
-            <div class="sidebar-status">
+            <div class="sidebar-status" id="sidebarStatus">
                 <span class="live-dot"></span>
-                <div><strong>数据服务正常</strong><small id="lastUpdated">正在同步…</small></div>
+                <div><strong id="connectionText">数据服务正常</strong><small id="lastUpdated">正在同步…</small></div>
             </div>
         </aside>
 
@@ -117,20 +117,15 @@
                     <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
                     <div><span>异常事件</span><strong id="monitorFailures">0</strong><small>当前统计区间</small></div>
                 </div>
-                <div class="monitor-grid panel">
-                    <div class="live-log-board"><div class="subpanel-title"><span>实时日志</span><div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs">暂停滚动</button><button id="clearLogs">清空</button></div></div><div id="liveLogs" class="live-logs"></div></div>
-                </div>
-
-                <div class="control-kpi-grid">
-                    <article><span>在线实例</span><strong id="controlOnlineCount">0</strong><small id="controlInstanceHint">等待心跳</small></article>
-                    <article><span>当前速度</span><strong id="controlRateValue">0</strong><small>份 / 小时</small></article>
-                    <article><span>当前状态</span><strong id="controlRunningCount">0</strong><small>运行中实例</small></article>
-                </div>
-
                 <div class="control-layout">
                     <article class="control-card control-span-12">
                         <div class="control-card-head"><div><span>浏览器实例</span><small id="controlInstanceSummary">等待脚本接入</small></div><button class="control-command subtle" data-control-action="refresh_instances">同步状态</button></div>
                         <div id="controlInstanceList" class="control-instance-grid"></div>
+                    </article>
+
+                    <article class="control-card control-span-12">
+                        <div class="control-card-head"><div><span>实时日志</span><small>脚本运行与投递动作实时流</small></div><div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs">暂停滚动</button><button id="clearLogs">清空</button></div></div>
+                        <div id="liveLogs" class="live-logs"></div>
                     </article>
 
                     <article class="control-card control-span-12">
@@ -305,14 +300,41 @@
                     <div><span class="eyebrow">LOCAL ADMIN</span><h2>系统管理</h2><p>仅允许从本机访问；敏感密钥不会回显</p></div>
                     <span class="panel-badge" id="adminSaveState">尚未修改</span>
                 </div>
-                <div class="admin-tabs" id="adminTabs">
-                    <button class="active" data-admin-tab="config">参数配置</button>
-                    <button data-admin-tab="resume">简历管理</button>
-                    <button data-admin-tab="prompts">提示词管理</button>
+                <div class="admin-tabs" id="adminTabs" role="tablist" aria-label="系统管理">
+                    <button class="active" data-admin-tab="config" role="tab" aria-selected="true">参数配置</button>
+                    <button data-admin-tab="llm" role="tab" aria-selected="false">接口管理</button>
+                    <button data-admin-tab="resume" role="tab" aria-selected="false">简历管理</button>
+                    <button data-admin-tab="prompts" role="tab" aria-selected="false">提示词管理</button>
                 </div>
                 <div class="admin-view active" data-admin-view="config">
                     <div id="visualConfigForm" class="visual-config-form"></div>
                     <div class="admin-actions"><span id="configNotice">常用参数保存后立即生效，数据库路径需要重启。</span><button id="saveConfig" class="primary-action">保存参数配置</button></div>
+                </div>
+                <div class="admin-view" data-admin-view="llm">
+                    <div class="llm-console-head">
+                        <div><span class="eyebrow">MODEL ROUTING</span><h3>大模型连接</h3></div>
+                        <span class="llm-provider-summary" id="llmProviderSummary"><i></i>尚未载入接口</span>
+                    </div>
+                    <div class="llm-global-bar" aria-label="大模型全局设置">
+                        <div class="llm-setting llm-strategy-setting">
+                            <span>调度策略</span>
+                            <div class="llm-segment" id="llmStrategy" role="radiogroup" aria-label="调度策略" data-value="failover">
+                                <button type="button" class="active" data-llm-strategy="failover" role="radio" aria-checked="true">故障转移</button>
+                                <button type="button" data-llm-strategy="round_robin" role="radio" aria-checked="false">轮询分摊</button>
+                            </div>
+                            <small id="llmStrategyHint">按列表顺序调用，失败后切换</small>
+                        </div>
+                        <label class="llm-setting llm-timeout-setting"><span>请求超时</span><div class="llm-number-input"><input id="llmTimeout" type="number" min="1" max="600" value="180"><b>秒</b></div><small>1 - 600 秒</small></label>
+                        <label class="llm-toggle-setting" for="llmJobFilter">
+                            <span class="llm-toggle-copy"><strong>AI 二次筛选</strong><small id="llmJobFilterState">已关闭</small></span>
+                            <input id="llmJobFilter" type="checkbox">
+                            <span class="llm-toggle" aria-hidden="true"><i></i></span>
+                        </label>
+                        <button id="llmTestAll" type="button" class="llm-secondary-action"><span aria-hidden="true">↻</span><b>全部测活</b></button>
+                    </div>
+                    <div id="llmProviderList" class="llm-provider-list"></div>
+                    <button id="llmAddProvider" type="button" class="llm-add-provider"><span aria-hidden="true">＋</span> 添加大模型接口</button>
+                    <div class="admin-actions llm-save-bar"><span id="llmNotice">配置保存在本机 .env；API Key 与代理凭据不会回显。</span><button id="saveLlm" class="primary-action"><span aria-hidden="true">✓</span> 保存接口配置</button></div>
                 </div>
                 <div class="admin-view" data-admin-view="resume">
                     <div class="editor-toolbar"><select id="resumeSelect" class="compact-select"></select><input id="newResumeName" type="text" placeholder="新建文件名，例如 resume.md"><button id="createResume">新建/切换</button><span id="resumeMeta"></span></div>

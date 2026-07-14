@@ -5,9 +5,8 @@ import json
 import os
 from pathlib import Path
 import re
-from urllib.parse import urlparse
 
-from config import Config, DEFAULT_USER_CONFIG
+from config import Config
 import prompts
 
 
@@ -44,7 +43,7 @@ def _validate_number(container: dict, key: str, minimum: float, maximum: float) 
 def validate_config(config: dict) -> None:
     if not isinstance(config, dict):
         raise ValueError('配置必须是 JSON 对象')
-    for key in ('frontend', 'backend', 'scoring', 'llm'):
+    for key in ('frontend', 'backend', 'scoring'):
         if not isinstance(config.get(key), dict):
             raise ValueError(f'{key} 必须是对象')
     tags = config.get('tags')
@@ -52,11 +51,9 @@ def validate_config(config: dict) -> None:
         raise ValueError('tags 必须是 1 到 80 个关键词的数组')
     if any(not isinstance(tag, str) or not tag.strip() or len(tag) > 80 for tag in tags):
         raise ValueError('tags 中存在无效关键词')
-    for key in ('introduce', 'character', 'resume_name', 'think_model', 'chat_model', 'resume_content'):
+    for key in ('introduce', 'character', 'resume_content'):
         if not isinstance(config.get(key), str):
             raise ValueError(f'{key} 必须是字符串')
-    if Path(config['resume_name']).name != config['resume_name']:
-        raise ValueError('resume_name 只能是文件名')
 
     frontend = config['frontend']
     if not isinstance(frontend.get('serverHost'), str) or not frontend['serverHost'].strip():
@@ -78,29 +75,6 @@ def validate_config(config: dict) -> None:
     if Path(str(backend.get('delivery_db_path') or '')).name != backend.get('delivery_db_path'):
         raise ValueError('delivery_db_path 只能是文件名')
 
-    llm = config['llm']
-    for key in ('enabled', 'job_filter', 'verbose_errors'):
-        if not isinstance(llm.get(key), bool):
-            raise ValueError(f'llm.{key} 必须是开关值')
-    for key in ('model', 'api_key'):
-        if not isinstance(llm.get(key), str):
-            raise ValueError(f'llm.{key} 必须是字符串')
-    api_base = str(llm.get('api_base') or '').strip()
-    if api_base:
-        parsed = urlparse(api_base)
-        if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
-            raise ValueError('llm.api_base 必须是有效的 HTTP(S) 地址')
-    _validate_number(llm, 'timeout', 1, 600)
-    _validate_number(llm, 'max_concurrent_requests', 1, 20)
-    _validate_number(llm, 'min_request_interval', 0, 60)
-    _validate_number(llm, 'retry_count', 0, 10)
-    _validate_number(llm, 'retry_base_delay', 0, 300)
-    _validate_number(llm, 'retry_max_delay', 0, 600)
-    _validate_number(llm, 'circuit_failure_threshold', 1, 100)
-    _validate_number(llm, 'circuit_open_seconds', 1, 3600)
-    _validate_number(llm, 'cache_ttl_seconds', 0, 86400)
-    _validate_number(llm, 'introduce_max_tokens', 16, 4096)
-    _validate_number(llm, 'filter_max_tokens', 16, 4096)
     expected_scoring_groups = {'title_deduction_keywords', 'detail_deduction_keywords'}
     if set(config['scoring']) != expected_scoring_groups:
         raise ValueError('岗位扣星规则必须包含职位名称和职位描述两个规则组')
@@ -117,14 +91,8 @@ def validate_config(config: dict) -> None:
 def get_public_config() -> dict:
     effective = Config.reload()
     public = copy.deepcopy(effective)
-    api_base = str(public.get('llm', {}).get('api_base') or '')
-    api_key = str(public.get('llm', {}).get('api_key') or '')
-    public['llm']['api_base'] = ''
-    public['llm']['api_key'] = ''
     return {
         'config': public,
-        'apiBaseConfigured': bool(api_base),
-        'apiKeyConfigured': bool(api_key),
         'revision': CONFIG_PATH.stat().st_mtime_ns if CONFIG_PATH.exists() else 0,
         'restartRequiredFields': ['backend.delivery_db_path'],
     }
@@ -138,8 +106,10 @@ def save_config(payload: dict) -> dict:
     # instead of recursively merging keyword maps; otherwise deleted scoring
     # keywords are silently restored from the previous JSON/default config.
     merged = copy.deepcopy(incoming)
-    merged.setdefault('llm', {})['api_base'] = ''
-    merged['llm']['api_key'] = ''
+    # 大模型接口已迁移到 .env，绝不写回 user_config.json。
+    merged.pop('llm', None)
+    for legacy_key in ('resume_name', 'think_model', 'chat_model'):
+        merged.pop(legacy_key, None)
     validate_config(merged)
     _atomic_write_text(CONFIG_PATH, json.dumps(merged, ensure_ascii=False, indent=2) + '\n')
     Config.reload()
@@ -156,6 +126,14 @@ def _safe_resume_path(name: str) -> Path:
     return path
 
 
+def _auto_selected_resume(items: list[dict]) -> str:
+    """无简历指针后，按优先级自动选择：简历_精简.md → resume.md → 首个存在的文件。"""
+    for preferred in ('简历_精简.md', 'resume.md'):
+        if any(item['name'] == preferred and item['exists'] for item in items):
+            return preferred
+    return next((item['name'] for item in items if item['exists']), '')
+
+
 def list_resumes() -> dict:
     names = set()
     for path in ROOT.iterdir():
@@ -164,8 +142,6 @@ def list_resumes() -> dict:
         lower = path.name.lower()
         if 'resume' in lower or '简历' in path.name:
             names.add(path.name)
-    if Config.resume_name:
-        names.add(Path(Config.resume_name).name)
     items = []
     for name in sorted(names):
         path = _safe_resume_path(name)
@@ -175,12 +151,8 @@ def list_resumes() -> dict:
             'size': path.stat().st_size if path.exists() else 0,
             'updatedAt': path.stat().st_mtime if path.exists() else None,
         })
-    selected = Path(Config.resume_name).name
-    selected_path = _safe_resume_path(selected)
-    if not selected_path.exists():
-        preferred = next((item['name'] for item in items if item['name'] == '简历_精简.md'), None)
-        selected = preferred or next((item['name'] for item in items if item['exists']), selected)
-    return {'selected': selected, 'configured': Path(Config.resume_name).name, 'items': items}
+    selected = _auto_selected_resume(items)
+    return {'selected': selected, 'configured': selected, 'items': items}
 
 
 def read_resume(name: str) -> dict:
@@ -196,10 +168,7 @@ def save_resume(name: str, content: str, select: bool = True) -> dict:
     if len(content.encode('utf-8')) > MAX_RESUME_SIZE:
         raise ValueError('简历文件不能超过 2MB')
     _atomic_write_text(path, content)
-    if select:
-        public = get_public_config()['config']
-        public['resume_name'] = name
-        save_config({'config': public})
+    # 简历不再有“当前选中”指针，保存即写入文件；自动选择逻辑见 _auto_selected_resume。
     return read_resume(name)
 
 

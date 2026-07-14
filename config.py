@@ -33,31 +33,8 @@ _load_env_file(ROOT / '.env')
 
 
 DEFAULT_USER_CONFIG = {
-    'resume_name': 'resume.md',
-    'think_model': 'qwen3:0.6b',
-    'chat_model': 'qwen3:0.6b',
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
     'character': '简洁 直接 礼貌',
-    'llm': {
-        'enabled': False,
-        'api_base': '',
-        'api_key': '',
-        'model': 'gpt-4o-mini',
-        'timeout': 15,
-        'job_filter': False,
-        'max_concurrent_requests': 1,
-        'min_request_interval': 0.8,
-        'retry_count': 2,
-        'retry_base_delay': 1.0,
-        'retry_max_delay': 8.0,
-        'circuit_failure_threshold': 3,
-        'circuit_open_seconds': 60,
-        'cache_ttl_seconds': 1800,
-        'introduce_max_tokens': 1024,
-        'introduce_retry_max_tokens': 4096,
-        'filter_max_tokens': 128,
-        'verbose_errors': False,
-    },
     'resume_content': '',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
     'backend': {
@@ -373,12 +350,6 @@ def load_user_config():
                 if isinstance(keyword_scores, dict):
                     config['scoring'][group_name] = copy.deepcopy(keyword_scores)
         config = _apply_legacy_compat(config, user_config)
-    env_api_base = os.environ.get('GOODJOB_LLM_API_BASE')
-    env_api_key = os.environ.get('GOODJOB_LLM_API_KEY')
-    if env_api_base is not None:
-        config['llm']['api_base'] = env_api_base.strip()
-    if env_api_key is not None:
-        config['llm']['api_key'] = env_api_key.strip()
     return config
 
 
@@ -387,9 +358,6 @@ USER_CONFIG = load_user_config()
 
 
 class Config:
-    resume_name = USER_CONFIG['resume_name']
-    think_model = USER_CONFIG['think_model']
-    chat_model = USER_CONFIG['chat_model']
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
@@ -403,7 +371,6 @@ class Config:
     frontend = USER_CONFIG['frontend']
     backend = USER_CONFIG['backend']
     scoring = USER_CONFIG['scoring']
-    llm = USER_CONFIG['llm']
     resume_content = USER_CONFIG['resume_content']
 
     @classmethod
@@ -425,9 +392,6 @@ class Config:
         global RAW_USER_CONFIG, USER_CONFIG
         RAW_USER_CONFIG = _load_raw_user_config()
         USER_CONFIG = load_user_config()
-        cls.resume_name = USER_CONFIG['resume_name']
-        cls.think_model = USER_CONFIG['think_model']
-        cls.chat_model = USER_CONFIG['chat_model']
         cls.introduce = USER_CONFIG['introduce']
         cls.character = USER_CONFIG['character']
         cls.tags = USER_CONFIG['tags']
@@ -438,6 +402,5 @@ class Config:
         cls.frontend = USER_CONFIG['frontend']
         cls.backend = USER_CONFIG['backend']
         cls.scoring = USER_CONFIG['scoring']
-        cls.llm = USER_CONFIG['llm']
         cls.resume_content = USER_CONFIG['resume_content']
         return copy.deepcopy(USER_CONFIG)

@@ -42,11 +42,33 @@ const state = {
     currentResume: '',
     control: null,
     controlOnline: false,
+    llm: null,
 };
 
 const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)', 'var(--red)', 'var(--blue)'];
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
-const TODAY_TARGET = 20;
+const TODAY_TARGET_FALLBACK = 20;
+
+function dailyTarget() {
+    const quotas = state.control?.quotas;
+    if (quotas && typeof quotas === 'object' && !Array.isArray(quotas)) {
+        const total = Object.values(quotas).reduce((sum, quota) => sum + Number(quota?.limit || 0), 0);
+        if (total > 0) return total;
+    }
+    const backendLimit = Number(state.adminConfig?.backend?.daily_greet_limit);
+    if (Number.isFinite(backendLimit) && backendLimit > 0) return backendLimit;
+    return TODAY_TARGET_FALLBACK;
+}
+
+function renderDailyGoal(today = state.todayDelivered || 0) {
+    state.todayDelivered = today;
+    const target = dailyTarget();
+    const goal = Math.min(100, Math.round(today / target * 100));
+    $('#todayHint').textContent = `今日目标完成度 ${goal}%`;
+    $('#goalText').textContent = `${today} / ${target}`;
+    $('#goalBar').style.width = `${goal}%`;
+    $('#goalHint').textContent = today >= target ? '今日目标已完成，注意及时复盘' : `还差 ${Math.max(0, target - today)} 份完成今日目标`;
+}
 const REPORT_LAYOUT_KEY = 'goodjobs.dashboard.report-layout.v1';
 const TABLE_PREFS_KEY = 'goodjobs.dashboard.table-prefs.v1';
 const $ = (selector) => document.querySelector(selector);
@@ -262,11 +284,7 @@ function renderMetrics(records) {
     $('#totalDelta').textContent = `当前筛选覆盖 ${new Set(records.map((r) => r.loggedAt?.slice(0, 10))).size} 个日期`;
     $('#companyDelta').textContent = records.length ? `平均每家公司 ${(records.length / Math.max(companies.size, 1)).toFixed(1)} 份` : '暂无公司数据';
     $('#salaryHint').textContent = salaries.length ? `已识别 ${Math.round(salaries.length / Math.max(records.length, 1) * 100)}% 的薪资` : '暂无可识别薪资';
-    const goal = Math.min(100, Math.round(today / TODAY_TARGET * 100));
-    $('#todayHint').textContent = `今日目标完成度 ${goal}%`;
-    $('#goalText').textContent = `${today} / ${TODAY_TARGET}`;
-    $('#goalBar').style.width = `${goal}%`;
-    $('#goalHint').textContent = today >= TODAY_TARGET ? '今日目标已完成，注意及时复盘' : `还差 ${Math.max(0, TODAY_TARGET - today)} 份完成今日目标`;
+    renderDailyGoal(today);
     renderSparkline('#totalSparkline', dailyValues.slice(-8), COLORS[0]);
     renderSparkline('#companySparkline', daily.slice(-8).map((item) => new Set(records.filter((r) => r.loggedAt?.startsWith(item.date)).map((r) => r.company)).size), COLORS[1]);
     renderSparkline('#salarySparkline', daily.slice(-8).map((item) => {
@@ -1027,7 +1045,7 @@ function normalizedControlState() {
 function renderControlInstances(instances) {
     const container = $('#controlInstanceList'); container.replaceChildren();
     const online = instances.filter((item) => item.online !== false && (item.online || item.state !== 'offline')).length;
-    $('#controlOnlineCount').textContent = online; $('#controlInstanceHint').textContent = `${instances.length} 个已登记`; $('#controlInstanceSummary').textContent = instances.length ? `${online} 个在线 / ${instances.length} 个实例` : '等待脚本接入';
+    $('#controlInstanceSummary').textContent = instances.length ? `${online} 个在线 / ${instances.length} 个实例` : '等待脚本接入';
     if (!instances.length) { container.innerHTML = '<div class="control-empty">尚未收到浏览器实例心跳</div>'; return; }
     instances.forEach((item) => {
         const workerId = item.workerId || item.id || '';
@@ -1050,10 +1068,9 @@ function renderAccountQuotas(accounts) {
 }
 
 function renderControlCenter() {
-    const data = normalizedControlState(), task = data.task;
-    const rate = Number(task.rate ?? task.hourlyRate ?? 0);
-    $('#controlRateValue').textContent = rate.toFixed(rate % 1 ? 1 : 0); $('#controlRunningCount').textContent = data.instances.filter((item) => item.online && !item.paused).length;
+    const data = normalizedControlState();
     renderControlInstances(data.instances); renderCurrentDecision(data.decision); renderAccountQuotas(data.accounts);
+    renderDailyGoal();
 }
 
 async function loadControlState() {
@@ -1149,6 +1166,22 @@ function exportRecords(records, filenamePrefix = '投递报表') {
 
 function exportCsv() { exportRecords(getFilteredRecords()); }
 
+function markDataConnection(ok) {
+    const status = $('.sidebar-status'); if (!status) return;
+    if (ok) {
+        state.dataFailures = 0;
+        status.classList.remove('offline');
+        $('#connectionText').textContent = '数据服务正常';
+        return;
+    }
+    state.dataFailures = (state.dataFailures || 0) + 1;
+    if (state.dataFailures >= 2) {
+        status.classList.add('offline');
+        $('#connectionText').textContent = '数据连接中断';
+        $('#lastUpdated').textContent = `已重试 ${state.dataFailures} 次，展示的是最后一次数据`;
+    }
+}
+
 async function loadData({ silent = false } = {}) {
     $('#refreshButton').classList.add('loading');
     try {
@@ -1157,7 +1190,8 @@ async function loadData({ silent = false } = {}) {
         const existingIds = new Set(state.records.map((record) => record.id)); state.selectedIds = new Set([...state.selectedIds].filter((id) => existingIds.has(id)));
         const generated = parseDate(state.payload.generatedAt); $('#lastUpdated').textContent = generated ? `${String(generated.getHours()).padStart(2, '0')}:${String(generated.getMinutes()).padStart(2, '0')} 已同步` : '已同步'; $('#footerTime').textContent = `最后更新 ${state.payload.generatedAt || '—'}`;
         populateFilters(); updateDashboard(); if (!silent) showToast('数据已刷新');
-    } catch (error) { console.error(error); state.payload = { summary: {}, deliveries: [] }; state.records = []; populateFilters(); updateDashboard(); $('#lastUpdated').textContent = '数据连接失败'; showToast('无法读取统计数据'); }
+        markDataConnection(true);
+    } catch (error) { console.error(error); markDataConnection(false); if (!state.records.length) { state.payload = { summary: {}, deliveries: [] }; state.records = []; populateFilters(); updateDashboard(); } if (!silent) showToast('无法读取统计数据'); }
     finally { $('#refreshButton').classList.remove('loading'); }
 }
 
@@ -1169,8 +1203,7 @@ async function apiJson(url, options = {}) {
 }
 
 const CONFIG_LABELS = {
-    resume_name: '默认简历文件', think_model: '思考模型', chat_model: '聊天模型', introduce: '固定打招呼语', character: '回复风格', resume_content: '兼容简历内容', tags: '搜索关键词',
-    llm: 'LLM 服务', enabled: '启用功能', api_base: 'API 地址', api_key: 'API Key', model: '模型名称', timeout: '请求超时（秒）', job_filter: '启用 AI 二次筛选', max_concurrent_requests: '最大并发请求', min_request_interval: '最小请求间隔（秒）', retry_count: '失败重试次数', retry_base_delay: '重试基础等待（秒）', retry_max_delay: '重试最大等待（秒）', circuit_failure_threshold: '熔断失败阈值', circuit_open_seconds: '熔断等待（秒）', cache_ttl_seconds: '结果缓存（秒）', introduce_max_tokens: '招呼语首次最大 Token', introduce_retry_max_tokens: '招呼语重试最大 Token', filter_max_tokens: '筛选最大 Token', verbose_errors: '打印完整异常栈',
+    introduce: '固定打招呼语', character: '回复风格', resume_content: '兼容简历内容', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: '简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
@@ -1178,15 +1211,11 @@ const CONFIG_LABELS = {
 
 function configLabel(key) { return CONFIG_LABELS[key] || key; }
 
-function makeConfigControl(path, key, value, secretStatus = {}) {
+function makeConfigControl(path, key, value) {
     const label = document.createElement('label'); label.className = 'config-field';
     const caption = document.createElement('span'); caption.textContent = configLabel(key); label.appendChild(caption);
     let input;
-    if (key === 'api_key' || key === 'api_base') {
-        input = document.createElement('input'); input.type = 'text'; input.disabled = true;
-        input.value = secretStatus[key] ? '已通过 .env 配置' : '未配置';
-        input.title = '请在项目根目录的 .env 文件中配置，不会保存到 user_config.json';
-    } else if (typeof value === 'boolean') {
+    if (typeof value === 'boolean') {
         label.classList.add('config-switch'); input = document.createElement('input'); input.type = 'checkbox'; input.checked = value; label.prepend(input);
     } else if (Array.isArray(value)) {
         input = document.createElement('textarea'); input.rows = Math.min(8, Math.max(3, value.length)); input.value = value.join('\n'); input.dataset.valueType = 'array';
@@ -1227,18 +1256,128 @@ function fillConfigForm(data) {
     const config = data.config; state.adminConfig = config;
     const form = $('#visualConfigForm'); form.replaceChildren();
     const basics = document.createElement('fieldset'); basics.innerHTML = '<legend>基础资料</legend><div class="config-field-grid"></div>'; const basicGrid = basics.querySelector('div');
-    const secretStatus = { api_key: data.apiKeyConfigured, api_base: data.apiBaseConfigured };
-    Object.entries(config).filter(([key]) => !['llm', 'backend', 'frontend', 'scoring'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value, secretStatus))); form.appendChild(basics);
-    ['llm', 'backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value, secretStatus))); fieldset.appendChild(grid); form.appendChild(fieldset); });
+    Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
+    ['backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value))); fieldset.appendChild(grid); form.appendChild(fieldset); });
     const scoring = document.createElement('fieldset'); const scoringLegend = document.createElement('legend'); scoringLegend.textContent = configLabel('scoring'); scoring.appendChild(scoringLegend); const scoringHint = document.createElement('p'); scoringHint.className = 'scoring-model-hint'; scoringHint.textContent = '每个岗位初始为 5 星。命中关键词后按规则扣星；同一段文字优先匹配更长的关键词。剩余星级小于 0 时直接丢弃岗位。'; scoring.appendChild(scoringHint); Object.entries(config.scoring || {}).forEach(([key, values]) => renderScoringGroup(scoring, key, values)); form.appendChild(scoring);
     $('#adminSaveState').textContent = '配置已载入';
 }
 
+const LLM_KEEP_SECRET = '__KEEP__';
+
+function llmProviderCard(provider = {}) {
+    const card = document.createElement('div'); card.className = 'llm-provider-card';
+    const configured = Boolean(provider.apiKeyConfigured);
+    // index 用于保存时让后端定位旧 key；新建卡片没有 index。
+    card.dataset.index = provider.index != null ? String(provider.index) : '';
+    card.dataset.keyConfigured = configured ? '1' : '';
+    card.dataset.keyDirty = '';
+    const test = provider.__test;
+    const testClass = test ? (test.ok ? 'ok' : 'bad') : '';
+    const testText = test
+        ? (test.ok ? `可用 · ${test.latencyMs ?? '—'}ms` : `失败 · ${escapeHtml(String(test.error || test.status || '未知'))}`)
+        : '尚未测活';
+    const keyPlaceholder = configured ? `已配置（${escapeHtml(provider.apiKeyMasked || '******')}），留空保留` : '输入 API Key';
+    card.innerHTML = `
+        <div class="llm-provider-top">
+            <label class="llm-enable"><input type="checkbox" data-llm-field="enabled" ${provider.enabled !== false ? 'checked' : ''}><span>启用</span></label>
+            <span class="llm-provider-test ${testClass}">${testText}</span>
+            <div class="llm-provider-tools">
+                <button type="button" data-llm-action="test">测活</button>
+                <button type="button" class="danger-action" data-llm-action="remove">删除</button>
+            </div>
+        </div>
+        <div class="llm-provider-grid">
+            <label><span>名称</span><input type="text" data-llm-field="name" value="${escapeHtml(provider.name || '')}" placeholder="例如 SenseNova"></label>
+            <label><span>接口地址</span><input type="url" data-llm-field="api_base" value="${escapeHtml(provider.api_base || '')}" placeholder="https://.../v1"></label>
+            <label><span>模型名称</span><input type="text" data-llm-field="model" value="${escapeHtml(provider.model || '')}" placeholder="例如 deepseek-v4-flash"></label>
+            <label><span>API Key</span><input type="password" data-llm-field="api_key" placeholder="${keyPlaceholder}" autocomplete="off"></label>
+        </div>`;
+    // 标记 key 输入被改动，保存时才发送真实值，否则发送哨兵保留原 key。
+    card.querySelector('[data-llm-field="api_key"]').addEventListener('input', () => { card.dataset.keyDirty = '1'; });
+    return card;
+}
+
+function renderLlmProviders() {
+    const list = $('#llmProviderList'); list.replaceChildren();
+    const providers = state.llm.providers || [];
+    if (!providers.length) { list.innerHTML = '<div class="llm-empty">还没有配置任何接口，点击下方按钮添加。</div>'; return; }
+    providers.forEach((provider) => list.appendChild(llmProviderCard(provider)));
+}
+
+function collectLlmPayload() {
+    const cards = $$('#llmProviderList .llm-provider-card');
+    const providers = cards.map((card) => {
+        const field = (name) => card.querySelector(`[data-llm-field="${name}"]`);
+        const keyInput = field('api_key');
+        const keyConfigured = card.dataset.keyConfigured === '1';
+        const keyDirty = card.dataset.keyDirty === '1';
+        // 未改动且原本已配置 → 用哨兵让后端保留；否则发送输入框实际内容。
+        const api_key = keyDirty ? keyInput.value : (keyConfigured ? LLM_KEEP_SECRET : '');
+        const indexRaw = card.dataset.index;
+        return {
+            index: indexRaw === '' ? null : Number(indexRaw),
+            name: field('name').value.trim(),
+            api_base: field('api_base').value.trim(),
+            model: field('model').value.trim(),
+            enabled: field('enabled').checked,
+            api_key,
+        };
+    });
+    return {
+        strategy: $('#llmStrategy').value,
+        timeout: Number($('#llmTimeout').value) || 180,
+        jobFilter: $('#llmJobFilter').checked,
+        providers,
+    };
+}
+
+function applyLlmConfig(data) {
+    state.llm = { providers: (data.providers || []).map((item) => ({ ...item })) };
+    $('#llmStrategy').value = data.strategy || 'failover';
+    $('#llmTimeout').value = data.timeout || 180;
+    $('#llmJobFilter').checked = Boolean(data.jobFilter);
+    renderLlmProviders();
+}
+
+async function loadLlm() {
+    try { applyLlmConfig(await apiJson('/api/admin/llm')); }
+    catch (error) { $('#llmNotice').textContent = `接口配置读取失败：${error.message}`; }
+}
+
+async function saveLlm() {
+    const button = $('#saveLlm'); button.disabled = true;
+    try { applyLlmConfig(await apiJson('/api/admin/llm', { method: 'PUT', body: JSON.stringify(collectLlmPayload()) })); showToast('接口配置已保存到 .env 并热加载'); }
+    catch (error) { showToast(`保存失败：${error.message}`); }
+    finally { button.disabled = false; }
+}
+
+function addLlmProvider() {
+    const list = $('#llmProviderList'); const empty = list.querySelector('.llm-empty'); if (empty) list.replaceChildren();
+    list.appendChild(llmProviderCard({ enabled: true }));
+}
+
+async function testLlmProvider(card) {
+    const badge = card.querySelector('.llm-provider-test'); badge.className = 'llm-provider-test'; badge.textContent = '测活中…';
+    const indexRaw = card.dataset.index;
+    if (indexRaw === '') { badge.classList.add('bad'); badge.textContent = '请先保存后再测活'; return; }
+    try {
+        const result = await apiJson('/api/admin/llm/test', { method: 'POST', body: JSON.stringify({ index: Number(indexRaw) }) });
+        if (result.ok) { badge.classList.add('ok'); badge.textContent = `可用 · ${result.latencyMs ?? '—'}ms`; }
+        else { badge.classList.add('bad'); badge.textContent = `失败 · ${result.error || result.status || '未知'}`; }
+    } catch (error) { badge.classList.add('bad'); badge.textContent = `失败 · ${error.message}`; }
+}
+
+async function testAllLlm() {
+    const cards = $$('#llmProviderList .llm-provider-card');
+    await Promise.all(cards.map((card) => card.dataset.index !== '' ? testLlmProvider(card) : Promise.resolve()));
+}
+
 async function loadAdmin() {
     try {
-        const [config, resumes, promptData] = await Promise.all([apiJson('/api/admin/config'), apiJson('/api/admin/resumes'), apiJson('/api/admin/prompts')]);
-        fillConfigForm(config); renderResumeOptions(resumes); state.prompts = promptData.items || []; renderPromptOptions();
+        const [config, resumes, promptData, llm] = await Promise.all([apiJson('/api/admin/config'), apiJson('/api/admin/resumes'), apiJson('/api/admin/prompts'), apiJson('/api/admin/llm')]);
+        fillConfigForm(config); renderResumeOptions(resumes); state.prompts = promptData.items || []; renderPromptOptions(); applyLlmConfig(llm);
     } catch (error) { $('#adminSaveState').textContent = '管理接口不可用'; $('#configNotice').textContent = error.message; }
+    loadLlm();
 }
 
 async function saveAdminConfig() {
@@ -1331,6 +1470,8 @@ function bindEvents() {
     $$('.nav-item').forEach((button) => button.addEventListener('click', () => { $$('.nav-item').forEach((item) => item.classList.toggle('active', item === button)); document.getElementById(button.dataset.scroll)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); $('#sidebar').classList.remove('open'); }));
     $$('#adminTabs button').forEach((button) => button.addEventListener('click', () => { $$('#adminTabs button').forEach((item) => item.classList.toggle('active', item === button)); $$('.admin-view').forEach((view) => view.classList.toggle('active', view.dataset.adminView === button.dataset.adminTab)); }));
     $('#saveConfig').addEventListener('click', saveAdminConfig); $('#resumeSelect').addEventListener('change', (event) => loadResume(event.target.value)); $('#createResume').addEventListener('click', createResume); $('#saveResume').addEventListener('click', saveCurrentResume); $('#promptSelect').addEventListener('change', (event) => showPrompt(event.target.value)); $('#savePrompt').addEventListener('click', saveCurrentPrompt);
+    $('#saveLlm').addEventListener('click', saveLlm); $('#llmAddProvider').addEventListener('click', addLlmProvider); $('#llmTestAll').addEventListener('click', () => $$('#llmProviderList .llm-provider-card').forEach((card) => testLlmProvider(card)));
+    $('#llmProviderList').addEventListener('click', (event) => { const button = event.target.closest('[data-llm-action]'); if (!button) return; const card = button.closest('.llm-provider-card'); if (button.dataset.llmAction === 'remove') { card.remove(); if (!$$('#llmProviderList .llm-provider-card').length) $('#llmProviderList').innerHTML = '<div class="llm-empty">还没有配置任何接口，点击下方按钮添加。</div>'; } else if (button.dataset.llmAction === 'test') { testLlmProvider(card); } });
     $('#refreshControl').addEventListener('click', loadControlState);
     $('#controlSection').addEventListener('click', (event) => {
         const button = event.target.closest('[data-control-action]'); if (!button) return;
@@ -1359,5 +1500,34 @@ loadData({ silent: true });
 loadRuntime().then(connectRuntimeStream);
 loadControlState();
 loadAdmin();
-setInterval(loadRuntime, 2000);
-setInterval(loadControlState, 3000);
+
+// 托管轮询：页面隐藏时暂停，避免切走标签页 / 锁屏后仍持续打接口。
+const POLLERS = [
+    { fn: loadRuntime, interval: 2000, timer: null },
+    { fn: loadControlState, interval: 3000, timer: null },
+];
+
+function startPolling() {
+    POLLERS.forEach((poller) => {
+        if (poller.timer === null) poller.timer = setInterval(poller.fn, poller.interval);
+    });
+}
+
+function stopPolling() {
+    POLLERS.forEach((poller) => {
+        if (poller.timer !== null) { clearInterval(poller.timer); poller.timer = null; }
+    });
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        // 恢复可见立即补一次，再重启定时轮询。
+        loadRuntime();
+        loadControlState();
+        startPolling();
+    }
+});
+
+startPolling();

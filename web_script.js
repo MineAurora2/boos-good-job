@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-14-lifecycle.1
+// @version      2026-07-14-llm-polling.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -12,7 +12,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-14-lifecycle.1';
+    const SCRIPT_VERSION = '2026-07-14-llm-polling.1';
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
@@ -950,14 +950,55 @@
         /**
          * 所有投递条件通过后，生成最终发送给招聘者的招呼语
          */
-        generateIntroduce(claimToken, company, title, salary, detail) {
-            return this.__http('/generate-introduce', 'POST', JSON.stringify({
+        async generateIntroduce(claimToken, company, title, salary, detail) {
+            const requestBody = JSON.stringify({
                 claimToken,
                 company,
                 title,
                 salary,
                 detail,
-            }));
+            });
+            const deadline = Date.now() + 10 * 60 * 1000;
+            let job = null;
+            let startFailures = 0;
+
+            // Starting is idempotent by claimToken, so a transient userscript
+            // background restart cannot create duplicate LLM requests.
+            while (!job && startFailures < 3) {
+                try {
+                    job = await this.__http('/generate-introduce/start', 'POST', requestBody, { timeout: 10000 });
+                } catch (error) {
+                    if (isStopError(error)) throw error;
+                    startFailures += 1;
+                    if (startFailures >= 3) break;
+                    await tools.asyncSleep(1000);
+                }
+            }
+
+            let pollFailures = 0;
+            while (job && job.status === 'pending' && Date.now() < deadline) {
+                await tools.asyncSleep(1000);
+                try {
+                    job = await this.__http(
+                        `/generate-introduce/status/${encodeURIComponent(job.jobId)}`,
+                        'GET',
+                        null,
+                        { timeout: 10000 }
+                    );
+                    pollFailures = 0;
+                } catch (error) {
+                    if (isStopError(error)) throw error;
+                    pollFailures += 1;
+                    if (pollFailures >= 3) throw error;
+                    // Tampermonkey/Violentmonkey may briefly restart its
+                    // background worker. The server-side task keeps running.
+                }
+            }
+
+            if (!job) throw new Error('无法启动招呼语生成任务');
+            if (job.status === 'failed') throw new Error(job.error || '招呼语生成失败');
+            if (job.status !== 'completed') throw new Error('招呼语生成等待超时');
+            return job;
         }
 
         /**

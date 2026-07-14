@@ -8,19 +8,22 @@
 
 - [x] 自动投简历
 
-- [x]  多账号投简历
+- [x] 多账号投简历
 
-- [x] 前端展示面板
+- [x] 统计面板
+
+- [x] 配置面板
 
 - [x] 固定打招呼
 
 - [x] AI智能打招呼
 
-- [x] 负向关键词筛选岗位
+- [x] 关键词筛选岗位
 
-- [x] 规则筛选岗位
+- [x] LLM接入管理器
 
-- [x] 默认不继续自动聊天
+- [x] 重复岗位跳过
+
 
 ------
 
@@ -33,9 +36,75 @@
 - 连续多轮没有新岗位时自动切换关键词继续挂机
 - 遇到超时、详情异常、打招呼异常时自动恢复
 
+## 投递流程（UML）
+
+### 活动流程图：单个岗位如何被处理
+
+```mermaid
+flowchart TD
+    Start(["脚本启动"]) --> Cfg["读取配置：tags 关键词 / thread 阈值 / resumeIndex"]
+    Cfg --> Loop{"遍历搜索关键词的岗位列表"}
+    Loop -->|取出一个岗位| Extract["提取 公司 / 岗位 / 薪资 / 详情"]
+    Extract --> Claim["POST /delivery/claim 原子领取投递权"]
+    Claim --> Dup{"公司或岗位已投递过？"}
+    Dup -->|是| Skip1["跳过，不计投递次数"] --> Loop
+    Dup -->|否| Quota{"达到每日投递上限？"}
+    Quota -->|是| Skip2["跳过该账号"] --> Loop
+    Quota -->|否| Token["领取成功，返回 claimToken"]
+    Token --> Score["POST /get-job-score 规则扣星评分（5 星起扣）"]
+    Score --> AI{"启用 AI 二次筛选？"}
+    AI -->|是| Filter["LLM 管理器判断岗位是否匹配"] --> Judge
+    AI -->|否| Judge{"命中屏蔽词 或 评分 &lt; 阈值？"}
+    Judge -->|是| Mark1["markDelivery failed_unknown"] --> Loop
+    Judge -->|否，达标| Gen["POST /generate-introduce 生成招呼语"]
+    Gen --> GenOk{"LLM 生成成功？"}
+    GenOk -->|失败| Fixed["回退固定招呼语"] --> Send
+    GenOk -->|成功| Send["发送招呼语"]
+    Send --> Mark2["markDelivery sent，写入投递记录"] --> Loop
+    Loop -->|连续多轮无新岗位| Switch["切换下一个关键词"] --> Loop
+```
+
+### 时序图：脚本、后端、投递库与 LLM 的交互
+
+```mermaid
+sequenceDiagram
+    participant S as 浏览器脚本 (web_script.js)
+    participant B as 后端 (main.py)
+    participant D as 投递库 (SQLite)
+    participant L as LLM 管理器 (.env 多接口)
+
+    S->>B: GET /client-config 读取运行配置
+    loop 每个岗位
+        S->>B: POST /delivery/claim 领取投递权
+        B->>D: 查重 + 配额检查 + 写入占位
+        D-->>B: accepted + claimToken / 重复 / 超限
+        B-->>S: 领取结果
+        alt 领取成功
+            S->>B: POST /get-job-score 规则评分
+            opt 启用 AI 二次筛选
+                B->>L: chat_completions 判断岗位匹配
+                L-->>B: 通过 / 不通过
+            end
+            B-->>S: score + blocked / discarded
+            alt 达标
+                S->>B: POST /generate-introduce/start 生成招呼语
+                B->>L: chat_completions 生成招呼语
+                L-->>B: 招呼语（失败则回退固定语）
+                B-->>S: introduce
+                S->>S: 在页面发送招呼语
+                S->>B: POST /delivery/mark sent
+            else 命中屏蔽词 / 不达标
+                S->>B: POST /delivery/mark failed_unknown
+            end
+        end
+    end
+```
+
 ## 项目介绍
 
 一个面向 Boss 直聘的轻量自动投递简历项目，采用“浏览器脚本 + 本地 Python 后端”的组合方式。
+
+![](.\img\01.png)
 
 ## 项目结构
 
@@ -75,12 +144,6 @@
 pip install -r requirements.txt
 ```
 
-如果要运行测试：
-
-```bash
-pip install -r requirements-dev.txt
-```
-
 ### 2. 配置外部 LLM（可选）
 
 ```bash
@@ -93,8 +156,6 @@ cp .env.example .env
 GOODJOB_LLM_API_BASE=https://your-provider.example/v1
 GOODJOB_LLM_API_KEY=your-api-key
 ```
-
-`.env` 永远不要提交到 Git。没有外部 LLM 时，项目仍可使用规则评分和固定打招呼主链。
 
 ### 3. 准备用户配置
 
