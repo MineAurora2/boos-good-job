@@ -18,6 +18,7 @@ const state = {
     mapCity: '',
     mapLevel: 'province',
     mapView: { scale: 1, x: 0, y: 0, suppressClick: false },
+    mapRenderVersion: 0,
     industry: '',
     role: '',
     exactDate: '',
@@ -53,6 +54,9 @@ const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)',
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
+const MAP_MAX_SCALE = 20;
+const CITY_DETAIL_ENTER_SCALE = 2.7;
+const CITY_DETAIL_EXIT_SCALE = 2.3;
 
 function dailyTarget() {
     const quotas = state.control?.quotas;
@@ -438,94 +442,6 @@ function geometryPath(geometry) {
     return path;
 }
 
-function geometryBounds(geometry) {
-    const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
-    const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-    polygons.forEach((polygon) => polygon.forEach((ring) => ring.forEach((coordinate) => {
-        const [x, y] = projectCoordinate(coordinate);
-        bounds.minX = Math.min(bounds.minX, x); bounds.maxX = Math.max(bounds.maxX, x);
-        bounds.minY = Math.min(bounds.minY, y); bounds.maxY = Math.max(bounds.maxY, y);
-    })));
-    return Number.isFinite(bounds.minX) ? bounds : null;
-}
-
-function clampValue(value, minimum, maximum) { return Math.max(minimum, Math.min(maximum, value)); }
-
-function percentile(values, ratio) {
-    if (!values.length) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))];
-}
-
-function boxesOverlap(left, right, gap = 1.2) {
-    return left.x < right.x + right.width + gap && left.x + left.width + gap > right.x && left.y < right.y + right.height + gap && left.y + left.height + gap > right.y;
-}
-
-function markerBox(marker, dx, dy, sizeScale = 1) {
-    const fontSize = marker.fontSize * sizeScale;
-    const height = marker.height * sizeScale;
-    const width = Math.max(height, marker.display.length * fontSize * .62 + 5 * sizeScale);
-    return {
-        x: marker.x + dx - width / 2,
-        y: marker.y + dy - height / 2,
-        width, height, dx, dy, fontSize,
-        radius: Math.max(2.2, marker.anchorRadius * sizeScale),
-    };
-}
-
-function layoutCityMarkers(markers) {
-    const ordered = [...markers].sort((left, right) => Number(right.selected) - Number(left.selected) || right.value - left.value || left.city.localeCompare(right.city, 'zh-CN'));
-    const placed = [];
-    const directions = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [1, 1], [-1, 1], [-1, -1]];
-    ordered.forEach((marker) => {
-        const candidates = [{ dx: 0, dy: 0 }];
-        [9, 15, 23, 33, 45, 56].forEach((distance) => directions.forEach(([x, y]) => candidates.push({ dx: x * distance, dy: y * distance })));
-        let chosen = null; let fallback = null;
-        for (const sizeScale of [1, .88, .76, .66]) {
-            for (const candidate of candidates) {
-                const box = markerBox(marker, candidate.dx, candidate.dy, sizeScale);
-                if (box.x < 4 || box.y < 4 || box.x + box.width > 666 || box.y + box.height > 396) continue;
-                const collisions = placed.filter((item) => boxesOverlap(box, item));
-                const coveredAnchors = markers.filter((item) => item !== marker && item.x > box.x - 1.5 && item.x < box.x + box.width + 1.5 && item.y > box.y - 1.5 && item.y < box.y + box.height + 1.5);
-                const overlapArea = collisions.reduce((sum, item) => {
-                    const width = Math.max(0, Math.min(box.x + box.width, item.x + item.width) - Math.max(box.x, item.x));
-                    const height = Math.max(0, Math.min(box.y + box.height, item.y + item.height) - Math.max(box.y, item.y));
-                    return sum + width * height;
-                }, 0);
-                const penalty = collisions.length * 500 + coveredAnchors.length * 800 + overlapArea * 20 + Math.hypot(candidate.dx, candidate.dy);
-                if (!fallback || penalty < fallback.penalty) fallback = { ...box, penalty };
-                if (!collisions.length && !coveredAnchors.length) { chosen = box; break; }
-            }
-            if (chosen) break;
-        }
-        if (!chosen) {
-            let nearestOpen = null;
-            for (let centerY = 10; centerY <= 390; centerY += 10) {
-                for (let centerX = 10; centerX <= 660; centerX += 10) {
-                    const box = markerBox(marker, centerX - marker.x, centerY - marker.y, .66);
-                    if (box.x < 4 || box.y < 4 || box.x + box.width > 666 || box.y + box.height > 396 || placed.some((item) => boxesOverlap(box, item))) continue;
-                    const coversAnchor = markers.some((item) => item !== marker && item.x > box.x - 1.5 && item.x < box.x + box.width + 1.5 && item.y > box.y - 1.5 && item.y < box.y + box.height + 1.5);
-                    if (coversAnchor) continue;
-                    const distance = Math.hypot(box.dx, box.dy);
-                    if (!nearestOpen || distance < nearestOpen.distance) nearestOpen = { ...box, distance };
-                }
-            }
-            chosen = nearestOpen;
-        }
-        if (!chosen) {
-            for (let centerY = 10; centerY <= 390 && !chosen; centerY += 10) {
-                for (let centerX = 10; centerX <= 660; centerX += 10) {
-                    const box = markerBox(marker, centerX - marker.x, centerY - marker.y, .66);
-                    if (box.x >= 4 && box.y >= 4 && box.x + box.width <= 666 && box.y + box.height <= 396 && !placed.some((item) => boxesOverlap(box, item))) { chosen = box; break; }
-                }
-            }
-        }
-        marker.badge = chosen || fallback || markerBox(marker, 0, 0, .66);
-        placed.push(marker.badge);
-    });
-    return ordered;
-}
-
 async function ensureChinaGeo() {
     if (state.chinaGeo) return state.chinaGeo;
     const response = await fetch('/dashboard/china.json', { cache: 'force-cache' });
@@ -543,113 +459,145 @@ async function ensureCityGeo() {
     return state.cityGeo;
 }
 
-function renderSpecialRegions(features, stats, metric, max, visible) {
-    const container = $('#mapSpecialRegions');
-    container.hidden = !visible;
-    if (!visible) { container.replaceChildren(); return; }
-    const cards = ['香港', '澳门'].map((name) => {
+function selectMapCity(city) {
+    if (!city) return;
+    state.mapCity = state.mapCity === city ? '' : city;
+    state.mapProvince = '';
+    state.page = 1;
+    updateDashboard();
+    showToast(state.mapCity ? `已筛选地级市 ${state.mapCity}` : '已取消城市筛选');
+}
+
+function selectMapProvince(province) {
+    if (!province) return;
+    state.mapProvince = state.mapProvince === province ? '' : province;
+    state.mapCity = '';
+    state.page = 1;
+    updateDashboard();
+    showToast(state.mapProvince ? `已筛选 ${state.mapProvince}` : '已取消地图筛选');
+}
+
+function renderProvinceCallouts(features, stats, metric, max) {
+    const targets = { 香港: [502, 344], 澳门: [494, 369] };
+    return Object.entries(targets).map(([name, [targetX, targetY]]) => {
         const feature = features.find((item) => normalizeProvince(item.properties?.name) === name);
-        if (!feature) return '';
-        const bounds = geometryBounds(feature.geometry); if (!bounds) return '';
-        const width = Math.max(.1, bounds.maxX - bounds.minX), height = Math.max(.1, bounds.maxY - bounds.minY), padding = Math.max(width, height) * .2;
-        const item = stats.get(name) || { count: 0, salaries: [] }; const value = mapMetricValue(item, metric);
-        const display = metric === 'salary' ? (value ? `${value.toFixed(0)}K` : '—') : `${item.count}份`;
-        const title = metric === 'salary' ? `${name}平均薪资 ${value ? value.toFixed(1) + 'K' : '暂无数据'}` : `${name}${item.count}份投递`;
-        return `<button type="button" class="map-special-region ${state.mapProvince === name ? 'is-active' : ''}" data-province="${name}" aria-pressed="${state.mapProvince === name}" aria-label="${title}，点击筛选"><svg viewBox="${(bounds.minX - padding).toFixed(2)} ${(bounds.minY - padding).toFixed(2)} ${(width + padding * 2).toFixed(2)} ${(height + padding * 2).toFixed(2)}" aria-hidden="true"><path d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path></svg><span>${name}</span><strong>${display}</strong></button>`;
+        const center = feature?.properties?.centroid || feature?.properties?.center;
+        if (!center) return '';
+        const [x, y] = projectCoordinate(center);
+        const value = mapMetricValue(stats.get(name), metric);
+        return `<g class="geo-region-callout ${state.mapProvince === name ? 'is-active' : ''}" data-province="${name}" tabindex="0" role="button" aria-label="${name}热力区域，点击筛选"><line x1="${x.toFixed(2)}" y1="${y.toFixed(2)}" x2="${(targetX - 7).toFixed(2)}" y2="${targetY.toFixed(2)}"></line><circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="3.2" fill="${mapColor(value, max)}"></circle><text x="${targetX}" y="${targetY + 4}">${name}</text></g>`;
     }).join('');
-    container.innerHTML = `<small>港澳放大</small><div>${cards}</div>`;
 }
 
 async function renderMap(records) {
     const container = $('#chinaMap');
+    const renderVersion = ++state.mapRenderVersion;
     try {
         const metric = $('#mapMetric').value;
         const level = state.mapLevel === 'city' ? 'city' : 'province';
         const geo = await ensureChinaGeo();
+        if (renderVersion !== state.mapRenderVersion) return;
         const cityGeo = level === 'city' ? await ensureCityGeo() : null;
+        if (renderVersion !== state.mapRenderVersion) return;
         const { stats, unknown } = level === 'city' ? cityStats(records) : provinceStats(records);
         const values = [...stats.values()].map((item) => mapMetricValue(item, metric));
         const max = Math.max(...values, 0);
         const features = geo.features.filter((feature) => feature.properties?.name);
-        let paths = '', labels = '', heatLayer = '';
+        container.dataset.mapLevel = level;
+        let paths = '';
+        let labels = '';
+        let callouts = '';
         if (level === 'province') {
             paths = features.map((feature) => {
-                const name = normalizeProvince(feature.properties.name), item = stats.get(name) || { count: 0, salaries: [] };
+                const name = normalizeProvince(feature.properties.name);
+                const item = stats.get(name) || { count: 0, salaries: [] };
                 const value = mapMetricValue(item, metric);
                 const title = metric === 'salary' ? `${name}：${value ? value.toFixed(1) + 'K' : '暂无薪资'}` : `${name}：${value} 份`;
-                return `<path class="geo-province ${state.mapProvince === name ? 'is-active' : ''}" data-province="${escapeHtml(name)}" d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"><title>${title}，点击筛选</title></path>`;
+                return `<path class="geo-province ${state.mapProvince === name ? 'is-active' : ''}" data-province="${escapeHtml(name)}" tabindex="0" role="button" aria-label="${title}，点击筛选" d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
             }).join('');
             labels = features.map((feature) => {
-                const name = normalizeProvince(feature.properties.name), center = feature.properties.centroid || feature.properties.center;
+                const name = normalizeProvince(feature.properties.name);
+                const center = feature.properties.centroid || feature.properties.center;
                 if (!center || name === '香港' || name === '澳门') return '';
-                const [x, y] = projectCoordinate(center), hot = stats.get(name)?.count;
-                return `<text class="geo-label ${hot ? 'hot' : ''}" x="${x}" y="${y}">${name.length > 3 ? name.slice(0, 3) : name}</text>`;
+                const [x, y] = projectCoordinate(center);
+                return `<text class="geo-label ${stats.get(name)?.count ? 'hot' : ''}" x="${x}" y="${y}">${name.length > 3 ? name.slice(0, 3) : name}</text>`;
             }).join('');
-            renderSpecialRegions(features, stats, metric, max, true);
+            callouts = renderProvinceCallouts(features, stats, metric, max);
         } else {
-            renderSpecialRegions(features, stats, metric, max, false);
+            const inverseScale = (1 / state.mapView.scale).toFixed(4);
             const cityFeatures = (cityGeo?.features || []).filter((feature) => feature.properties?.name);
-            const cityFeatureMap = new Map(cityFeatures.map((feature) => [normalizeCityName(feature.properties.name), feature]));
             const cityBoundaries = cityFeatures.map((feature) => {
-                const city = normalizeCityName(feature.properties.name), item = stats.get(city) || { count: 0, salaries: [] };
-                const value = mapMetricValue(item, metric), hasData = item.count > 0;
-                const title = metric === 'salary' ? `${city}：${value ? `平均 ${value.toFixed(1)}K` : '暂无薪资'}，${item.count} 份投递` : `${city}：${item.count} 份投递`;
-                return `<path class="geo-city-boundary ${hasData ? 'has-data' : ''} ${state.mapCity === city ? 'is-active' : ''}" ${hasData ? `data-city="${escapeHtml(city)}" tabindex="0" role="button"` : ''} d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"><title>${title}${hasData ? '，点击筛选' : ''}</title></path>`;
+                const city = normalizeCityName(feature.properties.name);
+                const item = stats.get(city) || { count: 0, salaries: [] };
+                const value = mapMetricValue(item, metric);
+                const hasData = item.count > 0;
+                const title = metric === 'salary'
+                    ? `${feature.properties.name}：${value ? `平均薪资 ${value.toFixed(1)}K` : '暂无薪资数据'}`
+                    : `${feature.properties.name}热力区域${hasData ? '已着色' : '暂无数据'}`;
+                return `<path class="geo-city-boundary ${hasData ? 'has-data' : ''}" ${hasData ? `data-city="${escapeHtml(city)}" tabindex="0" role="button" aria-label="${title}，点击筛选"` : ''} d="${geometryPath(feature.geometry)}" fill="${mapColor(value, max)}" fill-rule="evenodd"></path>`;
             }).join('');
             const provinceOutlines = features.map((feature) => `<path class="geo-province-outline" d="${geometryPath(feature.geometry)}" fill-rule="evenodd"></path>`).join('');
             paths = `<g class="city-boundary-layer">${cityBoundaries}</g><g class="province-outline-layer">${provinceOutlines}</g>`;
-
-            const positiveValues = values.filter((value) => value > 0), cap = percentile(positiveValues, .95) || max || 1;
-            const markers = [...stats.entries()].map(([city, item]) => {
-                const feature = cityFeatureMap.get(city);
-                const center = feature?.properties?.centroid || feature?.properties?.center || CITY_COORDINATES[city];
-                if (!center || !item.count) return null;
-                const value = mapMetricValue(item, metric), intensity = clampValue(Math.log1p(Math.min(value || item.count, cap)) / Math.log1p(cap), 0, 1);
-                const [x, y] = projectCoordinate(center), display = metric === 'salary' ? (value ? `${Math.round(value)}K` : '—') : String(item.count);
-                return {
-                    city, item, value, x, y, display, selected: state.mapCity === city,
-                    fontSize: 4.15 + Math.sqrt(intensity) * 1.65,
-                    height: 8 + Math.sqrt(intensity) * 2.8,
-                    anchorRadius: 2.3 + Math.sqrt(intensity) * 1.8,
-                    color: mapColor(value, max),
-                };
-            }).filter(Boolean);
-            const laidOut = layoutCityMarkers(markers), inverseScale = (1 / state.mapView.scale).toFixed(4);
-            const connectors = laidOut.filter((marker) => Math.hypot(marker.badge.dx, marker.badge.dy) > 2).map((marker) => `<g transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><line class="city-marker-connector" x1="0" y1="0" x2="${marker.badge.dx.toFixed(2)}" y2="${marker.badge.dy.toFixed(2)}"></line></g></g>`).join('');
-            const anchors = laidOut.map((marker) => `<g transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><circle class="city-marker-anchor ${marker.selected ? 'is-active' : ''}" r="${marker.badge.radius.toFixed(2)}" fill="${marker.color}"></circle></g></g>`).join('');
-            const badges = laidOut.map((marker) => {
-                const badge = marker.badge;
-                const title = metric === 'salary' ? `${marker.city}：平均 ${marker.value ? marker.value.toFixed(1) + 'K' : '暂无薪资'}，${marker.item.count} 份投递` : `${marker.city}：${marker.item.count} 份投递`;
-                return `<g class="city-count-marker ${marker.selected ? 'is-active' : ''}" data-city="${escapeHtml(marker.city)}" tabindex="0" role="button" aria-label="${title}，点击筛选" transform="translate(${marker.x.toFixed(2)} ${marker.y.toFixed(2)})"><g class="city-marker-visual" transform="scale(${inverseScale})"><g transform="translate(${badge.dx.toFixed(2)} ${badge.dy.toFixed(2)})"><rect x="${(-badge.width / 2).toFixed(2)}" y="${(-badge.height / 2).toFixed(2)}" width="${badge.width.toFixed(2)}" height="${badge.height.toFixed(2)}" rx="${(badge.height / 2).toFixed(2)}" fill="${marker.color}"></rect><text x="0" y="${(badge.fontSize * .34).toFixed(2)}" style="font-size:${badge.fontSize.toFixed(2)}px">${escapeHtml(marker.display)}</text><title>${title}，点击筛选</title></g></g></g>`;
+            labels = cityFeatures.map((feature) => {
+                const center = feature.properties.centroid || feature.properties.center;
+                if (!center) return '';
+                const city = normalizeCityName(feature.properties.name);
+                const [x, y] = projectCoordinate(center);
+                const length = feature.properties.name.length;
+                const fontSize = length > 10 ? 3.6 : (length > 6 ? 4.2 : 5.1);
+                return `<g class="geo-city-label ${stats.get(city)?.count ? 'has-data' : ''}" transform="translate(${x.toFixed(2)} ${y.toFixed(2)})"><g class="map-fixed-visual" transform="scale(${inverseScale})"><text data-base-font-size="${fontSize}">${escapeHtml(feature.properties.name)}</text></g></g>`;
             }).join('');
-            heatLayer = `<g class="city-connector-layer">${connectors}</g><g class="city-anchor-layer">${anchors}</g><g class="city-badge-layer">${badges}</g>`;
-            if (!markers.length) heatLayer += '<text class="city-unknown-note" x="335" y="205" text-anchor="middle">暂无可定位的地级市投递数据</text>';
         }
         const { scale, x, y } = state.mapView;
-        container.innerHTML = `<svg viewBox="0 0 670 400" preserveAspectRatio="xMidYMid meet"><g class="map-viewport" transform="translate(${x} ${y}) scale(${scale})">${paths}${labels}${heatLayer}</g></svg>`;
+        container.innerHTML = `<svg viewBox="0 0 670 400" preserveAspectRatio="xMidYMid meet"><g class="map-viewport" transform="translate(${x} ${y}) scale(${scale})">${paths}${labels}${callouts}</g></svg>`;
+        updateCityLabelSizes();
         updateMapZoomLabel();
+        if (renderVersion !== state.mapRenderVersion) return;
         const known = Math.max(0, records.length - unknown);
         $('#knownLocationRate').textContent = `已识别 ${records.length ? Math.round(known / records.length * 100) : 0}%`;
         $('#locationRankingTitle').textContent = level === 'city' ? '热门地级市' : '热门省份';
-        $('#mapInteractionHint').textContent = level === 'city' ? '地级市边界热力 · 数量自动避让 · 点击筛选 · 缩放查看' : '省份热力 · 港澳放大可点击 · 缩放查看';
-        const nonzeroValues = values.filter((value) => value > 0), minimum = nonzeroValues.length ? Math.min(...nonzeroValues) : 0;
-        $('#mapScaleMin').textContent = metric === 'salary' ? `${minimum ? minimum.toFixed(0) : 0}K` : `${minimum}份`;
-        $('#mapScaleMax').textContent = metric === 'salary' ? `${max ? max.toFixed(0) : 0}K` : `${max}份`;
+        $('#mapInteractionHint').textContent = level === 'city'
+            ? `地级市边界与名称 · 缩至 ${Math.round(CITY_DETAIL_EXIT_SCALE * 100)}% 自动返回省份`
+            : `省份热力 · 放大至 ${Math.round(CITY_DETAIL_ENTER_SCALE * 100)}% 自动显示地级市 · 港澳连线`;
+        const nonzeroValues = values.filter((value) => value > 0);
+        const minimum = nonzeroValues.length ? Math.min(...nonzeroValues) : 0;
+        const hideCityCount = level === 'city' && metric === 'count';
+        $('#mapScaleMin').textContent = hideCityCount ? '低' : (metric === 'salary' ? `${minimum ? minimum.toFixed(0) : 0}K` : `${minimum}份`);
+        $('#mapScaleMax').textContent = hideCityCount ? '高' : (metric === 'salary' ? `${max ? max.toFixed(0) : 0}K` : `${max}份`);
         const ranked = [...stats.entries()].filter(([, item]) => item.count).sort((a, b) => mapMetricValue(b[1], metric) - mapMetricValue(a[1], metric)).slice(0, 7);
         const rankingMax = ranked.length ? Math.max(...ranked.map(([, item]) => mapMetricValue(item, metric)), 1) : 1;
         $('#locationList').innerHTML = ranked.length ? ranked.map(([name, item], index) => {
-            const value = mapMetricValue(item, metric), display = metric === 'salary' ? `${value.toFixed(1)}K` : item.count;
+            const value = mapMetricValue(item, metric);
+            const display = metric === 'salary' ? `${value.toFixed(1)}K` : item.count;
             const selectedLocation = level === 'city' ? state.mapCity : state.mapProvince;
-            return `<div class="ranking-item ${selectedLocation === name ? 'is-active' : ''}" data-map-location="${escapeHtml(name)}"><span>${index + 1}</span><span class="ranking-name">${escapeHtml(name)}</span><strong class="ranking-count">${display}</strong><div class="ranking-bar"><i style="width:${value / rankingMax * 100}%"></i></div></div>`;
+            return `<div class="ranking-item ${selectedLocation === name ? 'is-active' : ''}" data-map-location="${escapeHtml(name)}"><span>${index + 1}</span><span class="ranking-name">${escapeHtml(name)}</span>${hideCityCount ? '' : `<strong class="ranking-count">${display}</strong>`}<div class="ranking-bar"><i style="width:${value / rankingMax * 100}%"></i></div></div>`;
         }).join('') : '<div class="empty-state" style="padding:38px 0"><strong>历史地区尚未采集</strong><p>新投递会自动进入热力地图</p></div>';
     } catch (error) {
+        if (renderVersion !== state.mapRenderVersion) return;
+        console.error(error);
         container.innerHTML = '<div class="empty-state"><strong>中国地图加载失败</strong><p>请刷新页面重试</p></div>';
     }
 }
 
+function mapLevelForScale(scale, currentLevel = state.mapLevel) {
+    if (currentLevel === 'city') return scale <= CITY_DETAIL_EXIT_SCALE ? 'province' : 'city';
+    return scale >= CITY_DETAIL_ENTER_SCALE ? 'city' : 'province';
+}
+
+function syncMapLevelWithScale() {
+    const nextLevel = mapLevelForScale(state.mapView.scale);
+    if (nextLevel === state.mapLevel) return false;
+    state.mapLevel = nextLevel;
+    state.mapCity = '';
+    state.page = 1;
+    const focused = document.activeElement;
+    if (focused?.closest?.('#chinaMap')) focused.blur();
+    return true;
+}
+
 function clampMapView() {
     const view = state.mapView;
-    view.scale = Math.max(1, Math.min(6, view.scale));
+    view.scale = Math.max(1, Math.min(MAP_MAX_SCALE, view.scale));
     const minX = -670 * (view.scale - 1), minY = -400 * (view.scale - 1);
     view.x = Math.max(minX, Math.min(0, view.x));
     view.y = Math.max(minY, Math.min(0, view.y));
@@ -660,63 +608,80 @@ function applyMapTransform() {
     const viewport = $('#chinaMap .map-viewport');
     if (viewport) viewport.setAttribute('transform', `translate(${state.mapView.x} ${state.mapView.y}) scale(${state.mapView.scale})`);
     const inverseScale = String(1 / state.mapView.scale);
-    $$('#chinaMap .city-marker-visual').forEach((marker) => marker.setAttribute('transform', `scale(${inverseScale})`));
+    $$('#chinaMap .map-fixed-visual').forEach((element) => element.setAttribute('transform', `scale(${inverseScale})`));
+    updateCityLabelSizes();
     updateMapZoomLabel();
+}
+
+function updateCityLabelSizes() {
+    const boost = Math.min(1.85, 1 + Math.log2(Math.max(1, state.mapView.scale)) * .22);
+    $$('#chinaMap .geo-city-label text').forEach((label) => {
+        const base = Number(label.dataset.baseFontSize || 5);
+        label.style.fontSize = `${(base * boost).toFixed(2)}px`;
+    });
 }
 
 function updateMapZoomLabel() {
     const label = $('#mapZoomValue');
-    if (label) label.textContent = `${Math.round(state.mapView.scale * 100)}%`;
+    if (!label) return;
+    label.textContent = `${Math.round(state.mapView.scale * 100)}%`;
 }
 
 function zoomMap(nextScale, centerX = 335, centerY = 200) {
     const view = state.mapView, previousScale = view.scale;
-    const scale = Math.max(1, Math.min(6, nextScale));
+    const scale = Math.max(1, Math.min(MAP_MAX_SCALE, nextScale));
     if (scale === previousScale) return;
     view.x = centerX - ((centerX - view.x) / previousScale) * scale;
     view.y = centerY - ((centerY - view.y) / previousScale) * scale;
     view.scale = scale;
+    const levelChanged = syncMapLevelWithScale();
     applyMapTransform();
+    if (levelChanged) updateDashboard();
 }
 
 function resetMapView() {
+    const levelChanged = state.mapLevel !== 'province';
+    state.mapLevel = 'province';
+    state.mapCity = '';
     Object.assign(state.mapView, { scale: 1, x: 0, y: 0, suppressClick: false });
     applyMapTransform();
+    if (levelChanged) updateDashboard();
+}
+
+function clientToSvgPoint(svg, clientX, clientY) {
+    const matrix = svg.getScreenCTM();
+    if (matrix) {
+        const point = svg.createSVGPoint();
+        point.x = clientX;
+        point.y = clientY;
+        return point.matrixTransform(matrix.inverse());
+    }
+    const rect = svg.getBoundingClientRect();
+    return { x: (clientX - rect.left) / rect.width * 670, y: (clientY - rect.top) / rect.height * 400 };
 }
 
 function initMapNavigation() {
     const map = $('#chinaMap');
     let pointer = null;
-    const selectCity = (city) => {
-        if (!city) return;
-        state.mapCity = state.mapCity === city ? '' : city; state.mapProvince = '';
-        state.page = 1; updateDashboard(); showToast(state.mapCity ? `已筛选地级市 ${state.mapCity}` : '已取消城市筛选');
-    };
-    const selectProvince = (province) => {
-        if (!province) return;
-        state.mapProvince = state.mapProvince === province ? '' : province; state.mapCity = '';
-        state.page = 1; updateDashboard(); showToast(state.mapProvince ? `已筛选 ${state.mapProvince}` : '已取消地图筛选');
-    };
     map.addEventListener('wheel', (event) => {
         event.preventDefault();
         const svg = map.querySelector('svg'); if (!svg) return;
-        const rect = svg.getBoundingClientRect();
-        const centerX = (event.clientX - rect.left) / rect.width * 670;
-        const centerY = (event.clientY - rect.top) / rect.height * 400;
-        zoomMap(state.mapView.scale * Math.exp(-event.deltaY * .0012), centerX, centerY);
+        const center = clientToSvgPoint(svg, event.clientX, event.clientY);
+        zoomMap(state.mapView.scale * Math.exp(-event.deltaY * .0015), center.x, center.y);
     }, { passive: false });
     map.addEventListener('pointerdown', (event) => {
         if (event.button !== 0) return;
         const svg = map.querySelector('svg'); if (!svg) return;
-        pointer = { id: event.pointerId, startX: event.clientX, startY: event.clientY, x: state.mapView.x, y: state.mapView.y, moved: false, rect: svg.getBoundingClientRect() };
+        pointer = { id: event.pointerId, start: clientToSvgPoint(svg, event.clientX, event.clientY), x: state.mapView.x, y: state.mapView.y, moved: false, svg };
         map.setPointerCapture(event.pointerId); map.classList.add('is-panning');
     });
     map.addEventListener('pointermove', (event) => {
         if (!pointer || pointer.id !== event.pointerId || state.mapView.scale <= 1) return;
-        const dx = event.clientX - pointer.startX, dy = event.clientY - pointer.startY;
+        const current = clientToSvgPoint(pointer.svg, event.clientX, event.clientY);
+        const dx = current.x - pointer.start.x, dy = current.y - pointer.start.y;
         if (Math.hypot(dx, dy) > 5) pointer.moved = true;
-        state.mapView.x = pointer.x + dx / pointer.rect.width * 670;
-        state.mapView.y = pointer.y + dy / pointer.rect.height * 400;
+        state.mapView.x = pointer.x + dx;
+        state.mapView.y = pointer.y + dy;
         applyMapTransform();
     });
     const finishPan = (event) => {
@@ -729,44 +694,30 @@ function initMapNavigation() {
     map.addEventListener('click', (event) => {
         const city = event.target.closest('[data-city]');
         if (city && !state.mapView.suppressClick) {
-            selectCity(city.dataset.city); return;
+            const name = city.dataset.city;
+            city.blur?.();
+            selectMapCity(name); return;
         }
-        const province = event.target.closest('.geo-province');
+        const province = event.target.closest('[data-province]');
         if (!province?.dataset.province || state.mapView.suppressClick) return;
-        selectProvince(province.dataset.province);
+        const name = province.dataset.province;
+        province.blur?.();
+        selectMapProvince(name);
     });
     map.addEventListener('keydown', (event) => {
         if (!['Enter', ' '].includes(event.key)) return;
         const city = event.target.closest('[data-city]');
-        if (city) { event.preventDefault(); selectCity(city.dataset.city); }
+        const province = event.target.closest('[data-province]');
+        if (city) { event.preventDefault(); selectMapCity(city.dataset.city); }
+        else if (province) { event.preventDefault(); selectMapProvince(province.dataset.province); }
     });
-    $('#mapSpecialRegions').addEventListener('click', (event) => {
-        const region = event.target.closest('[data-province]'); if (region) selectProvince(region.dataset.province);
-    });
-    map.addEventListener('dblclick', (event) => { event.preventDefault(); resetMapView(); showToast('地图视图已复位'); });
-    $('#mapZoomIn').addEventListener('click', () => zoomMap(state.mapView.scale * 1.3));
-    $('#mapZoomOut').addEventListener('click', () => zoomMap(state.mapView.scale / 1.3));
+    $('#mapZoomIn').addEventListener('click', () => zoomMap(state.mapView.scale * 1.45));
+    $('#mapZoomOut').addEventListener('click', () => zoomMap(state.mapView.scale / 1.45));
     $('#mapResetView').addEventListener('click', () => { resetMapView(); showToast('地图视图已复位'); });
-    $$('#mapLevelSwitch button').forEach((button) => button.addEventListener('click', () => {
-        state.mapLevel = button.dataset.mapLevel === 'city' ? 'city' : 'province';
-        state.mapProvince = '';
-        state.mapCity = '';
-        $$('#mapLevelSwitch button').forEach((item) => item.classList.toggle('active', item === button));
-        resetMapView();
-        state.page = 1;
-        updateDashboard();
-        showToast(state.mapLevel === 'city' ? '已切换地级市热力层' : '已切换省份热力层');
-    }));
     $('#locationList').addEventListener('click', (event) => {
         const item = event.target.closest('[data-map-location]'); if (!item) return;
         const name = item.dataset.mapLocation;
-        if (state.mapLevel === 'city') {
-            state.mapCity = state.mapCity === name ? '' : name; state.mapProvince = '';
-        } else {
-            state.mapProvince = state.mapProvince === name ? '' : name; state.mapCity = '';
-        }
-        state.page = 1; updateDashboard();
-        showToast((state.mapCity || state.mapProvince) ? `已筛选 ${name}` : '已取消地图筛选');
+        if (state.mapLevel === 'city') selectMapCity(name); else selectMapProvince(name);
     });
 }
 
@@ -1347,6 +1298,7 @@ function applyTheme(theme, persist = true) {
         button.title = normalized === 'dark' ? '切换白天主题' : '切换深蓝主题';
         button.setAttribute('aria-label', button.title);
     }
+    if (state.payload) renderMap(getFilteredRecords());
 }
 
 function toggleTheme() {

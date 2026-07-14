@@ -22,7 +22,7 @@ import httpx
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
-def _response_text(value) -> str:
+def response_text(value) -> str:
     """把不同兼容服务返回的字符串或内容分片统一整理为纯文本。"""
     if isinstance(value, str):
         return value.strip()
@@ -251,9 +251,9 @@ class LLMGateway:
                         if not isinstance(message, dict):
                             raise ValueError('LLM response is missing message')
                         if (
-                            not _response_text(message.get('content'))
-                            and not _response_text(message.get('reasoning_content'))
-                            and not _response_text(message.get('reasoning'))
+                            not response_text(message.get('content'))
+                            and not response_text(message.get('reasoning_content'))
+                            and not response_text(message.get('reasoning'))
                         ):
                             raise ValueError('LLM response content is empty')
                         self._record_success()
@@ -292,27 +292,44 @@ class LLMGateway:
         loop_key = id(asyncio.get_running_loop())
         inflight_key = (loop_key, cache_key)
         with self._lock:
-            # owner 创建真实网络任务，后续相同请求只等待该任务，避免重复计费。
             task = self._inflight.get(inflight_key)
-            owner = task is None
-            if owner:
+            if task is None:
                 task = asyncio.create_task(self._request(config, payload))
                 self._inflight[inflight_key] = task
-        try:
-            result = await asyncio.shield(task)
-            choices = result.get('choices') if isinstance(result, dict) else None
-            finish_reason = choices[0].get('finish_reason') if choices and isinstance(choices[0], dict) else None
-            message = choices[0].get('message') if choices and isinstance(choices[0], dict) else None
-            has_final_content = isinstance(message, dict) and bool(_response_text(message.get('content')))
-            # 仅含推理内容的响应仍是合法上游响应，不应触发熔断；但它没有可直接复用的
-            # 最终答案。因长度截断的响应同样不进入缓存，避免后续命中不完整结果。
-            if owner and finish_reason != 'length' and has_final_content:
-                self._put_cached(cache_key, result, cache_ttl)
-            return result
-        finally:
-            if owner:
-                with self._lock:
-                    self._inflight.pop(inflight_key, None)
+
+                def complete(completed: asyncio.Task) -> None:
+                    try:
+                        result = completed.result()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    else:
+                        choices = result.get('choices') if isinstance(result, dict) else None
+                        finish_reason = (
+                            choices[0].get('finish_reason')
+                            if choices and isinstance(choices[0], dict)
+                            else None
+                        )
+                        message = (
+                            choices[0].get('message')
+                            if choices and isinstance(choices[0], dict)
+                            else None
+                        )
+                        has_final_content = isinstance(message, dict) and bool(
+                            response_text(message.get('content'))
+                        )
+                        if finish_reason != 'length' and has_final_content:
+                            self._put_cached(cache_key, result, cache_ttl)
+                    finally:
+                        with self._lock:
+                            if self._inflight.get(inflight_key) is completed:
+                                self._inflight.pop(inflight_key, None)
+
+                # Cleanup belongs to the network task itself. A cancelled caller only stops
+                # waiting; it must not make an active paid request look absent to later callers.
+                task.add_done_callback(complete)
+
+        result = await asyncio.shield(task)
+        return result
 
     def reset_circuit(self, clear_cache: bool = False) -> None:
         """手动重置熔断状态，并可选择同时清空结果缓存。"""

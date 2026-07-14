@@ -1,19 +1,19 @@
-"""项目运行配置的默认值、兼容迁移和热加载入口。
+"""Project defaults, legacy configuration migration, and runtime reloads."""
 
-配置以本模块的默认值为基础，再由 ``user_config.json`` 覆盖；`.env` 只补充
-当前进程尚未显式设置的环境变量，避免覆盖部署环境传入的敏感配置。
-"""
+from __future__ import annotations
 
 import copy
 import json
 import os
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / 'user_config.json'
 
 
 def _load_env_file(path: Path) -> None:
-    """加载项目本地 .env，但不覆盖进程中显式设置的环境变量。"""
+    """Load a local ``.env`` without overriding explicit process variables."""
     if not path.exists():
         return
     for raw_line in path.read_text(encoding='utf-8').splitlines():
@@ -38,7 +38,6 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(ROOT / '.env')
 
 
-# 这里定义可直接启动项目的完整配置；网页保存的 user_config.json 只需包含覆盖项。
 DEFAULT_USER_CONFIG = {
     'resume_name': 'resume.md',
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
@@ -69,246 +68,119 @@ DEFAULT_USER_CONFIG = {
         'preloadActivateCardWaitMs': 250,
     },
     'scoring': {
-        'title_block_keywords': {
-            '测试': 100,
-            '销售': 100,
-            '商务': 100,
-            '运营': 100,
-            '客服': 100,
-            '管培生': 100,
-            '培训生': 100,
-            '储备干部': 100,
-            '储干': 100,
-            '项目经理': 100,
-            '项目管理': 100,
-            '数据开发': 100,
-            '数据治理': 100,
-            '算法': 100,
-            '算法工程师': 100,
-            '算法研究员': 100,
-            '机器学习算法': 100,
-            '深度学习算法': 100,
-            '推荐算法': 100,
-            '搜索算法': 100,
-            'cv算法': 100,
-            'nlp算法': 100,
-            '多模态算法': 100,
-            '模型训练': 100,
-            '模型研发': 100,
-            '大模型算法': 100,
-            '训练': 100,
-            '预训练': 100,
-            '微调': 100,
-            '嵌入式': 100,
-            '硬件': 100,
-            '渠道': 100,
-            '光伏': 100,
+        'title_deduction_keywords': {
+            'java': 2,
+            '前端': 3,
+            '后端': 1,
+            '全栈': 1,
+            '测试': 5,
+            '销售': 5,
+            '商务': 5,
+            '运营': 5,
+            '客服': 5,
+            '管培生': 5,
+            '培训生': 5,
+            '储备干部': 5,
+            '储干': 5,
+            '项目经理': 5,
+            '项目管理': 5,
+            '数据开发': 5,
+            '数据治理': 5,
+            '算法': 5,
+            '算法工程师': 5,
+            '算法研究员': 5,
+            '机器学习算法': 5,
+            '深度学习算法': 5,
+            '推荐算法': 5,
+            '搜索算法': 5,
+            'cv算法': 5,
+            'nlp算法': 5,
+            '多模态算法': 5,
+            '模型训练': 5,
+            '模型研发': 5,
+            '大模型算法': 5,
+            '训练': 5,
+            '预训练': 5,
+            '微调': 5,
+            '嵌入式': 5,
+            '硬件': 5,
+            '渠道': 5,
+            '光伏': 5,
         },
-        'title_penalty_keywords': {
-            'java': 35,
-            '前端': 45,
-            '后端': 20,
-            '全栈': 18,
-        },
-        'title_strong_keywords': {
-            'ai应用': 88,
-            '人工智能应用': 88,
-            'ai工程': 85,
-            '人工智能工程师': 85,
-            'ai开发': 86,
-            'ai提效': 86,
-            'ai产品': 84,
-            '人工智能产品': 84,
-            'ai产品经理': 84,
-            'ai解决方案': 82,
-            'ai实施顾问': 80,
-            'ai agent': 88,
-            '智能体': 88,
-            'ai工作流': 86,
-            '工作流工程师': 84,
-            '大模型应用': 86,
-            'llm应用': 86,
-            'vibe coding': 88,
-            'vibecoding': 88,
-            '自动化工程师': 82,
-            '工具开发': 80,
-            '效率工程': 80,
-            '运维开发工程师': 60,
-            '运维开发': 58,
-            'devops': 58,
-            'sre': 58,
-            '站点可靠性工程师': 58,
-            '运维工程师': 55,
-            '平台工程师': 55,
-            '平台工程': 55,
-            '自动化运维': 55,
-            '可靠性工程师': 52,
-        },
-        'title_medium_keywords': {
-            'ai': 80,
-            'agent': 76,
-            'workflow': 72,
-            '工作流': 72,
-            '自动化开发': 70,
-            '解决方案': 70,
-            '实施顾问': 68,
-            '产品经理': 68,
-            'saas': 68,
-            'web': 64,
-            '工具': 64,
-            '效率': 64,
-            'rag': 68,
-            '知识库': 66,
-            'mcp': 66,
-            'prompt': 64,
-            '提示词': 64,
-            'token': 72,
-            'tokens': 72,
-            '上下文工程': 72,
-            'prompt工程': 72,
-            '提示词工程': 72,
-            '运维': 42,
-            'linux运维': 42,
-            '系统运维': 40,
-            '云运维': 40,
-            '云平台': 36,
-            '基础架构': 36,
-            '发布工程师': 34,
-            'linux': 30,
-        },
-        'detail_infra_keywords': {
-            'k8s': 10,
-            'kubernetes': 10,
-            'docker': 8,
-            'ansible': 8,
-            'jenkins': 8,
-            'prometheus': 8,
-            'grafana': 8,
-            'elk': 8,
-            'nginx': 6,
-            'helm': 6,
-            'terraform': 8,
-            '云原生': 8,
-            'devops': 8,
-            'sre': 8,
-            'ai agent': 10,
-            '智能体': 10,
-            'mcp': 8,
-            'rag': 8,
-            '知识库': 6,
-            '工作流': 6,
-            'workflow': 6,
-            'aigc': 8,
-            'llm': 8,
-            '大模型应用': 8,
-            'vibe coding': 24,
-            'vibecoding': 24,
-        },
-        'detail_support_keywords': {
-            'linux': 5,
-            'shell': 4,
-            'python': 4,
-            '日志': 3,
-            '监控': 3,
-            '部署': 3,
-            '发布': 3,
-            '故障处理': 4,
-            '高可用': 4,
-            '自动化': 3,
-            '服务器': 2,
-            '运维': 4,
-            '平台工程': 4,
-            'ai': 6,
-            '提效': 6,
-            '自动化办公': 5,
-            '效率工具': 5,
-            '提示词': 5,
-            'prompt': 5,
-            'agent': 6,
-            'copilot': 5,
-            'saas': 6,
-            'web': 5,
-            '产品': 4,
-            '产品经理': 6,
-            '解决方案': 6,
-            '实施': 4,
-            '顾问': 4,
-            '工具开发': 6,
-            '效率工程': 6,
-            'token': 8,
-            'tokens': 8,
-            '上下文': 6,
-            '上下文工程': 8,
-            '提示词工程': 8,
-            'prompt工程': 8,
-            'embedding': 8,
-            'rerank': 8,
-            '知识召回': 8,
-            'vibe': 6,
-        },
-        'detail_negative_keywords': {
-            'spring': 12,
-            'spring boot': 16,
-            'react': 16,
-            'vue': 16,
-            'android': 12,
-            'ios': 12,
-            '小程序': 12,
-            '客户': 10,
-            '渠道': 12,
-            '销售': 12,
-            '新能源': 12,
-            '光伏': 16,
-            'to b': 8,
-            'to c': 8,
+        'detail_deduction_keywords': {
+            'spring': 1,
+            'spring boot': 1,
+            'react': 1,
+            'vue': 1,
+            'android': 1,
+            'ios': 1,
+            '小程序': 1,
+            '客户': 1,
+            '渠道': 1,
+            '销售': 1,
+            '新能源': 1,
+            '光伏': 1,
+            'to b': 1,
+            'to c': 1,
         },
     },
 }
 
 
+def _deduction_rules(values: dict) -> dict[str, int]:
+    """Convert negative legacy percentages to bounded one-to-five star deductions."""
+    result: dict[str, int] = {}
+    for keyword, score in values.items():
+        if not isinstance(score, (int, float)) or isinstance(score, bool) or score >= 0:
+            continue
+        result[keyword] = max(1, min(5, (int(abs(score)) + 19) // 20))
+    return result
+
+
+def _negative_groups(scoring: dict, *names: str) -> dict:
+    """Merge legacy groups as negative values, keeping the strongest duplicate."""
+    merged: dict = {}
+    for name in names:
+        values = scoring.get(name)
+        if not isinstance(values, dict):
+            continue
+        for keyword, score in values.items():
+            if not isinstance(score, (int, float)) or isinstance(score, bool):
+                continue
+            value = -abs(score)
+            merged[keyword] = min(merged.get(keyword, value), value)
+    return merged
+
+
 def _unify_scoring_rules(scoring: dict, policy: dict | None = None) -> dict:
-    """把旧版百分制评分规则转换为当前 1 至 5 星的纯扣分规则。"""
-    if all(key in scoring for key in ('title_deduction_keywords', 'detail_deduction_keywords')):
-        return copy.deepcopy(scoring)
-    policy = policy or {}
-    strong_scale = float(policy.get('strong_title_scale', 0.82))
-    medium_scale = float(policy.get('medium_title_scale', 0.75))
-    strong_cap = int(policy.get('strong_title_cap', 78))
-    medium_cap = int(policy.get('medium_title_cap', 58))
-    positive = {}
-    for keyword, score in scoring.get('title_medium_keywords', {}).items():
-        positive[keyword] = min(round(score * medium_scale), medium_cap)
-    for keyword, score in scoring.get('title_strong_keywords', {}).items():
-        positive[keyword] = max(positive.get(keyword, 0), min(round(score * strong_scale), strong_cap))
-    negative = {keyword: -abs(score) for keyword, score in scoring.get('title_penalty_keywords', {}).items()}
-    for keyword, score in scoring.get('title_block_keywords', {}).items():
-        negative[keyword] = min(negative.get(keyword, 0), -abs(score))
-    if 'title_positive_keywords' in scoring:
-        positive.update(scoring.get('title_positive_keywords', {}))
-        negative.update({keyword: -abs(score) for keyword, score in scoring.get('title_negative_keywords', {}).items()})
-    title_keywords = {**positive, **negative}
-    detail_keywords = copy.deepcopy(scoring.get('detail_support_keywords', scoring.get('detail_positive_keywords', {})))
-    detail_keywords.update({keyword: -abs(score) for keyword, score in scoring.get('detail_negative_keywords', {}).items()})
-    if 'title_keywords' in scoring:
-        title_keywords = copy.deepcopy(scoring['title_keywords'])
-    if 'detail_keywords' in scoring:
-        detail_keywords = copy.deepcopy(scoring['detail_keywords'])
-    to_deductions = lambda values: {
-        keyword: max(1, min(5, int((abs(score) + 19) // 20)))
-        for keyword, score in values.items() if score < 0
-    }
+    """Normalize current rules or migrate supported legacy percentage groups."""
+    del policy  # The old scaling policy affected positive scores, which are no longer used.
+    current_keys = ('title_deduction_keywords', 'detail_deduction_keywords')
+    if any(key in scoring for key in current_keys):
+        return {
+            key: copy.deepcopy(scoring.get(key, {})) if isinstance(scoring.get(key, {}), dict) else {}
+            for key in current_keys
+        }
+
+    title_values = scoring.get('title_keywords')
+    if not isinstance(title_values, dict):
+        title_values = _negative_groups(
+            scoring,
+            'title_penalty_keywords',
+            'title_block_keywords',
+            'title_negative_keywords',
+        )
+    detail_values = scoring.get('detail_keywords')
+    if not isinstance(detail_values, dict):
+        detail_values = _negative_groups(scoring, 'detail_negative_keywords')
     return {
-        'title_deduction_keywords': to_deductions(title_keywords),
-        'detail_deduction_keywords': to_deductions(detail_keywords),
+        'title_deduction_keywords': _deduction_rules(title_values),
+        'detail_deduction_keywords': _deduction_rules(detail_values),
     }
-
-
-DEFAULT_USER_CONFIG['scoring'] = _unify_scoring_rules(DEFAULT_USER_CONFIG['scoring'], DEFAULT_USER_CONFIG.get('scoring_policy'))
-DEFAULT_USER_CONFIG.pop('scoring_policy', None)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """递归合并配置字典，忽略值为 ``None`` 的覆盖项。"""
+    """Recursively merge dictionaries while ignoring explicit ``None`` values."""
     result = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
@@ -319,92 +191,84 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _apply_legacy_compat(config: dict, user_config: dict) -> dict:
-    """将仍受支持的旧版顶层字段迁移到新的分组结构。"""
-    legacy_top_level_to_nested = {
+    """Move still-supported legacy top-level settings into their current groups."""
+    legacy_fields = {
         'job_score_delay_base_ms': ('backend', 'job_score_delay_base_ms'),
         'job_score_delay_jitter_ms': ('backend', 'job_score_delay_jitter_ms'),
         'thread': ('frontend', 'thread'),
     }
-    for old_key, (group, new_key) in legacy_top_level_to_nested.items():
+    for old_key, (group, new_key) in legacy_fields.items():
         if old_key in user_config and user_config[old_key] is not None:
             config[group][new_key] = user_config[old_key]
     return config
 
 
-def _load_raw_user_config():
-    """读取未经默认值合并的用户配置，不存在时返回空字典。"""
-    config_path = ROOT / 'user_config.json'
-    if config_path.exists():
-        with config_path.open('r', encoding='utf-8') as f:
-            user_config = json.load(f)
-        if isinstance(user_config, dict):
-            return user_config
-    return {}
+def _load_raw_user_config() -> dict:
+    """Read the user file, falling back to an empty override when it is unavailable."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def load_user_config():
-    """加载、迁移并合并用户配置，返回可直接使用的完整配置。"""
+def load_user_config() -> dict:
+    """Load defaults, migrate legacy fields, and apply the complete user override."""
     config = copy.deepcopy(DEFAULT_USER_CONFIG)
-    user_config = _load_raw_user_config()
-    if isinstance(user_config, dict) and user_config:
-        user_config = copy.deepcopy(user_config)
-        # 旧版内联简历已停用，简历内容统一由 resumes/ 目录和 resume_name 管理。
-        user_config.pop('resume_content', None)
-        if isinstance(user_config.get('scoring'), dict):
-            user_config['scoring'] = _unify_scoring_rules(user_config['scoring'], user_config.get('scoring_policy'))
-            user_config.pop('scoring_policy', None)
-        config = _deep_merge(config, user_config)
-        # 关键词集合由用户完整管理，必须整组替换；否则删除的卡片会在重载后被默认值补回。
-        user_scoring = user_config.get('scoring')
-        if isinstance(user_scoring, dict):
-            for group_name, keyword_scores in user_scoring.items():
-                if isinstance(keyword_scores, dict):
-                    config['scoring'][group_name] = copy.deepcopy(keyword_scores)
-        config = _apply_legacy_compat(config, user_config)
-    return config
+    user_config = copy.deepcopy(_load_raw_user_config())
+    if not user_config:
+        return config
+
+    user_config.pop('resume_content', None)
+    if isinstance(user_config.get('scoring'), dict):
+        user_config['scoring'] = _unify_scoring_rules(
+            user_config['scoring'],
+            user_config.pop('scoring_policy', None),
+        )
+    config = _deep_merge(config, user_config)
+    # Scoring dictionaries are complete user-managed sets. Restoring deleted defaults here
+    # would make removed dashboard cards reappear after a reload.
+    if isinstance(user_config.get('scoring'), dict):
+        for group_name, keyword_scores in user_config['scoring'].items():
+            if isinstance(keyword_scores, dict):
+                config['scoring'][group_name] = copy.deepcopy(keyword_scores)
+    return _apply_legacy_compat(config, user_config)
 
 
-RAW_USER_CONFIG = _load_raw_user_config()
 USER_CONFIG = load_user_config()
 
 
 class Config:
-    """保存当前生效配置的进程级只读视图，并提供热加载能力。"""
+    """Process-wide view of the currently effective configuration."""
+
     resume_name = USER_CONFIG['resume_name']
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
-
     job_score_delay_base_ms = USER_CONFIG['backend']['job_score_delay_base_ms']
     job_score_delay_jitter_ms = USER_CONFIG['backend']['job_score_delay_jitter_ms']
-
     title_deduction_keywords = USER_CONFIG['scoring']['title_deduction_keywords']
     detail_deduction_keywords = USER_CONFIG['scoring']['detail_deduction_keywords']
-
     frontend = USER_CONFIG['frontend']
     backend = USER_CONFIG['backend']
     scoring = USER_CONFIG['scoring']
 
     @classmethod
-    def get_default_introduce(cls):
-        """返回 LLM 不可用时使用的固定招呼语。"""
-        return cls.introduce
-
-    @classmethod
-    def get_client_config(cls):
-        """返回允许浏览器脚本读取的运行配置子集。"""
+    def get_client_config(cls) -> dict:
+        """Return the subset that the browser automation client may read."""
         return {
-            'introduce': cls.get_default_introduce(),
+            'introduce': cls.introduce,
             'character': cls.character,
             'tags': cls.tags,
             'frontend': cls.frontend,
         }
 
     @classmethod
-    def reload(cls):
-        """从磁盘重新加载配置，并一次性替换运行时类属性。"""
-        global RAW_USER_CONFIG, USER_CONFIG
-        RAW_USER_CONFIG = _load_raw_user_config()
+    def reload(cls) -> dict:
+        """Reload disk configuration and replace all runtime attributes together."""
+        global USER_CONFIG
         USER_CONFIG = load_user_config()
         cls.resume_name = USER_CONFIG['resume_name']
         cls.introduce = USER_CONFIG['introduce']

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import unittest
@@ -285,6 +286,36 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured['proxy_url'], 'http://127.0.0.1:7890')
         self.assertTrue(captured['proxy_enabled'])
 
+    async def test_manager_reload_reuses_unchanged_provider_gateway(self):
+        """仅调整调度配置时应保留原网关的在途请求、缓存和熔断状态。"""
+        loaded = {
+            'strategy': 'failover',
+            'timeout': 30,
+            'jobFilter': False,
+            'providers': [{
+                'index': 1,
+                'name': 'primary',
+                'api_base': 'https://api.example.com/v1',
+                'api_key': 'sk-test',
+                'model': 'test-model',
+                'proxy_url': '',
+                'proxy_enabled': False,
+                'enabled': True,
+            }],
+        }
+        with patch('llm_manager.llm_env_store.load_llm_config', return_value=loaded), patch(
+            'llm_manager.LLMGateway',
+            wraps=LLMGateway,
+        ) as gateway_factory:
+            manager = LLMManager()
+            original_gateway = manager._providers[0].gateway
+            loaded['strategy'] = 'round_robin'
+            loaded['jobFilter'] = True
+            manager.reload()
+
+        self.assertIs(manager._providers[0].gateway, original_gateway)
+        self.assertEqual(gateway_factory.call_count, 1)
+
     async def test_gateway_wraps_invalid_proxy_factory_errors(self):
         """客户端创建阶段的代理错误应统一包装成网关异常。"""
         gateway = LLMGateway(client_factory=lambda timeout, proxy: (_ for _ in ()).throw(ValueError('bad proxy')))
@@ -300,6 +331,48 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(LLMGatewayError):
             await gateway.chat_completions(config, {'messages': []}, 'test')
+
+    async def test_cancelled_owner_keeps_inflight_request_for_later_waiters(self):
+        """取消首个等待者不能让仍在执行的同请求再次发起并重复计费。"""
+        gateway = LLMGateway()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def request(_config, _payload):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {
+                'choices': [{
+                    'message': {'content': 'ok'},
+                    'finish_reason': 'stop',
+                }],
+            }
+
+        config = {
+            'api_base': 'https://api.example.com/v1',
+            'model': 'test-model',
+            'cache_ttl_seconds': 60,
+        }
+        payload = {'messages': [{'role': 'user', 'content': 'same request'}]}
+        with patch.object(gateway, '_request', side_effect=request):
+            owner = asyncio.create_task(gateway.chat_completions(config, payload, 'cancel-test'))
+            await started.wait()
+            owner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await owner
+
+            follower = asyncio.create_task(gateway.chat_completions(config, payload, 'cancel-test'))
+            await asyncio.sleep(0)
+            self.assertEqual(calls, 1)
+            release.set()
+            result = await follower
+            await asyncio.sleep(0)
+
+        self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+        self.assertFalse(gateway._inflight)
 
     async def test_health_check_uses_the_same_proxy_settings(self):
         """接口测活必须复用正式请求的显式代理和环境隔离规则。"""

@@ -8,20 +8,17 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
-import json
 from pathlib import Path
 import re
-import sqlite3
 
+from delivery_store import (
+    DELIVERY_SOURCE_ACTIONS,
+    FINAL_ACTION_STATUSES,
+    DeliveryStore,
+    delivery_key,
+)
+from storage_io import read_jsonl
 
-DELIVERY_ACTIONS = {'delivery_claimed', 'greet_queued', 'chat_greet_sent'}
-FINAL_ACTION_STATUSES = {
-    'greet_sent': 'sent',
-    'chat_greet_sent': 'sent',
-    'greet_failed': 'failed_unknown',
-    'chat_greet_failed': 'failed_unknown',
-    'greet_queue_failed': 'failed_unknown',
-}
 
 CITY_PREFIXES = sorted({
     '北京', '上海', '天津', '重庆', '深圳', '广州', '杭州', '南京', '苏州', '成都', '武汉', '西安', '长沙',
@@ -43,40 +40,6 @@ def extract_city(value: str | None) -> str:
     if match:
         return match.group(1)
     return ''
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    """读取 JSONL 中的对象记录；文件不存在或单行损坏时静默跳过。"""
-    if not path.exists():
-        return []
-    records = []
-    with path.open('r', encoding='utf-8') as file:
-        for line in file:
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if isinstance(record, dict):
-                records.append(record)
-    return records
-
-
-def parse_salary_k(salary: str | None) -> float | None:
-    """将常见薪资文本折算为月薪区间中位数（K）；无法解析时返回 ``None``。"""
-    if not salary:
-        return None
-    text = str(salary).upper().replace('Ｋ', 'K').replace(',', '')
-    range_match = re.search(
-        r'(\d+(?:\.\d+)?)\s*K?\s*[-~—至]\s*(\d+(?:\.\d+)?)\s*K',
-        text,
-    )
-    if range_match:
-        values = [float(range_match.group(1)), float(range_match.group(2))]
-    else:
-        values = [float(value) for value in re.findall(r'(?<!\d)(\d+(?:\.\d+)?)\s*K', text)]
-    if not values:
-        return None
-    return round(sum(values[:2]) / min(2, len(values)), 1)
 
 
 def parse_salary_details(salary: str | None) -> dict:
@@ -109,51 +72,29 @@ def parse_salary_details(salary: str | None) -> dict:
     }
 
 
-def _database_statuses(db_path: Path) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
-    """只读加载投递状态，并分别按令牌及“公司、岗位”建立索引。"""
-    if not db_path.exists():
-        return {}, {}
-    by_token: dict[str, dict] = {}
-    by_job: dict[tuple[str, str], dict] = {}
-    try:
-        with sqlite3.connect(db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                """
-                SELECT company, title, account_id, claim_token, status,
-                       claimed_at, queued_at, completed_at
-                FROM company_deliveries
-                """
-            ).fetchall()
-    except (sqlite3.Error, OSError):
-        return {}, {}
-    for row in rows:
-        item = dict(row)
-        token = item.get('claim_token') or ''
-        if token:
-            by_token[token] = item
-        key = ((item.get('company') or '').strip(), (item.get('title') or '').strip())
-        if key[0]:
-            by_job[key] = item
-    return by_token, by_job
-
-
-def _record_status(record: dict, final_by_token: dict[str, str], db_by_token: dict[str, dict], db_by_job: dict[tuple[str, str], dict]) -> str:
+def _record_status(
+    record: dict,
+    final_by_token: dict[str, str],
+    final_by_job: dict[str, str],
+    db_by_token: dict[str, dict],
+    db_by_job: dict[tuple[str, str], dict],
+) -> str:
     """按动作终态、令牌数据库记录、岗位记录的优先级推导展示状态。"""
     action = record.get('action')
-    if action == 'chat_greet_sent':
-        return 'sent'
-    if action == 'greet_queued':
-        return 'queued'
+    if action in FINAL_ACTION_STATUSES:
+        return FINAL_ACTION_STATUSES[action]
     token = record.get('claimToken') or ''
     if token in final_by_token:
         return final_by_token[token]
+    job_key = delivery_key(record.get('company') or '', record.get('title') or '')
+    if job_key in final_by_job:
+        return final_by_job[job_key]
     if token in db_by_token:
         return db_by_token[token].get('status') or 'queued'
     key = ((record.get('company') or '').strip(), (record.get('title') or '').strip())
     if key in db_by_job:
         return db_by_job[key].get('status') or 'queued'
-    return 'queued'
+    return 'reserved' if action == 'delivery_claimed' else 'queued'
 
 
 def delivery_sources(actions: list[dict]) -> list[dict]:
@@ -163,14 +104,20 @@ def delivery_sources(actions: list[dict]) -> list[dict]:
     """
     sources = []
     seen_tokens: set[str] = set()
+    seen_jobs: set[str] = set()
     for index, record in enumerate(actions):
-        if record.get('action') not in DELIVERY_ACTIONS:
+        if record.get('action') not in DELIVERY_SOURCE_ACTIONS:
             continue
         token = record.get('claimToken') or ''
         if token and token in seen_tokens:
             continue
+        job_key = delivery_key(record.get('company') or '', record.get('title') or '')
+        if job_key and job_key in seen_jobs:
+            continue
         if token:
             seen_tokens.add(token)
+        if job_key:
+            seen_jobs.add(job_key)
         logged_at = record.get('loggedAt') or ''
         timestamp_id = index
         try:
@@ -185,22 +132,26 @@ def delivery_sources(actions: list[dict]) -> list[dict]:
     return sources
 
 
-def load_dashboard_data(action_log_path: Path, delivery_db_path: Path) -> dict:
+def load_dashboard_data(action_log_path: Path, delivery_store: DeliveryStore) -> dict:
     """聚合动作 JSONL 与投递数据库，返回统计摘要和倒序投递明细。
 
-    两个路径均为只读输入。数据库状态用于弥补异步日志中的中间态；源文件缺失或数据库
+    日志路径和存储对象均按只读方式使用。数据库状态用于弥补异步日志中的中间态；源文件缺失或数据库
     暂不可读时仍返回结构完整的空数据或日志侧结果。
     """
-    actions = _read_jsonl(action_log_path)
-    db_by_token, db_by_job = _database_statuses(delivery_db_path)
+    actions = read_jsonl(action_log_path)
+    db_by_token, db_by_job = delivery_store.status_indexes()
 
     # 同一令牌可能有多条动作；按日志顺序保留最后出现的终态，再与数据库状态交叉校正。
     final_by_token: dict[str, str] = {}
+    final_by_job: dict[str, str] = {}
     for record in actions:
         token = record.get('claimToken') or ''
         status = FINAL_ACTION_STATUSES.get(record.get('action'))
         if token and status:
             final_by_token[token] = status
+        job_key = delivery_key(record.get('company') or '', record.get('title') or '')
+        if job_key and status:
+            final_by_job[job_key] = status
 
     deliveries = []
     for source in delivery_sources(actions):
@@ -216,7 +167,7 @@ def load_dashboard_data(action_log_path: Path, delivery_db_path: Path) -> dict:
 
         salary = (record.get('salary') or '').strip()
         salary_details = parse_salary_details(salary)
-        status = _record_status(record, final_by_token, db_by_token, db_by_job)
+        status = _record_status(record, final_by_token, final_by_job, db_by_token, db_by_job)
         deliveries.append({
             'id': source['id'],
             'loggedAt': timestamp,

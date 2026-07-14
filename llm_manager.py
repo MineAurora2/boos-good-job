@@ -31,10 +31,6 @@ _GATEWAY_DEFAULTS = {
     'circuit_failure_threshold': 3,
     'circuit_open_seconds': 60,
     'cache_ttl_seconds': 1800,
-    'introduce_max_tokens': 1024,
-    'introduce_retry_max_tokens': 4096,
-    'filter_max_tokens': 128,
-    'verbose_errors': False,
 }
 
 
@@ -114,7 +110,6 @@ class LLMManager:
         self._lock = threading.Lock()
         self._providers: list[LLMProvider] = []
         self._strategy = llm_env_store.DEFAULT_STRATEGY
-        self._timeout = llm_env_store.DEFAULT_TIMEOUT
         self._job_filter = False
         self._round_robin = itertools.count()
         self.reload()
@@ -122,28 +117,48 @@ class LLMManager:
     # ------------------------------------------------------------------ 配置
 
     def reload(self) -> None:
-        """从 .env 重建可用接口列表，并重置轮询起点。"""
+        """Reload providers, retaining gateways whose request configuration is unchanged."""
         config = llm_env_store.load_llm_config()
+        with self._lock:
+            existing_by_index = {provider.index: provider for provider in self._providers}
         providers = []
         for item in config['providers']:
             if not item.get('enabled'):
                 continue
-            provider = LLMProvider(
-                index=item['index'],
-                name=item['name'],
-                api_base=item['api_base'],
-                api_key=item['api_key'],
-                model=item['model'],
-                timeout=config['timeout'],
-                proxy_url=item['proxy_url'],
-                proxy_enabled=item['proxy_enabled'],
+            provider = existing_by_index.get(item['index'])
+            unchanged = provider is not None and (
+                provider.api_base,
+                provider.api_key,
+                provider.model,
+                provider.timeout,
+                provider.proxy_url,
+                provider.proxy_enabled,
+            ) == (
+                item['api_base'],
+                item['api_key'],
+                item['model'],
+                config['timeout'],
+                item['proxy_url'],
+                item['proxy_enabled'],
             )
+            if unchanged:
+                provider.name = item['name'] or f'接口{item["index"]}'
+            else:
+                provider = LLMProvider(
+                    index=item['index'],
+                    name=item['name'],
+                    api_base=item['api_base'],
+                    api_key=item['api_key'],
+                    model=item['model'],
+                    timeout=config['timeout'],
+                    proxy_url=item['proxy_url'],
+                    proxy_enabled=item['proxy_enabled'],
+                )
             if provider.is_usable():
                 providers.append(provider)
         with self._lock:
             self._providers = providers
             self._strategy = config['strategy']
-            self._timeout = config['timeout']
             self._job_filter = config['jobFilter']
             self._round_robin = itertools.count()
 

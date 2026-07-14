@@ -23,7 +23,10 @@ import json
 import os
 from pathlib import Path
 import re
+import threading
 from urllib.parse import urlsplit, urlunsplit
+
+from storage_io import atomic_write_text
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +40,7 @@ MAX_PROVIDERS = 20
 # 写入时用这个哨兵表示“保留原有 api_key，不修改”。读出的配置永远脱敏，
 # 因此前端不修改某个 key 时会回传哨兵，避免把脱敏占位写回 .env。
 KEEP_SECRET = '__KEEP__'
+_SAVE_LOCK = threading.Lock()
 
 _TRUE_VALUES = {'1', 'true', 'yes', 'on'}
 _PROVIDER_RE = re.compile(
@@ -317,7 +321,7 @@ def resolve_provider_config(payload: dict) -> dict:
     return provider
 
 
-def save_llm_config(payload: dict) -> dict:
+def _save_llm_config(payload: dict) -> dict:
     """校验并写回 .env，保留所有非 GOODJOB_LLM_* 行；返回脱敏后的公开配置。"""
     config = _validate_incoming(payload)
 
@@ -354,16 +358,16 @@ def save_llm_config(payload: dict) -> dict:
         lines.append(f'GOODJOB_LLM_{index}_ENABLED={"true" if provider["enabled"] else "false"}')
 
     content = '\n'.join(lines).rstrip('\n') + '\n'
-    temp_path = ENV_PATH.with_name('.env.tmp')
-    # 先完整写入并刷盘，再以原子替换覆盖 .env，避免进程中断留下半份配置。
-    with temp_path.open('w', encoding='utf-8', newline='\n') as file:
-        file.write(content)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp_path, ENV_PATH)
+    atomic_write_text(ENV_PATH, content)
 
     _sync_environ(config)
     return public_llm_config()
+
+
+def save_llm_config(payload: dict) -> dict:
+    """Serialize dashboard writes so concurrent updates cannot share stale temp state."""
+    with _SAVE_LOCK:
+        return _save_llm_config(payload)
 
 
 def _sync_environ(config: dict) -> None:

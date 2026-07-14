@@ -9,16 +9,35 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-import json
 from pathlib import Path
 import re
 import secrets
 import sqlite3
 import unicodedata
 
+from storage_io import read_jsonl
+
 
 FINAL_STATUSES = {'sent', 'failed_unknown'}
-ACTIVE_STATUSES = {'reserved', 'queued', *FINAL_STATUSES}
+FINAL_ACTION_STATUSES = {
+    'greet_sent': 'sent',
+    'greet_message_sent': 'sent',
+    'chat_greet_sent': 'sent',
+    'greet_failed': 'failed_unknown',
+    'chat_greet_failed': 'failed_unknown',
+    'greet_queue_failed': 'failed_unknown',
+}
+DELIVERY_SOURCE_ACTIONS = {
+    'delivery_claimed',
+    'greet_queued',
+    *FINAL_ACTION_STATUSES,
+}
+HISTORICAL_DELIVERY_ACTIONS = {
+    'greet_queued',
+    'greet_sent',
+    'greet_message_sent',
+    'chat_greet_sent',
+}
 
 
 def normalize_company(company: str) -> str:
@@ -107,6 +126,11 @@ class DeliveryStore:
                     count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (usage_date, account_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS delivery_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
                 );
                 """
             )
@@ -243,6 +267,7 @@ class DeliveryStore:
         account_id: str,
         worker_id: str,
         job_url: str = '',
+        daily_limit: int | None = None,
     ) -> dict:
         """原子申请一个岗位投递占位并占用账号当日额度。
 
@@ -266,6 +291,7 @@ class DeliveryStore:
 
         today = self._today()
         now = self._now()
+        effective_limit = self.daily_limit if daily_limit is None else max(1, int(daily_limit))
         claim_token = secrets.token_urlsafe(24)
         connection = self._connect()
         try:
@@ -296,13 +322,13 @@ class DeliveryStore:
                 (today, account_id),
             ).fetchone()
             count = int(usage['count'])
-            if count >= self.daily_limit:
+            if count >= effective_limit:
                 connection.rollback()
                 return {
                     'accepted': False,
                     'reason': 'daily_limit',
                     'count': count,
-                    'limit': self.daily_limit,
+                    'limit': effective_limit,
                     'remaining': 0,
                 }
 
@@ -339,8 +365,8 @@ class DeliveryStore:
                 'claimToken': claim_token,
                 'companyKey': company_key,
                 'count': count + 1,
-                'limit': self.daily_limit,
-                'remaining': max(0, self.daily_limit - count - 1),
+                'limit': effective_limit,
+                'remaining': max(0, effective_limit - count - 1),
             }
         except Exception:
             connection.rollback()
@@ -523,6 +549,32 @@ class DeliveryStore:
             ).fetchone()
         return {'exists': bool(row), 'delivery': dict(row) if row else None}
 
+    def status_indexes(self) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+        """Return all delivery states indexed by claim token and original job identity."""
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT company, title, account_id, claim_token, status,
+                           claimed_at, queued_at, completed_at
+                    FROM company_deliveries
+                    """
+                ).fetchall()
+        except (sqlite3.Error, OSError):
+            return {}, {}
+
+        by_token: dict[str, dict] = {}
+        by_job: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            item = dict(row)
+            token = item.get('claim_token') or ''
+            if token:
+                by_token[token] = item
+            key = ((item.get('company') or '').strip(), (item.get('title') or '').strip())
+            if key[0]:
+                by_job[key] = item
+        return by_token, by_job
+
     def record_legacy_sent(self, company: str, title: str, account_id: str = 'legacy') -> dict:
         """兼容旧客户端，幂等写入已投递记录但不占用或修改每日额度。
 
@@ -549,19 +601,11 @@ class DeliveryStore:
 
     def import_legacy_jsonl(self, path: Path | str) -> int:
         """从旧 JSONL 文件导入公司和岗位，跳过坏行并返回新增记录数。"""
-        path = Path(path)
-        if not path.exists():
-            return 0
         imported = 0
-        with path.open('r', encoding='utf-8') as file:
-            for line in file:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                company = record.get('company') or ''
-                if company and not self.record_legacy_sent(company, record.get('title') or '').get('duplicate'):
-                    imported += 1
+        for record in read_jsonl(path):
+            company = record.get('company') or ''
+            if company and not self.record_legacy_sent(company, record.get('title') or '').get('duplicate'):
+                imported += 1
         return imported
 
     def import_action_log(self, path: Path | str) -> int:
@@ -570,24 +614,43 @@ class DeliveryStore:
         仅识别投递相关动作，坏行会被忽略。导入会写数据库但不占每日额度，策略上采用
         “宁可少投、不重复投”。
         """
-        path = Path(path)
-        if not path.exists():
-            return 0
-        delivery_actions = {
-            'greet_queued',
-            'greet_sent',
-            'chat_greet_sent',
-        }
         imported = 0
-        with path.open('r', encoding='utf-8') as file:
-            for line in file:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get('action') not in delivery_actions:
-                    continue
-                company = record.get('company') or ''
-                if company and not self.record_legacy_sent(company, record.get('title') or '').get('duplicate'):
-                    imported += 1
+        for record in read_jsonl(path):
+            if record.get('action') not in HISTORICAL_DELIVERY_ACTIONS:
+                continue
+            company = record.get('company') or ''
+            if company and not self.record_legacy_sent(company, record.get('title') or '').get('duplicate'):
+                imported += 1
         return imported
+
+    def _import_file_once(self, migration_key: str, path: Path | str, importer) -> int:
+        """Run one legacy-file importer only after its source is actually available."""
+        source = Path(path)
+        if not source.exists() or not source.is_file():
+            return 0
+        with self._connection() as connection:
+            completed = connection.execute(
+                'SELECT 1 FROM delivery_metadata WHERE key = ?',
+                (migration_key,),
+            ).fetchone()
+        if completed:
+            return 0
+        imported = importer(source)
+        with self._connection() as connection:
+            connection.execute(
+                'INSERT OR IGNORE INTO delivery_metadata(key, value) VALUES (?, ?)',
+                (migration_key, self._now()),
+            )
+        return imported
+
+    def import_legacy_once(self, greeted_path: Path | str, action_path: Path | str) -> int:
+        """Import each pre-SQLite source once, without marking missing files complete."""
+        return self._import_file_once(
+            'legacy_greeted_jsonl_v1',
+            greeted_path,
+            self.import_legacy_jsonl,
+        ) + self._import_file_once(
+            'legacy_action_jsonl_v1',
+            action_path,
+            self.import_action_log,
+        )

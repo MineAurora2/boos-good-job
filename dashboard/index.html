@@ -180,10 +180,6 @@
                     <div class="panel-head">
                         <div><span class="eyebrow">地区分布</span><h2>投递热力地图</h2></div>
                         <div class="map-head-tools">
-                            <div class="map-level-switch" id="mapLevelSwitch" aria-label="地图详细层级">
-                                <button class="active" data-map-level="province">省份</button>
-                                <button data-map-level="city">地级市</button>
-                            </div>
                             <select id="mapMetric" class="compact-select" aria-label="地图指标">
                                 <option value="count">投递数量</option>
                                 <option value="salary">平均薪资</option>
@@ -192,15 +188,14 @@
                     </div>
                     <div class="map-content">
                         <div class="map-stage" id="mapStage">
-                            <div id="chinaMap" class="china-map" aria-label="可切换省份和地级市层级的中国投递热力地图"></div>
-                            <div id="mapSpecialRegions" class="map-special-regions" aria-label="香港和澳门放大地图"></div>
+                            <div id="chinaMap" class="china-map" aria-label="随缩放自动显示省份或地级市边界的中国投递热力地图"></div>
                             <div class="map-navigation" aria-label="地图缩放控制">
                                 <button id="mapZoomIn" title="放大地图" aria-label="放大地图">＋</button>
                                 <span id="mapZoomValue">100%</span>
                                 <button id="mapZoomOut" title="缩小地图" aria-label="缩小地图">−</button>
                                 <button id="mapResetView" title="恢复地图视图" aria-label="恢复地图视图">⌂</button>
                             </div>
-                            <div class="map-interaction-hint" id="mapInteractionHint">省份热力 · 点击筛选 · 滚轮缩放 · 按住拖动</div>
+                            <div class="map-interaction-hint" id="mapInteractionHint">省份热力 · 放大自动显示地级市 · 港澳连线标注</div>
                         </div>
                         <div class="location-ranking">
                             <div class="ranking-title"><span id="locationRankingTitle">热门省份</span><small id="knownLocationRate">已识别 0%</small></div>

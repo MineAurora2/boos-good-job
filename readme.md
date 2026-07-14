@@ -56,7 +56,7 @@ flowchart TD
     AI -->|是| Filter["LLM 管理器判断岗位是否匹配"] --> Judge
     AI -->|否| Judge{"命中屏蔽词 或 评分 &lt; 阈值？"}
     Judge -->|是| Mark1["markDelivery failed_unknown"] --> Loop
-    Judge -->|否，达标| Gen["POST /generate-introduce 生成招呼语"]
+    Judge -->|否，达标| Gen["POST /generate-introduce/start 生成招呼语"]
     Gen --> GenOk{"LLM 生成成功？"}
     GenOk -->|失败| Fixed["回退固定招呼语"] --> Send
     GenOk -->|成功| Send["发送招呼语"]
@@ -104,33 +104,24 @@ sequenceDiagram
 
 一个面向 Boss 直聘的轻量自动投递简历项目，采用“浏览器脚本 + 本地 Python 后端”的组合方式。
 
-![](.\img\01.png)
+![](./img/01.png)
 
 ## 项目结构
 
-- `main.py`：FastAPI 后端入口
-
-- `core.py`：规则评分主逻辑 + 遗留聊天能力
-
-- `config.py`：配置加载与岗位评分配置
-
-- `web_script.js`：Boss 页面 Tampermonkey 脚本
-
-- `dashboard/`：投递统计面板页面
-
-- `dashboard_data.py`：统计面板数据聚合
-
-- `user_config.example.json`：用户配置模板
-
+- `main.py`：FastAPI 应用创建、生命周期和服务启动入口
+- `routes/`：按“岗位投递”和“管理运行”归类的 HTTP 接口
+- `app_state.py`：数据库、日志路径、进程锁和启动迁移等共享资源
+- `job_scoring.py`：岗位文本解析与纯规则扣星评分
+- `llm_tasks.py`：简历读取、定制招呼语和 AI 岗位筛选
+- `llm_gateway.py`、`llm_manager.py`、`llm_env_store.py`：单接口请求、多接口调度和 `.env` 持久化
+- `delivery_store.py`、`resume_store.py`、`admin_store.py`：投递、简历和管理配置存储
+- `storage_io.py`：原子文本写入和 JSONL 读写
+- `config.py`、`prompts.py`：运行配置、旧配置迁移和当前使用的 LLM 提示词
+- `web_script.js`：Boss 页面 Tampermonkey 单文件脚本
+- `dashboard/`、`dashboard_data.py`：统计管理面板及数据聚合
+- `user_config.example.json`：可直接复制使用的当前格式配置模板
 - `resumes/`：网页管理并提供给 LLM 使用的真实简历目录
-
 - `resume-example.md`：简历模板，仅用于创建真实简历，不在网页管理页展示
-
-- `PROJECT_MEMORY.md`：长期项目背景与关键决策
-
-- `DEV_LOG.md`：开发演进记录
-
-  
 
 **配置文件**
 

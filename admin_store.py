@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from pathlib import Path
 
+import config
 from config import Config
 import prompts
 from resume_store import (
@@ -21,30 +21,7 @@ from resume_store import (
     save_resume_file,
     validate_resume_name,
 )
-
-
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / 'user_config.json'
-
-
-def _read_json(path: Path, default):
-    """读取 JSON；文件缺失或损坏时返回 ``default`` 的深拷贝，避免共享可变默认值。"""
-    if not path.exists():
-        return copy.deepcopy(default)
-    try:
-        return json.loads(path.read_text(encoding='utf-8'))
-    except (json.JSONDecodeError, OSError):
-        return copy.deepcopy(default)
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """刷新临时文件后原子替换目标文件；调用方应串行处理同一路径的写入。"""
-    temp_path = path.with_name(f'.{path.name}.tmp')
-    with temp_path.open('w', encoding='utf-8', newline='\n') as file:
-        file.write(content)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp_path, path)
+from storage_io import atomic_write_text
 
 
 def _validate_number(container: dict, key: str, minimum: float, maximum: float) -> None:
@@ -85,7 +62,10 @@ def validate_config(config: dict) -> None:
         raise ValueError('onlyGreet 必须是开关值')
     _validate_number(frontend, 'thread', 0, 100)
     _validate_number(frontend, 'resumeIndex', 0, 50)
-    for key in ('timestampTimeout', 'manualFilterWaitMs', 'roundRestartDelayMs', 'detailTimeout', 'greetTimeout', 'preloadScrollWaitMs'):
+    for key in (
+        'timestampTimeout', 'manualFilterWaitMs', 'roundRestartDelayMs', 'detailTimeout',
+        'greetTimeout', 'preloadScrollWaitMs', 'preloadActivateCardWaitMs',
+    ):
         _validate_number(frontend, key, 0, 600000)
     for key in ('maxEmptyRounds', 'preloadStableRoundsLimit', 'preloadMaxRounds', 'preloadActivateCardEvery'):
         _validate_number(frontend, key, 0, 10000)
@@ -95,8 +75,13 @@ def validate_config(config: dict) -> None:
     _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)
     _validate_number(backend, 'job_score_delay_jitter_ms', 0, 600000)
     _validate_number(backend, 'daily_greet_limit', 1, 10000)
-    if Path(str(backend.get('delivery_db_path') or '')).name != backend.get('delivery_db_path'):
-        raise ValueError('delivery_db_path 只能是文件名')
+    database_name = backend.get('delivery_db_path')
+    if (
+        not isinstance(database_name, str)
+        or not database_name.strip()
+        or Path(database_name).name != database_name
+    ):
+        raise ValueError('delivery_db_path 必须是非空文件名')
 
     expected_scoring_groups = {'title_deduction_keywords', 'detail_deduction_keywords'}
     if set(config['scoring']) != expected_scoring_groups:
@@ -111,16 +96,16 @@ def validate_config(config: dict) -> None:
                 raise ValueError(f'scoring.{group_name}.{keyword} 扣星数必须是 1 到 5 的整数')
 
 
-def get_public_config() -> dict:
+def get_public_config(effective: dict | None = None) -> dict:
     """重新加载磁盘配置并返回可公开副本、修订号及需重启字段列表。
 
     调用会刷新 ``Config`` 的进程内有效值，但不会写文件。
     """
-    effective = Config.reload()
+    effective = Config.reload() if effective is None else effective
     public = copy.deepcopy(effective)
     return {
         'config': public,
-        'revision': CONFIG_PATH.stat().st_mtime_ns if CONFIG_PATH.exists() else 0,
+        'revision': config.CONFIG_PATH.stat().st_mtime_ns if config.CONFIG_PATH.exists() else 0,
         'restartRequiredFields': ['backend.delivery_db_path'],
     }
 
@@ -144,9 +129,8 @@ def save_config(payload: dict) -> dict:
     for legacy_key in ('think_model', 'chat_model'):
         merged.pop(legacy_key, None)
     validate_config(merged)
-    _atomic_write_text(CONFIG_PATH, json.dumps(merged, ensure_ascii=False, indent=2) + '\n')
-    Config.reload()
-    return get_public_config()
+    atomic_write_text(config.CONFIG_PATH, json.dumps(merged, ensure_ascii=False, indent=2) + '\n')
+    return get_public_config(Config.reload())
 
 
 def list_resumes() -> dict:

@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import re
+
+from storage_io import atomic_write_text
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,35 +58,22 @@ def _safe_resume_path(name: str) -> Path:
     return path
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """将 UTF-8 文本刷盘到同目录临时文件，再替换目标；调用方负责并发串行化。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f'.{path.name}.tmp')
-    with temp_path.open('w', encoding='utf-8', newline='\n') as file:
-        file.write(content)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp_path, path)
-
-
 def _resume_names() -> list[str]:
     """返回按名称排序的可管理简历，不包含目录、其他后缀或示例文件。"""
     _ensure_resume_dir()
-    return sorted(
-        path.name
-        for path in RESUME_DIR.iterdir()
-        if path.is_file()
-        and path.suffix.lower() in RESUME_SUFFIXES
-        and not _is_example_name(path.name)
-    )
+    names = []
+    for path in RESUME_DIR.iterdir():
+        if not path.is_file() or path.suffix.lower() not in RESUME_SUFFIXES:
+            continue
+        try:
+            names.append(validate_resume_name(path.name))
+        except ValueError:
+            continue
+    return sorted(names)
 
 
-def resolve_resume_name(configured: str = '') -> str:
-    """解析当前简历名称，依次采用有效配置、默认名称和首个可用文件。
-
-    目录为空时返回空串；读取目录过程中可能按需创建 ``resumes`` 目录。
-    """
-    names = _resume_names()
+def _resolve_resume_name(configured: str, names: list[str]) -> str:
+    """Resolve a configured name against one previously scanned directory listing."""
     configured_name = Path(str(configured or '')).name
     if configured_name == configured and configured_name in names:
         return configured_name
@@ -95,18 +83,27 @@ def resolve_resume_name(configured: str = '') -> str:
     return names[0] if names else ''
 
 
+def resolve_resume_name(configured: str = '') -> str:
+    """解析当前简历名称，依次采用有效配置、默认名称和首个可用文件。
+
+    目录为空时返回空串；读取目录过程中可能按需创建 ``resumes`` 目录。
+    """
+    return _resolve_resume_name(configured, _resume_names())
+
+
 def list_resume_files(configured: str = '') -> dict:
     """返回当前选择、原配置名及简历元数据列表，不读取文件正文。"""
     names = _resume_names()
-    selected = resolve_resume_name(configured)
+    selected = _resolve_resume_name(configured, names)
     items = []
     for name in names:
         path = _safe_resume_path(name)
+        stat = path.stat()
         items.append({
             'name': name,
             'exists': True,
-            'size': path.stat().st_size,
-            'updatedAt': path.stat().st_mtime,
+            'size': stat.st_size,
+            'updatedAt': stat.st_mtime,
             'selected': name == selected,
         })
     configured_name = Path(str(configured or '')).name
@@ -132,7 +129,7 @@ def save_resume_file(name: str, content: str) -> dict:
         raise ValueError('简历内容必须是文本')
     if len(content.encode('utf-8')) > MAX_RESUME_SIZE:
         raise ValueError('简历文件不能超过 2MB')
-    _atomic_write_text(path, content)
+    atomic_write_text(path, content)
     return read_resume_file(name)
 
 

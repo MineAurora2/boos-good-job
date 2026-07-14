@@ -16,6 +16,8 @@ import secrets
 import threading
 import time
 
+from storage_io import atomic_write_text
+
 
 DEFAULT_SAFETY = {
     'globalPaused': False,
@@ -89,6 +91,8 @@ class RuntimeMonitor:
             data = json.loads(self._state_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError):
             return
+        if not isinstance(data, dict):
+            return
         if isinstance(data.get('safety'), dict):
             self._safety.update({key: bool(value) for key, value in data['safety'].items() if key in DEFAULT_SAFETY})
         if isinstance(data.get('plan'), dict):
@@ -96,20 +100,24 @@ class RuntimeMonitor:
         if isinstance(data.get('accounts'), dict):
             self._account_policies = data['accounts']
 
-    def _persist_state_locked(self) -> None:
+    def _persist_state_locked(
+        self,
+        *,
+        safety: dict | None = None,
+        plan: dict | None = None,
+        accounts: dict | None = None,
+    ) -> None:
         """通过同目录临时文件替换持久化策略；调用时必须已持有条件锁。"""
         if not self._state_path:
             return
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            'safety': self._safety,
-            'plan': self._plan,
-            'accounts': self._account_policies,
+            'safety': self._safety if safety is None else safety,
+            'plan': self._plan if plan is None else plan,
+            'accounts': self._account_policies if accounts is None else accounts,
             'updatedAt': self._now_iso(),
         }
-        temporary = self._state_path.with_suffix(self._state_path.suffix + '.tmp')
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        temporary.replace(self._state_path)
+        atomic_write_text(self._state_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def publish(self, event_type: str, payload: dict) -> dict:
         """在线程锁内追加事件并唤醒长轮询者，返回与内部状态隔离的事件副本。"""
@@ -379,12 +387,14 @@ class RuntimeMonitor:
         """
         if not isinstance(patch, dict):
             raise ValueError('invalid_safety_payload')
+        unsupported = set(patch) - set(DEFAULT_SAFETY)
+        if unsupported:
+            raise ValueError(f'unsupported_safety_field:{sorted(unsupported)[0]}')
+        changes = {key: bool(value) for key, value in patch.items()}
         with self._condition:
-            for key, value in patch.items():
-                if key not in DEFAULT_SAFETY:
-                    raise ValueError(f'unsupported_safety_field:{key}')
-                self._safety[key] = bool(value)
-            self._persist_state_locked()
+            candidate = {**self._safety, **changes}
+            self._persist_state_locked(safety=candidate)
+            self._safety = candidate
             result = deepcopy(self._safety)
         if audit:
             self.audit('safety_updated', {'changes': patch}, actor)
@@ -398,22 +408,25 @@ class RuntimeMonitor:
         integers = {'dailyTarget', 'hourlyLimit', 'maxConsecutiveFailures', 'minDelayMs', 'maxDelayMs'}
         booleans = {'stopAtTarget'}
         times = {'activeStart', 'activeEnd', 'breakStart', 'breakEnd'}
+        normalized = {}
+        for key, value in patch.items():
+            if key not in DEFAULT_PLAN:
+                raise ValueError(f'unsupported_plan_field:{key}')
+            if key in integers:
+                value = max(0, int(value))
+            elif key in booleans:
+                value = bool(value)
+            elif key in times:
+                value = self._clean_text(value, 5)
+                if value and (len(value) != 5 or value[2] != ':'):
+                    raise ValueError(f'invalid_time:{key}')
+            normalized[key] = value
         with self._condition:
-            for key, value in patch.items():
-                if key not in DEFAULT_PLAN:
-                    raise ValueError(f'unsupported_plan_field:{key}')
-                if key in integers:
-                    value = max(0, int(value))
-                elif key in booleans:
-                    value = bool(value)
-                elif key in times:
-                    value = self._clean_text(value, 5)
-                    if value and (len(value) != 5 or value[2] != ':'):
-                        raise ValueError(f'invalid_time:{key}')
-                self._plan[key] = value
-            if self._plan['maxDelayMs'] and self._plan['maxDelayMs'] < self._plan['minDelayMs']:
+            candidate = {**self._plan, **normalized}
+            if candidate['maxDelayMs'] and candidate['maxDelayMs'] < candidate['minDelayMs']:
                 raise ValueError('max_delay_less_than_min_delay')
-            self._persist_state_locked()
+            self._persist_state_locked(plan=candidate)
+            self._plan = candidate
             result = deepcopy(self._plan)
         self.audit('plan_updated', {'changes': patch}, actor)
         self.publish('plan_updated', result)
@@ -430,19 +443,22 @@ class RuntimeMonitor:
         allowed = {'alias', 'dailyLimit', 'dailyTarget', 'paused', 'keyword', 'notes'}
         if not isinstance(patch, dict) or any(key not in allowed for key in patch):
             raise ValueError('invalid_account_policy')
+        normalized = {}
+        for key, value in patch.items():
+            if key in {'dailyLimit', 'dailyTarget'}:
+                value = max(0, int(value))
+            elif key == 'paused':
+                value = bool(value)
+            else:
+                value = self._clean_text(value, 500 if key == 'notes' else 120)
+            normalized[key] = value
         with self._condition:
-            policy = self._account_policies.setdefault(account_id, {})
-            for key, value in patch.items():
-                if key in {'dailyLimit', 'dailyTarget'}:
-                    value = max(0, int(value))
-                elif key == 'paused':
-                    value = bool(value)
-                else:
-                    value = self._clean_text(value, 500 if key == 'notes' else 120)
-                policy[key] = value
+            policy = {**self._account_policies.get(account_id, {}), **normalized}
             policy['accountId'] = account_id
             policy['updatedAt'] = self._now_iso()
-            self._persist_state_locked()
+            accounts = {**self._account_policies, account_id: policy}
+            self._persist_state_locked(accounts=accounts)
+            self._account_policies = accounts
             result = deepcopy(policy)
         self.audit('account_policy_updated', {'accountId': account_id, 'changes': patch}, actor)
         self.publish('account_policy_updated', result)

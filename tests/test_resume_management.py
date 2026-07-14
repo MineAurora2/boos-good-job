@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import admin_store
 import config
-import core
+import llm_tasks
 import resume_store
 
 
@@ -30,7 +30,7 @@ class ResumeManagementTests(unittest.TestCase):
         # 同时替换各模块已经导入的路径常量，确保没有读写仓库中的真实用户数据。
         self._patchers = [
             patch.object(config, 'ROOT', self.test_root),
-            patch.object(admin_store, 'CONFIG_PATH', self.config_path),
+            patch.object(config, 'CONFIG_PATH', self.config_path),
             patch.object(resume_store, 'ROOT', self.test_root),
             patch.object(resume_store, 'RESUME_DIR', self.resume_dir),
         ]
@@ -90,7 +90,7 @@ class ResumeManagementTests(unittest.TestCase):
         config.Config.resume_name = 'first.md'
         config.Config.reload()
         self.assertEqual(config.Config.resume_name, 'selected.txt')
-        self.assertEqual(core._load_resume(), 'WEB SELECTED RESUME')
+        self.assertEqual(llm_tasks.load_resume(), 'WEB SELECTED RESUME')
 
     def test_save_without_selecting_keeps_current_resume(self):
         """保存草稿但不选择时，不应改变当前简历。"""
@@ -101,7 +101,7 @@ class ResumeManagementTests(unittest.TestCase):
 
         self.assertEqual(result['selected'], 'current.md')
         self.assertEqual(config.Config.resume_name, 'current.md')
-        self.assertEqual(core._load_resume(), 'CURRENT')
+        self.assertEqual(llm_tasks.load_resume(), 'CURRENT')
 
     def test_root_and_example_files_are_not_listed_or_loaded(self):
         """根目录旧文件和模板文件均不得进入管理列表或 LLM 上下文。"""
@@ -112,13 +112,22 @@ class ResumeManagementTests(unittest.TestCase):
 
         with patch.object(config.Config, 'resume_name', 'resume-example.md'):
             result = admin_store.list_resumes()
-            llm_resume = core._load_resume()
+            llm_resume = llm_tasks.load_resume()
 
         self.assertEqual([item['name'] for item in result['items']], ['managed.md'])
         self.assertEqual(result['selected'], 'managed.md')
         self.assertEqual(llm_resume, 'MANAGED RESUME')
         self.assertNotIn('ROOT TEMPLATE', llm_resume)
         self.assertNotIn('ROOT LEGACY RESUME', llm_resume)
+
+    def test_invalid_existing_filename_does_not_break_resume_listing(self):
+        """目录中的非受管名称应被忽略，不能让整个简历列表失败。"""
+        self._write_managed_resume('valid.md', 'VALID')
+        self._write_managed_resume('CV 2026.md', 'UNMANAGED')
+
+        result = resume_store.list_resume_files('valid.md')
+
+        self.assertEqual([item['name'] for item in result['items']], ['valid.md'])
 
     def test_rejects_path_traversal_bad_suffix_and_example_names(self):
         """拒绝路径穿越、不支持的后缀以及保留的示例命名。"""
