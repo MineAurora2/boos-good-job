@@ -143,8 +143,12 @@ class LLMGateway:
             while len(self._cache) > 512:
                 self._cache.popitem(last=False)
 
-    def _check_circuit(self) -> None:
-        """检查熔断状态，并在冷却结束后只放行一个半开探测请求。"""
+    def _check_circuit(self) -> bool:
+        """检查熔断状态，并在冷却结束后只放行一个半开探测请求。
+
+        返回本次调用是否成为半开探测：为 True 时调用方必须保证最终清除
+        ``_half_open_in_progress``，否则探测意外中断后熔断器会永久卡在半开拒绝态。
+        """
         now = time.monotonic()
         with self._lock:
             if self._open_until > now:
@@ -161,6 +165,13 @@ class LLMGateway:
                     self._circuit_rejections += 1
                     raise LLMGatewayError('LLM circuit half-open probe in progress', circuit_open=True)
                 self._half_open_in_progress = True
+                return True
+        return False
+
+    def _clear_half_open_probe(self) -> None:
+        """兜底清除半开探测标记，供探测请求因意外异常（如取消）跳过成败记录时使用。"""
+        with self._lock:
+            self._half_open_in_progress = False
 
     def _record_success(self) -> None:
         """记录成功并关闭熔断器；半开探测成功也在这里恢复正常流量。"""
@@ -222,64 +233,74 @@ class LLMGateway:
         }
 
         async with self._semaphore(max_concurrent):
-            self._check_circuit()
+            is_probe = self._check_circuit()
             with self._lock:
                 self._requests += 1
             last_error: Exception | None = None
+            outcome_recorded = False
             try:
-                client_context = self._client_factory(timeout, proxy)
-            except (httpx.InvalidURL, ValueError, ImportError) as error:
-                final_error = LLMGatewayError(f'{type(error).__name__}: {error}')
-                self._record_failure(config, final_error)
-                raise final_error from error
-            async with client_context as client:
-                for attempt in range(retries + 1):
-                    wait_for_slot = self._reserve_request_slot(min_interval)
-                    if wait_for_slot:
-                        await asyncio.sleep(wait_for_slot)
-                    response = None
-                    try:
-                        response = await client.post(url, json=payload, headers=headers)
-                        response.raise_for_status()
-                        data = response.json()
-                        if not isinstance(data, dict):
-                            raise ValueError('LLM response must be a JSON object')
-                        choices = data.get('choices')
-                        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                            raise ValueError('LLM response is missing choices')
-                        message = choices[0].get('message')
-                        if not isinstance(message, dict):
-                            raise ValueError('LLM response is missing message')
-                        if (
-                            not response_text(message.get('content'))
-                            and not response_text(message.get('reasoning_content'))
-                            and not response_text(message.get('reasoning'))
-                        ):
-                            raise ValueError('LLM response content is empty')
-                        self._record_success()
-                        return data
-                    except (httpx.HTTPError, ValueError, KeyError, json.JSONDecodeError) as error:
-                        status_code = response.status_code if response is not None else None
-                        body = response.text[:300] if response is not None else ''
-                        message = f'{type(error).__name__}: {error}'
-                        if body:
-                            message += f' | body={body}'
-                        last_error = LLMGatewayError(message, status_code=status_code)
-                        retryable = status_code in RETRYABLE_STATUS_CODES or status_code is None
-                        if attempt >= retries or not retryable:
-                            break
-                        with self._lock:
-                            self._retries += 1
-                        retry_after = self._retry_after(response)
-                        # 指数退避叠加少量随机抖动，减少多个任务同时重试造成的尖峰；
-                        # 服务端明确给出的 Retry-After 拥有更高优先级。
-                        delay = min(max_delay, base_delay * (2 ** attempt))
-                        delay = max(retry_after, delay + random.uniform(0, max(0.05, delay * 0.2)))
-                        await asyncio.sleep(delay)
+                try:
+                    client_context = self._client_factory(timeout, proxy)
+                except (httpx.InvalidURL, ValueError, ImportError) as error:
+                    final_error = LLMGatewayError(f'{type(error).__name__}: {error}')
+                    self._record_failure(config, final_error)
+                    outcome_recorded = True
+                    raise final_error from error
+                async with client_context as client:
+                    for attempt in range(retries + 1):
+                        wait_for_slot = self._reserve_request_slot(min_interval)
+                        if wait_for_slot:
+                            await asyncio.sleep(wait_for_slot)
+                        response = None
+                        try:
+                            response = await client.post(url, json=payload, headers=headers)
+                            response.raise_for_status()
+                            data = response.json()
+                            if not isinstance(data, dict):
+                                raise ValueError('LLM response must be a JSON object')
+                            choices = data.get('choices')
+                            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                                raise ValueError('LLM response is missing choices')
+                            message = choices[0].get('message')
+                            if not isinstance(message, dict):
+                                raise ValueError('LLM response is missing message')
+                            if (
+                                not response_text(message.get('content'))
+                                and not response_text(message.get('reasoning_content'))
+                                and not response_text(message.get('reasoning'))
+                            ):
+                                raise ValueError('LLM response content is empty')
+                            self._record_success()
+                            outcome_recorded = True
+                            return data
+                        except (httpx.HTTPError, ValueError, KeyError, json.JSONDecodeError) as error:
+                            status_code = response.status_code if response is not None else None
+                            body = response.text[:300] if response is not None else ''
+                            message = f'{type(error).__name__}: {error}'
+                            if body:
+                                message += f' | body={body}'
+                            last_error = LLMGatewayError(message, status_code=status_code)
+                            retryable = status_code in RETRYABLE_STATUS_CODES or status_code is None
+                            if attempt >= retries or not retryable:
+                                break
+                            with self._lock:
+                                self._retries += 1
+                            retry_after = self._retry_after(response)
+                            # 指数退避叠加少量随机抖动，减少多个任务同时重试造成的尖峰；
+                            # 服务端明确给出的 Retry-After 拥有更高优先级。
+                            delay = min(max_delay, base_delay * (2 ** attempt))
+                            delay = max(retry_after, delay + random.uniform(0, max(0.05, delay * 0.2)))
+                            await asyncio.sleep(delay)
 
-            final_error = last_error or LLMGatewayError('unknown LLM gateway error')
-            self._record_failure(config, final_error)
-            raise final_error
+                final_error = last_error or LLMGatewayError('unknown LLM gateway error')
+                self._record_failure(config, final_error)
+                outcome_recorded = True
+                raise final_error
+            finally:
+                # 探测请求若因取消等未被捕获的异常跳过了成败记录，必须在此清除半开标记，
+                # 否则冷却已过但标记长期为 True，后续所有请求都会被半开分支永久拒绝。
+                if is_probe and not outcome_recorded:
+                    self._clear_half_open_probe()
 
     async def chat_completions(self, config: dict, payload: dict, purpose: str) -> dict:
         """返回聊天补全结果，并合并同一事件循环中的相同在途请求。"""

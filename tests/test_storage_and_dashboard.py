@@ -8,13 +8,14 @@ import json
 import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import uuid
 
-import admin_store
-import config
-from dashboard_data import load_dashboard_data
-from delivery_store import DeliveryStore
-from storage_io import atomic_write_text, read_jsonl, replace_jsonl
+from app.storage import admin_store
+from app import config
+from app.storage.dashboard_data import load_dashboard_data
+from app.storage.delivery_store import DeliveryStore
+from app.storage.io import atomic_write_text, read_jsonl, replace_jsonl
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -173,6 +174,36 @@ class DashboardProjectionTests(unittest.TestCase):
             self.assertTrue(first['accepted'])
             self.assertEqual(second['reason'], 'daily_limit')
             self.assertEqual(second['limit'], 1)
+
+    def test_release_returns_quota_to_the_original_claim_day(self):
+        with isolated_directory() as root:
+            store = DeliveryStore(root / 'delivery.db', daily_limit=5)
+
+            # 领取发生在“昨天”，占额记在昨天。
+            with patch.object(store, '_today', return_value='2026-01-01'), patch.object(
+                store, '_now', return_value='2026-01-01T23:59:00'
+            ):
+                claim = store.claim(
+                    company='跨天公司',
+                    title='跨天岗位',
+                    account_id='account-1',
+                    worker_id='worker-1',
+                )
+                self.assertTrue(claim['accepted'])
+
+            # 释放发生在“今天”：名额必须退回领取当天，而不是错扣今天的计数。
+            with patch.object(store, '_today', return_value='2026-01-02'), patch.object(
+                store, '_now', return_value='2026-01-02T00:05:00'
+            ):
+                released = store.release(claim['claimToken'])
+                self.assertTrue(released['released'])
+                today_quota = store.quota_status('account-1')
+
+            with patch.object(store, '_today', return_value='2026-01-01'):
+                claim_day_quota = store.quota_status('account-1')
+
+            self.assertEqual(today_quota['count'], 0)
+            self.assertEqual(claim_day_quota['count'], 0)
 
 
 class ConfigurationTests(unittest.TestCase):

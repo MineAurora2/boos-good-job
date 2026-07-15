@@ -6,10 +6,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from config import Config
-from job_scoring import evaluate_job_match, parse_job_fields
-import llm_tasks
-from routes import delivery as delivery_routes
+from app.config import Config
+from app.scoring import evaluate_job_match, parse_job_fields
+from app.llm import tasks as llm_tasks
+from app.routes import delivery as delivery_routes
 
 
 JOB_TEXT = """# 职位名称

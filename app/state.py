@@ -10,10 +10,11 @@ import uuid
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from config import Config
-from delivery_store import DeliveryStore
-from runtime_monitor import RUNTIME_MONITOR
-from storage_io import append_jsonl
+from app import paths
+from app.config import Config
+from app.runtime import RUNTIME_MONITOR
+from app.storage.delivery_store import DeliveryStore
+from app.storage.io import append_jsonl
 
 
 class ApplicationState:
@@ -119,7 +120,9 @@ class ApplicationState:
         """Combine persisted usage with the control center's account override."""
         quota = self.delivery_store.quota_status(account_id)
         policy = RUNTIME_MONITOR.effective_control('', account_id).get('account') or {}
-        configured_limit = int(policy.get('dailyLimit') or quota['limit'])
+        # 显式区分“未配置”（用默认上限）与“配置为 0”（冻结该账号），避免 0 被 or 当作缺省丢弃。
+        raw_limit = policy.get('dailyLimit')
+        configured_limit = int(raw_limit) if raw_limit is not None else quota['limit']
         quota['limit'] = configured_limit
         quota['remaining'] = max(0, configured_limit - quota['count'])
         quota['reached'] = quota['count'] >= configured_limit
@@ -133,4 +136,4 @@ def require_local_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail='管理功能只允许从本机访问')
 
 
-STATE = ApplicationState(Path(__file__).resolve().parent)
+STATE = ApplicationState(paths.PROJECT_ROOT)

@@ -16,7 +16,8 @@ import secrets
 import threading
 import time
 
-from storage_io import atomic_write_text
+from app import paths
+from app.storage.io import atomic_write_text
 
 
 DEFAULT_SAFETY = {
@@ -561,4 +562,4 @@ class RuntimeMonitor:
             return [deepcopy(item) for item in list(self._events)[-max(1, min(limit, 500)):]]
 
 
-RUNTIME_MONITOR = RuntimeMonitor(state_path=Path(__file__).resolve().parent / 'control_center_state.json')
+RUNTIME_MONITOR = RuntimeMonitor(state_path=paths.CONTROL_CENTER_STATE_PATH)

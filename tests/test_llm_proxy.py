@@ -10,9 +10,9 @@ from unittest.mock import patch
 
 import httpx
 
-import llm_env_store
-from llm_gateway import LLMGateway, LLMGatewayError
-from llm_manager import LLMManager
+from app.llm import env_store as llm_env_store
+from app.llm.gateway import LLMGateway, LLMGatewayError
+from app.llm.manager import LLMManager
 
 
 class _FakeClient:
@@ -217,7 +217,7 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
             'cache_ttl_seconds': 0,
             'min_request_interval': 0,
         }
-        with patch('llm_gateway.httpx.AsyncClient', side_effect=client_factory):
+        with patch('app.llm.gateway.httpx.AsyncClient', side_effect=client_factory):
             result = await LLMGateway().chat_completions(
                 config,
                 {'model': 'test-model', 'messages': [{'role': 'user', 'content': 'ping'}]},
@@ -245,7 +245,7 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
             'cache_ttl_seconds': 0,
             'min_request_interval': 0,
         }
-        with patch('llm_gateway.httpx.AsyncClient', side_effect=client_factory):
+        with patch('app.llm.gateway.httpx.AsyncClient', side_effect=client_factory):
             await LLMGateway().chat_completions(config, {'messages': []}, 'direct-test')
         self.assertIsNone(captured['proxy'])
         self.assertFalse(captured['trust_env'])
@@ -280,7 +280,7 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
                 'enabled': True,
             }],
         }
-        with patch('llm_manager.llm_env_store.load_llm_config', return_value=loaded), patch('llm_manager.LLMGateway', side_effect=CaptureGateway):
+        with patch('app.llm.manager.llm_env_store.load_llm_config', return_value=loaded), patch('app.llm.manager.LLMGateway', side_effect=CaptureGateway):
             manager = LLMManager()
         await manager.chat_completions({'messages': []}, 'manager-test')
         self.assertEqual(captured['proxy_url'], 'http://127.0.0.1:7890')
@@ -303,8 +303,8 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
                 'enabled': True,
             }],
         }
-        with patch('llm_manager.llm_env_store.load_llm_config', return_value=loaded), patch(
-            'llm_manager.LLMGateway',
+        with patch('app.llm.manager.llm_env_store.load_llm_config', return_value=loaded), patch(
+            'app.llm.manager.LLMGateway',
             wraps=LLMGateway,
         ) as gateway_factory:
             manager = LLMManager()
@@ -389,7 +389,7 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
             'proxy_url': 'http://127.0.0.1:7890',
             'proxy_enabled': True,
         }
-        with patch('llm_manager.httpx.AsyncClient', side_effect=client_factory):
+        with patch('app.llm.manager.httpx.AsyncClient', side_effect=client_factory):
             result = await LLMManager._test_provider_config(target, 10)
         self.assertTrue(result['ok'])
         self.assertTrue(result['viaProxy'])
@@ -411,7 +411,7 @@ class LLMProxyRequestTests(unittest.IsolatedAsyncioTestCase):
             'proxy_url': 'http://127.0.0.1:7890',
             'proxy_enabled': False,
         }
-        with patch('llm_manager.httpx.AsyncClient', side_effect=client_factory):
+        with patch('app.llm.manager.httpx.AsyncClient', side_effect=client_factory):
             result = await LLMManager._test_provider_config(target, 10)
         self.assertTrue(result['ok'])
         self.assertFalse(result['viaProxy'])

@@ -10,11 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
-from storage_io import atomic_write_text
+from app import paths
+from app.storage.io import atomic_write_text
 
 
-ROOT = Path(__file__).resolve().parent
-RESUME_DIR = ROOT / 'resumes'
+ROOT = paths.PROJECT_ROOT
+RESUME_DIR = paths.RESUME_DIR
 RESUME_SUFFIXES = {'.md', '.txt'}
 MAX_RESUME_SIZE = 2 * 1024 * 1024
 _EXAMPLE_MARKERS = ('example', 'sample', 'template', '示例', '样例', '模板')

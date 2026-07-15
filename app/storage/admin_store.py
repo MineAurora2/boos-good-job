@@ -11,17 +11,17 @@ import copy
 import json
 from pathlib import Path
 
-import config
-from config import Config
-import prompts
-from resume_store import (
+from app import config
+from app.config import Config
+from app.llm import prompts
+from app.storage.resume_store import (
     list_resume_files,
     read_resume_file,
     require_resume_file,
     save_resume_file,
     validate_resume_name,
 )
-from storage_io import atomic_write_text
+from app.storage.io import atomic_write_text
 
 
 def _validate_number(container: dict, key: str, minimum: float, maximum: float) -> None:

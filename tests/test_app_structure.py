@@ -13,11 +13,11 @@ import uuid
 
 from fastapi.testclient import TestClient
 
-from app_state import ApplicationState
-import config
+from app.state import ApplicationState
+from app import config
 import main
-import routes.control as control_routes
-import routes.delivery as delivery_routes
+import app.routes.control as control_routes
+import app.routes.delivery as delivery_routes
 
 
 EXPECTED_ROUTES = {
@@ -124,6 +124,35 @@ class ApplicationStructureTests(unittest.TestCase):
             elif path.is_dir():
                 path.rmdir()
         root.rmdir()
+
+
+class AccountQuotaOverrideTests(unittest.TestCase):
+    def test_zero_daily_limit_override_freezes_account(self):
+        """账号被管理端设为 dailyLimit=0 时应真正冻结，而不是回退默认上限。"""
+        import app.state as state_module
+        from app.runtime import RuntimeMonitor
+
+        tests_dir = Path(__file__).resolve().parent
+        root = tests_dir / f'.app-structure-{os.getpid()}-{uuid.uuid4().hex}'
+        root.mkdir()
+        self.addCleanup(ApplicationStructureTests._remove_tree, root, tests_dir)
+        config_path = root / 'user_config.json'
+        config_path.write_text(
+            json.dumps(copy.deepcopy(config.DEFAULT_USER_CONFIG), ensure_ascii=False),
+            encoding='utf-8',
+        )
+        state = ApplicationState(root)
+        monitor = RuntimeMonitor(state_path=None)
+        monitor.update_account('account-frozen', {'dailyLimit': 0})
+
+        with patch.object(config, 'CONFIG_PATH', config_path), patch.object(
+            state_module, 'RUNTIME_MONITOR', monitor
+        ):
+            quota = state.quota_status('account-frozen')
+
+        self.assertEqual(quota['limit'], 0)
+        self.assertTrue(quota['reached'])
+        self.assertEqual(quota['remaining'], 0)
 
 
 class IntroduceTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):

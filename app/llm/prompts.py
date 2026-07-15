@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from string import Formatter
 import threading
 
-from storage_io import atomic_write_text
+from app import paths
+from app.storage.io import atomic_write_text
 
 
 CUSTOM_INTRODUCE = """你负责生成一条可以直接发送给招聘者的首次招呼消息。
@@ -58,7 +58,7 @@ PROMPT_REQUIRED_FIELDS = {
     'JOB_FILTER': {'resume', 'job_info'},
 }
 _DEFAULT_PROMPTS = {key: globals()[key] for key in PROMPT_KEYS}
-_OVERRIDE_PATH = Path(__file__).resolve().parent / 'prompt_overrides.json'
+_OVERRIDE_PATH = paths.PROMPT_OVERRIDE_PATH
 _SAVE_LOCK = threading.Lock()
 
 

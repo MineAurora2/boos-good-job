@@ -10,12 +10,12 @@ import uuid
 
 from fastapi import APIRouter, Body, HTTPException
 
-from app_state import STATE
-from config import Config
-from delivery_store import delivery_key
-from job_scoring import evaluate_job_match
-from llm_manager import LLM_MANAGER
-from llm_tasks import generate_custom_introduce, llm_job_filter
+from app.state import STATE
+from app.config import Config
+from app.scoring import evaluate_job_match
+from app.llm.manager import LLM_MANAGER
+from app.llm.tasks import generate_custom_introduce, llm_job_filter
+from app.storage.delivery_store import delivery_key
 
 
 router = APIRouter()

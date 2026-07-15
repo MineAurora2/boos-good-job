@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from config import Config
+from app.config import Config
 
 
 _FIELD_HEADING = re.compile(
@@ -115,25 +115,6 @@ def evaluate_job_match(job: str) -> dict:
         'rawStars': raw_stars,
         'deductedStars': deducted_stars,
         'discarded': discarded,
-        'blocked': discarded,
-        'title_score': 0,
-        'detail_score': 0,
-        'title_penalty_score': title_deduction * 20,
-        'penalty_score': detail_deduction * 20,
-        'combo_score': 0,
-        'final_score': final_score,
-        'title_match_level': 'deduction',
-        'title_matches': [],
-        'title_penalty_matches': [keyword for keyword, _ in title_matches],
-        'detail_infra_matches': [],
-        'detail_support_matches': [],
-        'detail_negative_matches': [keyword for keyword, _ in detail_matches],
-        'title_scored_matches': [
-            {'keyword': keyword, 'deductStars': value} for keyword, value in title_matches
-        ],
-        'detail_scored_matches': [
-            {'keyword': keyword, 'deductStars': value} for keyword, value in detail_matches
-        ],
         'deductions': deductions,
         'reason': reason,
     }

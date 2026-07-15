@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-from runtime_monitor import RuntimeMonitor
+from app.runtime import RuntimeMonitor
 
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -55,7 +55,7 @@ class RuntimeMonitorTests(unittest.TestCase):
         self.addCleanup(path.unlink, missing_ok=True)
         monitor = RuntimeMonitor(state_path=path)
 
-        with patch('runtime_monitor.atomic_write_text', side_effect=OSError('disk unavailable')):
+        with patch('app.runtime.atomic_write_text', side_effect=OSError('disk unavailable')):
             with self.assertRaisesRegex(OSError, 'disk unavailable'):
                 monitor.update_safety({'globalPaused': True})
             with self.assertRaisesRegex(OSError, 'disk unavailable'):

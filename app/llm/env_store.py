@@ -26,11 +26,12 @@ import re
 import threading
 from urllib.parse import urlsplit, urlunsplit
 
-from storage_io import atomic_write_text
+from app import paths
+from app.storage.io import atomic_write_text
 
 
-ROOT = Path(__file__).resolve().parent
-ENV_PATH = ROOT / '.env'
+ROOT = paths.PROJECT_ROOT
+ENV_PATH = paths.ENV_PATH
 
 STRATEGIES = ('failover', 'round_robin')
 DEFAULT_STRATEGY = 'failover'

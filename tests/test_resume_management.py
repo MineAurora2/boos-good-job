@@ -9,10 +9,10 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-import admin_store
-import config
-import llm_tasks
-import resume_store
+from app.storage import admin_store
+from app import config
+from app.llm import tasks as llm_tasks
+from app.storage import resume_store
 
 
 class ResumeManagementTests(unittest.TestCase):

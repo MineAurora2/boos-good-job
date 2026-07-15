@@ -8,11 +8,11 @@ import re
 import threading
 import time
 
-import prompts
-from config import Config
-from llm_gateway import LLMGatewayError, response_text
-from llm_manager import LLM_MANAGER
-from resume_store import load_resume_selection
+from app.config import Config
+from app.llm import prompts
+from app.llm.gateway import LLMGatewayError, response_text
+from app.llm.manager import LLM_MANAGER
+from app.storage.resume_store import load_resume_selection
 
 
 _LLM_LOG_LOCK = threading.Lock()

@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 
+from app import paths
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / 'user_config.json'
+
+ROOT = paths.PROJECT_ROOT
+CONFIG_PATH = paths.CONFIG_PATH
 
 
 def _load_env_file(path: Path) -> None:

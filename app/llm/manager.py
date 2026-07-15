@@ -17,8 +17,8 @@ import time
 
 import httpx
 
-from llm_gateway import LLMGateway, LLMGatewayError
-import llm_env_store
+from app.llm.gateway import LLMGateway, LLMGatewayError
+from app.llm import env_store as llm_env_store
 
 
 # 从 .env 剥离出来的调优参数改为进程内默认常量（不再暴露到配置面板）。

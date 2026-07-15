@@ -20,6 +20,8 @@
 
 - [x] 关键词筛选岗位
 
+- [x] LLM筛选岗位
+
 - [x] LLM接入管理器
 
 - [x] 重复岗位跳过
@@ -38,67 +40,6 @@
 
 ## 投递流程（UML）
 
-### 活动流程图：单个岗位如何被处理
-
-```mermaid
-flowchart TD
-    Start(["脚本启动"]) --> Cfg["读取配置：tags 关键词 / thread 阈值 / BOSS 在线简历序号 resumeIndex"]
-    Cfg --> Loop{"遍历搜索关键词的岗位列表"}
-    Loop -->|取出一个岗位| Extract["提取 公司 / 岗位 / 薪资 / 详情"]
-    Extract --> Claim["POST /delivery/claim 原子领取投递权"]
-    Claim --> Dup{"公司或岗位已投递过？"}
-    Dup -->|是| Skip1["跳过，不计投递次数"] --> Loop
-    Dup -->|否| Quota{"达到每日投递上限？"}
-    Quota -->|是| Skip2["跳过该账号"] --> Loop
-    Quota -->|否| Token["领取成功，返回 claimToken"]
-    Token --> Score["POST /get-job-score 规则扣星评分（5 星起扣）"]
-    Score --> AI{"启用 AI 二次筛选？"}
-    AI -->|是| Filter["LLM 管理器判断岗位是否匹配"] --> Judge
-    AI -->|否| Judge{"命中屏蔽词 或 评分 &lt; 阈值？"}
-    Judge -->|是| Mark1["markDelivery failed_unknown"] --> Loop
-    Judge -->|否，达标| Gen["POST /generate-introduce/start 生成招呼语"]
-    Gen --> GenOk{"LLM 生成成功？"}
-    GenOk -->|失败| Fixed["回退固定招呼语"] --> Send
-    GenOk -->|成功| Send["发送招呼语"]
-    Send --> Mark2["markDelivery sent，写入投递记录"] --> Loop
-    Loop -->|连续多轮无新岗位| Switch["切换下一个关键词"] --> Loop
-```
-
-### 时序图：脚本、后端、投递库与 LLM 的交互
-
-```mermaid
-sequenceDiagram
-    participant S as 浏览器脚本 (web_script.js)
-    participant B as 后端 (main.py)
-    participant D as 投递库 (SQLite)
-    participant L as LLM 管理器 (.env 多接口)
-
-    S->>B: GET /client-config 读取运行配置
-    loop 每个岗位
-        S->>B: POST /delivery/claim 领取投递权
-        B->>D: 查重 + 配额检查 + 写入占位
-        D-->>B: accepted + claimToken / 重复 / 超限
-        B-->>S: 领取结果
-        alt 领取成功
-            S->>B: POST /get-job-score 规则评分
-            opt 启用 AI 二次筛选
-                B->>L: chat_completions 判断岗位匹配
-                L-->>B: 通过 / 不通过
-            end
-            B-->>S: score + blocked / discarded
-            alt 达标
-                S->>B: POST /generate-introduce/start 生成招呼语
-                B->>L: chat_completions 生成招呼语
-                L-->>B: 招呼语（失败则回退固定语）
-                B-->>S: introduce
-                S->>S: 在页面发送招呼语
-                S->>B: POST /delivery/mark sent
-            else 命中屏蔽词 / 不达标
-                S->>B: POST /delivery/mark failed_unknown
-            end
-        end
-    end
-```
 
 ## 项目介绍
 
@@ -108,17 +49,20 @@ sequenceDiagram
 
 ## 项目结构
 
-- `main.py`：FastAPI 应用创建、生命周期和服务启动入口
-- `routes/`：按“岗位投递”和“管理运行”归类的 HTTP 接口
-- `app_state.py`：数据库、日志路径、进程锁和启动迁移等共享资源
-- `job_scoring.py`：岗位文本解析与纯规则扣星评分
-- `llm_tasks.py`：简历读取、定制招呼语和 AI 岗位筛选
-- `llm_gateway.py`、`llm_manager.py`、`llm_env_store.py`：单接口请求、多接口调度和 `.env` 持久化
-- `delivery_store.py`、`resume_store.py`、`admin_store.py`：投递、简历和管理配置存储
-- `storage_io.py`：原子文本写入和 JSONL 读写
-- `config.py`、`prompts.py`：运行配置、旧配置迁移和当前使用的 LLM 提示词
+- `main.py`：可执行入口，仅负责组装 FastAPI 应用与启动服务
+- `app/`：后端业务代码包
+  - `app/paths.py`：集中管理项目根目录与所有本地数据文件路径
+  - `app/config.py`：运行配置、旧配置迁移与热加载
+  - `app/state.py`：数据库、日志路径、进程锁和启动迁移等共享资源
+  - `app/scoring.py`：岗位文本解析与纯规则扣星评分
+  - `app/runtime.py`：浏览器工作器运行态、控制策略与事件流
+  - `app/routes/`：按“岗位投递”和“管理运行”归类的 HTTP 接口
+  - `app/llm/`：`gateway.py` 单接口请求、`manager.py` 多接口调度、`env_store.py` `.env` 持久化、`tasks.py` 招呼语与筛选、`prompts.py` 提示词
+  - `app/storage/`：`io.py` 原子写入与 JSONL、`delivery_store.py`/`resume_store.py`/`admin_store.py` 投递、简历与管理配置存储、`dashboard_data.py` 面板数据聚合
+- `dashboard/`：统计管理面板前端资源（HTML/CSS/JS 与地图数据）
+- `scripts/`：地图等离线数据构建脚本
+- `tests/`：无网络的回归测试
 - `web_script.js`：Boss 页面 Tampermonkey 单文件脚本
-- `dashboard/`、`dashboard_data.py`：统计管理面板及数据聚合
 - `user_config.example.json`：可直接复制使用的当前格式配置模板
 - `resumes/`：网页管理并提供给 LLM 使用的真实简历目录
 - `resume-example.md`：简历模板，仅用于创建真实简历，不在网页管理页展示
@@ -137,7 +81,7 @@ sequenceDiagram
 pip install -r requirements.txt
 ```
 
-### 2. 配置外部 LLM（可选）
+### 2. 配置外部 LLM（建议）
 
 ```bash
 cp .env.example .env
@@ -176,9 +120,9 @@ cp resume-example.md resumes/resume.md
 ```
 
 说明：
-- `resumes/` 只存放真实简历，网页简历管理页可在该目录中选择、新建和编辑 Markdown/TXT 文件
+- `resumes/` 存放简历
 - 网页设置的当前简历会作为 LLM 生成定制招呼语和执行 AI 岗位筛选时的默认简历
-- `resume-example.md` 是项目模板，不会出现在简历管理页，也不会作为 LLM 的简历输入
+- `resume-example.md` 简历模板
 
 ### 5. 启动后端
 

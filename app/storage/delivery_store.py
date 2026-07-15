@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import unicodedata
 
-from storage_io import read_jsonl
+from app.storage.io import read_jsonl
 
 
 FINAL_STATUSES = {'sent', 'failed_unknown'}
@@ -504,7 +504,7 @@ class DeliveryStore:
         try:
             connection.execute('BEGIN IMMEDIATE')
             row = connection.execute(
-                'SELECT account_id, status FROM company_deliveries WHERE claim_token = ?',
+                'SELECT account_id, status, claimed_at FROM company_deliveries WHERE claim_token = ?',
                 (claim_token,),
             ).fetchone()
             if not row:
@@ -514,6 +514,9 @@ class DeliveryStore:
                 connection.rollback()
                 return {'success': False, 'reason': 'already_started', 'status': row['status']}
 
+            # 归还名额必须落在“领取当天”的计数上：claim 在领取当日累加，若占位跨过午夜再释放，
+            # 按今天扣减会错扣当天配额并让领取日计数永久虚高。claimed_at 的日期前缀与 usage_date 同格式。
+            claim_date = (row['claimed_at'] or '')[:10] or self._today()
             connection.execute('DELETE FROM company_deliveries WHERE claim_token = ?', (claim_token,))
             connection.execute(
                 """
@@ -521,7 +524,7 @@ class DeliveryStore:
                 SET count = MAX(0, count - 1), updated_at = ?
                 WHERE usage_date = ? AND account_id = ?
                 """,
-                (self._now(), self._today(), row['account_id']),
+                (self._now(), claim_date, row['account_id']),
             )
             connection.commit()
             return {'success': True, 'released': True, 'reason': (reason or '')[:1000]}
