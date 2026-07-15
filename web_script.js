@@ -238,6 +238,13 @@
         preloadMaxRounds: 30, // 岗位预加载：最多滑动多少轮
         preloadActivateCardEvery: 0, // 预加载时每隔多少轮尝试轻点一次左侧岗位卡片，0 表示关闭
         preloadActivateCardWaitMs: 250, // 轻点岗位卡片后的额外等待时间
+        // 防检测：总开关关闭时下列随机化全部失效，脚本回到确定性行为。
+        antiDetectionEnabled: false,
+        shuffleJobOrder: true, // 取岗位前打乱本轮顺序
+        randomSkipRatio: 0, // 达标岗位按百分比概率随机跳过（0 表示不跳过）
+        randomNoIntroduceRatio: 0, // 随机不带招呼语直接打招呼的百分比（0 表示始终使用招呼语）
+        randomDelayMinMs: 0, // 投递前后随机延时下限
+        randomDelayMaxMs: 0, // 投递前后随机延时上限
     };
 
     // 元素选择器
@@ -524,6 +531,50 @@
             writeLog(message);
         }
     }
+
+    // 防检测：仅做行为随机化（岗位顺序、随机跳过、随机延时、随机省略招呼语）。
+    // 总开关 OPTIONS.antiDetectionEnabled 关闭时全部失效，脚本回到确定性行为。
+    const antiDetection = {
+        enabled() {
+            return Boolean(OPTIONS.antiDetectionEnabled);
+        },
+        // Fisher–Yates 原地打乱，返回同一数组便于链式使用。
+        shuffle(list) {
+            for (let i = list.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [list[i], list[j]] = [list[j], list[i]];
+            }
+            return list;
+        },
+        // ratio 为 0～100 的百分比概率，非法值按 0 处理（即不触发）。
+        roll(ratio) {
+            const percent = Number(ratio);
+            if (!Number.isFinite(percent) || percent <= 0) return false;
+            return Math.random() * 100 < Math.min(100, percent);
+        },
+        // 在 [min, max] 毫秒区间取随机延时；区间非法或为 0 时返回 0。
+        randomDelayMs() {
+            const min = Math.max(0, Number(OPTIONS.randomDelayMinMs) || 0);
+            const max = Math.max(min, Number(OPTIONS.randomDelayMaxMs) || 0);
+            if (max <= 0) return 0;
+            return Math.floor(min + Math.random() * (max - min + 1));
+        },
+        // 受总开关约束的可中断随机延时；关闭或区间为 0 时不等待。
+        // 不接收调用方标签，交由 asyncSleep 使用默认的 runtimeLifecycle.signal，保证停止时可中断。
+        async delay() {
+            if (!this.enabled()) return;
+            const ms = this.randomDelayMs();
+            if (ms > 0) await tools.asyncSleep(ms);
+        },
+        // 达标岗位是否按概率随机跳过（调用方已确认总开关开启）。
+        shouldSkip() {
+            return this.roll(OPTIONS.randomSkipRatio);
+        },
+        // 本次是否随机省略招呼语、直接打招呼（调用方已确认总开关开启）。
+        shouldSkipIntroduce() {
+            return this.roll(OPTIONS.randomNoIntroduceRatio);
+        },
+    };
 
     // 每个浏览器配置文件拥有独立 workerId；accountId 可通过油猴菜单设置。
     const deliveryIdentity = {
@@ -1543,6 +1594,10 @@
                     page++;
                     logger.add(`开始浏览第 ${page} 页`);
                     if (hrefs.length) {
+                        // 防检测：打乱本页新增岗位顺序，避免固定的从上到下投递节奏。
+                        if (antiDetection.enabled() && OPTIONS.shuffleJobOrder) {
+                            antiDetection.shuffle(hrefs);
+                        }
                         jobHrefs.push(...hrefs);
                         roundQueuedCount += hrefs.length;
                         logger.add(`本页新增 ${hrefs.length} 个未处理岗位`);
@@ -1746,8 +1801,13 @@
                             ).catch(() => null);
                             return;
                         }
-                        const greetIntroduce = pendingGreetDecision?.introduce || this.introduce;
-                        logger.add(`打招呼introduce: ${greetIntroduce.substring(0, 40)}...`);
+                        // 命中防检测随机省略招呼语时发送空串，不回退固定文本；否则按定制/固定招呼语。
+                        const greetIntroduce = pendingGreetDecision?.omitIntroduce
+                            ? ''
+                            : (pendingGreetDecision?.introduce || this.introduce);
+                        logger.add(greetIntroduce
+                            ? `打招呼introduce: ${greetIntroduce.substring(0, 40)}...`
+                            : '打招呼introduce: （防检测随机省略，空手打招呼）');
                         await this.broadcast.reply(
                             from,
                             this.bcTypes.SAY_HI,
@@ -1977,8 +2037,26 @@
                     // 如果分数达到阈值，打个招呼
                     if (!decision.discarded && decision.score >= OPTIONS.thread) {
                         if (control.stopped || this.pause) return;
+                        // 防检测：达标岗位按概率随机跳过，打散固定的“达标即投”节奏。
+                        if (antiDetection.enabled() && antiDetection.shouldSkip()) {
+                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机跳过，本次不投递`);
+                            await logAction({
+                                action: 'job_random_skipped',
+                                scene: 'search',
+                                title: jobInfo.title,
+                                company: jobInfo.company,
+                                keyword: currentKeyword,
+                                score: decision.score,
+                                accountId: identity.accountId,
+                                workerId: identity.workerId,
+                            });
+                            return loop();
+                        }
                         runtime.state = 'claiming';
                         runtime.phase = '领取投递权';
+                        // 防检测：投递前随机延时，避免评分完成到领取之间的固定间隔。
+                        await antiDetection.delay();
+                        if (control.stopped || this.pause) return;
                         const claim = await deliveryFlow.claim(api, identity, jobInfo, href);
                         if (claim.reason === 'service_unavailable') {
                             logger.add('投递协调服务不可用，为避免重复投递已跳过');
@@ -2103,24 +2181,33 @@
                             claimToken: claim.claimToken,
                         });
 
-                        logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`);
-                        try {
-                            const generated = await api.generateIntroduce(
-                                claim.claimToken,
-                                jobInfo.company,
-                                jobInfo.title,
-                                jobInfo.salary,
-                                jobInfo.detail
-                            );
-                            decision.introduce = generated.introduce || this.introduce;
-                            decision.introduceGenerated = Boolean(generated.generated);
-                        } catch (err) {
-                            if (isStopError(err)) throw err;
-                            decision.introduce = this.introduce;
+                        // 防检测：按概率随机不带招呼语直接打招呼，模拟真人偶尔空手打招呼的行为。
+                        const skipIntroduce = antiDetection.enabled() && antiDetection.shouldSkipIntroduce();
+                        if (skipIntroduce) {
+                            decision.introduce = '';
                             decision.introduceGenerated = false;
-                            logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`);
+                            decision.omitIntroduce = true;
+                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机策略，本次不携带招呼语`);
+                        } else {
+                            logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`);
+                            try {
+                                const generated = await api.generateIntroduce(
+                                    claim.claimToken,
+                                    jobInfo.company,
+                                    jobInfo.title,
+                                    jobInfo.salary,
+                                    jobInfo.detail
+                                );
+                                decision.introduce = generated.introduce || this.introduce;
+                                decision.introduceGenerated = Boolean(generated.generated);
+                            } catch (err) {
+                                if (isStopError(err)) throw err;
+                                decision.introduce = this.introduce;
+                                decision.introduceGenerated = false;
+                                logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`);
+                            }
                         }
-                        logger.add(`最终招呼语: ${(decision.introduce || '').substring(0, 60)}...`);
+                        logger.add(`最终招呼语: ${(decision.introduce || '（空，直接打招呼）').substring(0, 60)}...`);
                         try {
                             await logAction({
                                 action: 'chat_open_requested',

@@ -1261,14 +1261,12 @@ function normalizedControlState() {
     const policyMap = data.accounts && !Array.isArray(data.accounts) ? data.accounts : {};
     const accountIds = [...new Set([...Object.keys(quotaMap), ...Object.keys(policyMap), ...instances.map((item) => item.accountId).filter(Boolean)])];
     const accounts = Array.isArray(data.accounts) ? data.accounts : accountIds.map((accountId) => ({ accountId, ...(quotaMap[accountId] || {}), ...(policyMap[accountId] || {}) }));
-    const clientDecision = instances.find((item) => item.currentDecision && Object.keys(item.currentDecision).length);
     const queue = controlArray(data.queue || data.jobs).length ? controlArray(data.queue || data.jobs) : instances.flatMap((item) => controlArray(item.queue).map((entry) => ({ workerId: item.workerId, ...entry })));
     const currentKeywords = [...new Set(instances.map((item) => item.keyword).filter(Boolean))];
     return {
         global,
         task,
         instances,
-        decision: data.currentDecision || data.decision || (clientDecision ? { workerId: clientDecision.workerId, ...clientDecision.currentDecision } : null),
         queue,
         keywords: data.keywords || { items: currentKeywords, current: currentKeywords[0] || '' },
         filters: data.filters || {},
@@ -1280,6 +1278,27 @@ function normalizedControlState() {
     };
 }
 
+function decisionMarkup(decision) {
+    if (!decision || !Object.keys(decision).length) {
+        return '<div class="instance-decision empty">暂无正在评分的岗位</div>';
+    }
+    const stars = Number(decision.stars ?? decision.remainingStars ?? 5);
+    const deductions = controlArray(decision.deductions || decision.matches);
+    const deductionRows = deductions.length
+        ? deductions.map((item) => `<div><span>${escapeHtml(item.keyword || item.name || '规则命中')}</span><b>−${Number(item.stars ?? item.deductStars ?? item.value ?? 1)} 星</b></div>`).join('')
+        : '<div><span>未命中扣星规则</span><b>0 星</b></div>';
+    // AI 二次筛选结果：仅在后端启用并回传时展示通过/不通过与原因。
+    let aiRow = '';
+    if (decision.aiFilterEnabled) {
+        const passed = decision.aiPassed === true;
+        const label = passed ? 'AI 通过' : 'AI 不通过';
+        const reason = decision.aiReason ? `：${escapeHtml(decision.aiReason)}` : '';
+        aiRow = `<div class="decision-ai ${passed ? 'pass' : 'fail'}"><span>${label}</span><em>${reason}</em></div>`;
+    }
+    const verdict = decision.discarded ? '准备丢弃' : (decision.state || '评分完成');
+    return `<div class="instance-decision"><div class="instance-decision-head"><span class="decision-company">${escapeHtml(decision.company || '公司未识别')}</span><span class="decision-verdict">${escapeHtml(verdict)}</span></div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div>${aiRow}<div class="decision-deductions">${deductionRows}</div></div>`;
+}
+
 function renderControlInstances(instances) {
     const container = $('#controlInstanceList'); container.replaceChildren();
     const online = instances.filter((item) => item.online !== false && (item.online || item.state !== 'offline')).length;
@@ -1288,17 +1307,9 @@ function renderControlInstances(instances) {
     instances.forEach((item) => {
         const workerId = item.workerId || item.id || '';
         const card = document.createElement('div'); card.className = `control-instance-card ${item.online ? 'online' : ''}`;
-        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong></div><span class="control-instance-state">${escapeHtml(item.phase || item.state || '等待')}</span></div><div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>运行状态<b>${item.paused ? '本地暂停' : '运行中'}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen).slice(11) || '—')}</b></span></div>`;
+        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong></div><span class="control-instance-state">${escapeHtml(item.phase || item.state || '等待')}</span></div><div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>运行状态<b>${item.paused ? '本地暂停' : '运行中'}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen).slice(11) || '—')}</b></span></div>${decisionMarkup(item.currentDecision)}`;
         container.appendChild(card);
     });
-}
-
-function renderCurrentDecision(decision) {
-    const container = $('#currentDecision');
-    if (!decision) { container.className = 'current-decision-empty'; container.textContent = '暂无正在评分的岗位'; $('#decisionState').textContent = '等待岗位'; return; }
-    const stars = Number(decision.stars ?? decision.remainingStars ?? 5), deductions = controlArray(decision.deductions || decision.matches);
-    container.className = 'current-decision'; $('#decisionState').textContent = decision.discarded ? '准备丢弃' : (decision.state || '评分完成');
-    container.innerHTML = `<div class="decision-company">${escapeHtml(decision.company || '公司未识别')}</div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-deductions">${deductions.length ? deductions.map((item) => `<div><span>${escapeHtml(item.keyword || item.name || '规则命中')}</span><b>−${Number(item.stars ?? item.value ?? 1)} 星</b></div>`).join('') : '<div><span>未命中扣星规则</span><b>0 星</b></div>'}</div>`;
 }
 
 function renderAccountQuotas(accounts) {
@@ -1307,7 +1318,7 @@ function renderAccountQuotas(accounts) {
 
 function renderControlCenter() {
     const data = normalizedControlState();
-    renderControlInstances(data.instances); renderCurrentDecision(data.decision); renderAccountQuotas(data.accounts);
+    renderControlInstances(data.instances); renderAccountQuotas(data.accounts);
     renderDailyGoal();
 }
 
@@ -1442,9 +1453,10 @@ async function apiJson(url, options = {}) {
 }
 
 const CONFIG_LABELS = {
-    llm_greeting_enabled: '使用 LLM 生成打招呼语', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
+    llm_greeting_enabled: '使用 LLM 生成打招呼语', scoring_enabled: '启用岗位扣星规则', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
+    antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
 };
 

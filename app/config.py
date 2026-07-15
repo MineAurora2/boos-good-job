@@ -44,6 +44,8 @@ DEFAULT_USER_CONFIG = {
     'resume_name': 'resume.md',
     # 开启时按岗位调用 LLM 生成招呼语；关闭时直接使用 introduce 固定文本。
     'llm_greeting_enabled': True,
+    # 开启时按关键词规则扣星；关闭时所有岗位保持 5 星、不做扣分筛选。
+    'scoring_enabled': True,
     'introduce': '您好，我是一名对 AI 应用开发、自动化流程和工程落地感兴趣的求职者，想进一步了解这个岗位。',
     'character': '简洁 直接 礼貌',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
@@ -70,6 +72,17 @@ DEFAULT_USER_CONFIG = {
         'preloadMaxRounds': 300,
         'preloadActivateCardEvery': 0,
         'preloadActivateCardWaitMs': 250,
+        # 防检测：总开关关闭时下列随机化全部失效，脚本回到确定性行为。
+        'antiDetectionEnabled': False,
+        # 取岗位前打乱本轮岗位顺序，避免固定的从上到下投递节奏。
+        'shuffleJobOrder': True,
+        # 达标岗位按百分比概率随机跳过（0 表示不跳过）。
+        'randomSkipRatio': 0,
+        # 随机不带招呼语直接打招呼的百分比概率（0 表示始终使用招呼语）。
+        'randomNoIntroduceRatio': 0,
+        # 投递前后附加的随机延时区间（毫秒）。
+        'randomDelayMinMs': 0,
+        'randomDelayMaxMs': 0,
     },
     'scoring': {
         'title_deduction_keywords': {
@@ -249,6 +262,7 @@ class Config:
 
     resume_name = USER_CONFIG['resume_name']
     llm_greeting_enabled = USER_CONFIG['llm_greeting_enabled']
+    scoring_enabled = USER_CONFIG['scoring_enabled']
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
@@ -277,6 +291,7 @@ class Config:
         USER_CONFIG = load_user_config()
         cls.resume_name = USER_CONFIG['resume_name']
         cls.llm_greeting_enabled = USER_CONFIG['llm_greeting_enabled']
+        cls.scoring_enabled = USER_CONFIG['scoring_enabled']
         cls.introduce = USER_CONFIG['introduce']
         cls.character = USER_CONFIG['character']
         cls.tags = USER_CONFIG['tags']

@@ -81,9 +81,29 @@ def _find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str, 
     return accepted
 
 
+def _unscored_result(title: str, salary: str, detail: str) -> dict:
+    """扣分规则关闭时的结果：所有岗位保持 5 星、不做任何扣分筛选。"""
+    return {
+        'title': title,
+        'salary': salary,
+        'detail': detail,
+        'matched_field': 'none',
+        'keyword': None,
+        'score': 100,
+        'stars': 5,
+        'rawStars': 5,
+        'deductedStars': 0,
+        'discarded': False,
+        'deductions': [],
+        'reason': '扣分规则已关闭，保持5星',
+    }
+
+
 def evaluate_job_match(job: str) -> dict:
     """从五星开始应用关键词扣星规则，并返回完整评分明细。"""
     title, salary, detail = parse_job_fields(job)
+    if not Config.scoring_enabled:
+        return _unscored_result(title, salary, detail)
     title_matches = _find_matches(title, Config.title_deduction_keywords)
     detail_matches = _find_matches(detail, Config.detail_deduction_keywords)
     title_deduction = sum(stars for _, stars in title_matches)

@@ -83,6 +83,9 @@ async def get_job_score(job: str = Body(..., description='职位信息')):
         'introduce': Config.introduce,
         'introduceGenerated': False,
         'resumeIndex': Config.frontend.get('resumeIndex', 0),
+        'aiFilterEnabled': use_ai_filter,
+        'aiPassed': ai_pass if use_ai_filter else None,
+        'aiReason': ai_reason if use_ai_filter else '',
     }
 
 

@@ -55,6 +55,8 @@ def validate_config(config: dict) -> None:
             raise ValueError(f'{key} 必须是字符串')
     if not isinstance(config.get('llm_greeting_enabled'), bool):
         raise ValueError('llm_greeting_enabled 必须是开关值')
+    if not isinstance(config.get('scoring_enabled'), bool):
+        raise ValueError('scoring_enabled 必须是开关值')
     validate_resume_name(config['resume_name'])
 
     frontend = config['frontend']
@@ -72,6 +74,17 @@ def validate_config(config: dict) -> None:
     for key in ('maxEmptyRounds', 'preloadStableRoundsLimit', 'preloadMaxRounds', 'preloadActivateCardEvery'):
         _validate_number(frontend, key, 0, 10000)
     _validate_number(frontend, 'preloadScrollPixels', 0, 5000)
+
+    # 防检测随机化字段：总开关与打乱开关为布尔，比率 0～100，延时 0～600000 且上限不小于下限。
+    for key in ('antiDetectionEnabled', 'shuffleJobOrder'):
+        if not isinstance(frontend.get(key), bool):
+            raise ValueError(f'{key} 必须是开关值')
+    for key in ('randomSkipRatio', 'randomNoIntroduceRatio'):
+        _validate_number(frontend, key, 0, 100)
+    for key in ('randomDelayMinMs', 'randomDelayMaxMs'):
+        _validate_number(frontend, key, 0, 600000)
+    if frontend['randomDelayMaxMs'] < frontend['randomDelayMinMs']:
+        raise ValueError('randomDelayMaxMs 不能小于 randomDelayMinMs')
 
     backend = config['backend']
     _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)
@@ -124,8 +137,13 @@ def save_config(payload: dict) -> dict:
     # 管理页提交完整表单，因此直接替换；若递归合并，已删除的扣星关键词会被旧值恢复。
     merged = copy.deepcopy(incoming)
     merged.pop('resume_content', None)
-    # 兼容尚未提交新开关字段的旧版管理页面，升级后默认维持原有 LLM 行为。
+    # 兼容尚未提交新开关字段的旧版管理页面，升级后默认维持原有行为。
     merged.setdefault('llm_greeting_enabled', config.DEFAULT_USER_CONFIG['llm_greeting_enabled'])
+    merged.setdefault('scoring_enabled', config.DEFAULT_USER_CONFIG['scoring_enabled'])
+    # 旧版前端可能不提交新增的防检测字段，用默认值补齐后再校验，避免误判为缺字段。
+    if isinstance(merged.get('frontend'), dict):
+        for key, default in config.DEFAULT_USER_CONFIG['frontend'].items():
+            merged['frontend'].setdefault(key, default)
     if isinstance(merged.get('tags'), list):
         merged['tags'] = [tag.strip() if isinstance(tag, str) else tag for tag in merged['tags']]
     # 大模型接口已迁移到 .env，绝不写回 user_config.json。
