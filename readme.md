@@ -1,4 +1,4 @@
-# goodjob
+# boos-goodjob
 
 原项目：https://github.com/czc6666/czc-good-job
 
