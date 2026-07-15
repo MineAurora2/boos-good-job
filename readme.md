@@ -38,6 +38,77 @@
 - 连续多轮没有新岗位时自动切换关键词继续挂机
 - 遇到超时、详情异常、打招呼异常时自动恢复
 
+## 系统架构
+
+```mermaid
+flowchart LR
+    User[用户] --> Boss[Boss 直聘网页]
+    User --> Dashboard[统计与管理面板]
+
+    subgraph Browser[浏览器端]
+        Boss --> Script[Tampermonkey 脚本<br/>web_script.js]
+        Script --> Search[关键词轮换与岗位扫描]
+        Script --> Chat[聊天页操作<br/>发送招呼语与简历]
+        Search <-->|BroadcastChannel / localStorage| Chat
+    end
+
+    subgraph Backend[本地 FastAPI 服务 :47999]
+        API[HTTP API<br/>routes/delivery.py<br/>routes/control.py]
+        Score[规则评分引擎<br/>app/scoring.py]
+        Runtime[运行监控与控制中心<br/>app/runtime.py]
+        LLMManager[LLM 接入管理器<br/>多接口调度与故障回退]
+        Aggregator[仪表盘数据聚合<br/>dashboard_data.py]
+
+        API --> Score
+        API --> Runtime
+        API --> LLMManager
+        API --> Aggregator
+    end
+
+    subgraph AI[外部 AI 服务]
+        LLM[OpenAI 兼容 LLM API<br/>岗位筛选 / 定制招呼语]
+    end
+
+    subgraph Storage[本地配置与数据存储]
+        Config[user_config.json / .env<br/>运行参数与 LLM 配置]
+        Resume[resumes/<br/>本地简历]
+        DB[(delivery_state.db<br/>投递状态 / 去重 / 每日配额)]
+        Logs[(JSONL 日志<br/>动作 / 评分 / AI 筛选)]
+        ControlState[control_center_state.json<br/>安全开关与账号策略]
+        Prompts[prompt_overrides.json<br/>提示词覆盖]
+    end
+
+    Script <-->|岗位评分、领取令牌、状态更新| API
+    Script -->|心跳、日志、错误| Runtime
+    Runtime -->|暂停、恢复、停止、仅扫描| Script
+
+    LLMManager <-->|兼容 OpenAI API| LLM
+    LLMManager --> Resume
+    LLMManager --> Prompts
+
+    API --> Config
+    API <--> DB
+    API --> Logs
+    Runtime <--> ControlState
+    Aggregator --> DB
+    Aggregator --> Logs
+
+    Dashboard <-->|统计、配置、简历、LLM 与运行控制 API| API
+    Dashboard -->|静态页面| User
+
+    classDef browser fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef backend fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef ai fill:#f3e8ff,stroke:#9333ea,color:#581c87;
+    classDef storage fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    classDef control fill:#cffafe,stroke:#0891b2,color:#164e63;
+
+    class Boss,Script,Search,Chat browser;
+    class API,Score,LLMManager,Aggregator backend;
+    class LLM ai;
+    class Config,Resume,DB,Logs,ControlState,Prompts storage;
+    class Dashboard,Runtime control;
+```
+
 ## 投递流程（UML）
 
 
