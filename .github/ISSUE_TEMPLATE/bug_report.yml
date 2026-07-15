@@ -1,0 +1,150 @@
+name: "错误报告 / Bug Report"
+description: "报告可复现的异常、投递错误或功能故障"
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进 goodjob。提交前请先搜索已有 Issue，避免重复报告。
+
+        > [!WARNING]
+        > 请务必删除 API Key、Cookie、Token、手机号、真实简历内容、聊天记录和其他个人信息。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前检查
+      options:
+        - label: "我已搜索现有 Issue，确认没有重复报告。"
+          required: true
+        - label: "我已尝试使用最新代码，或已在下方说明无法升级的原因。"
+          required: true
+        - label: "我已对日志、截图和配置中的敏感信息进行脱敏。"
+          required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: 问题所在模块
+      description: 选择最接近的模块。
+      options:
+        - 浏览器脚本：岗位搜索、扫描或关键词轮换
+        - 浏览器脚本：打招呼、聊天或简历发送
+        - 本地后端：启动、HTTP API 或数据存储
+        - 管理面板：统计、配置、简历或运行控制
+        - 岗位评分、筛选或去重
+        - LLM 接口、AI 筛选或 AI 打招呼
+        - 多账号、配额或运行状态
+        - 安装、升级或配置
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 请简洁说明发生了什么，以及它对投递流程的影响。
+      placeholder: 例如：岗位达到评分阈值后，脚本重复发送了打招呼。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 请提供能稳定复现问题的最小步骤。
+      placeholder: |
+        1. 启动 `python main.py`
+        2. 在管理面板中开启……
+        3. 打开 Boss 直聘的……页面
+        4. 执行……后出现问题
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      placeholder: 你认为正确的结果应该是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      placeholder: 实际出现了什么？如有错误提示，请完整填写。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 复现频率
+      options:
+        - 每次都会出现
+        - 经常出现
+        - 偶尔出现
+        - 仅出现过一次
+        - 暂时无法复现
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: 影响程度
+      options:
+        - 紧急：可能造成误投、重复投递、错误发送消息或隐私泄露
+        - 严重：主要流程无法使用，且没有可行的规避方法
+        - 一般：部分功能失效，但存在规避方法
+        - 轻微：界面、统计或其他小问题
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 项目版本
+      description: 填写 Git 提交号、Release 版本或代码获取日期。
+      placeholder: 例如：main@a1b2c3d 或 2026-07-15 拉取的最新代码
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 不适用的项可填“无”。
+      value: |
+        - 操作系统：
+        - Python 版本：
+        - 浏览器及版本：
+        - Tampermonkey 版本：
+        - 是否使用 LLM：
+        - LLM 提供商/模型（请勿填写 API Key）：
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 相关配置
+      description: 仅粘贴与问题相关的最小配置，并删除密钥、代理凭据和个人信息。
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或错误信息
+      description: 可提供后端终端、浏览器控制台或 JSONL 日志中与问题相关的片段，请先脱敏。
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充信息
+      description: 可添加已脱敏的截图、录屏、临时规避方法或其他线索。

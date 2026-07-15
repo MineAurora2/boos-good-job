@@ -1,0 +1,111 @@
+name: "功能建议 / Feature Request"
+description: "建议新功能、体验改进或工程优化"
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你为 goodjob 提出建议。请尽量先描述真实使用场景和要解决的问题，再说明你期望的方案。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前检查
+      options:
+        - label: "我已搜索现有 Issue，确认没有重复建议。"
+          required: true
+        - label: "该建议与本项目的岗位筛选、投递自动化、管理面板或本地服务相关。"
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 建议类型
+      options:
+        - 浏览器自动化与投递流程
+        - 岗位匹配、评分、筛选或去重
+        - LLM 接入、AI 筛选或招呼语生成
+        - 统计、管理面板或可视化
+        - 多账号、配额或运行控制
+        - 配置、安装、升级或部署
+        - 性能、稳定性或可观测性
+        - 隐私、安全或风险控制
+        - 文档、测试或开发体验
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与问题
+      description: 你在什么情况下遇到了什么不便？现在是如何处理的？
+      placeholder: 例如：同时管理多个账号时，无法快速看出哪个账号已接近当日配额。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的解决方案
+      description: 请说明期望的功能、交互或配置方式。
+      placeholder: 例如：在运行监控页按账号显示已用配额、剩余配额和预警状态。
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: 期望的使用流程
+      description: 可用步骤、伪配置或简单示例描述这个功能如何工作。
+      placeholder: |
+        1. 用户在……中开启功能
+        2. 系统在……时执行……
+        3. 用户可在……中查看或撤销结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 可选方案
+      description: 你是否考虑过其他解决方式？为什么它们不够理想？
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 什么情况下可以认为这个功能已完成？
+      placeholder: |
+        - [ ] 可以……
+        - [ ] 当……时不会……
+        - [ ] 状态可在……中查看
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: 影响与风险
+      description: 请说明是否影响自动投递、消息发送、每日配额、个人信息、数据兼容性或第三方 LLM 费用。
+      placeholder: 例如：默认关闭；开启后仅扫描不自动发送；不上传简历原文。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: 是否愿意参与实现
+      options:
+        - 愿意提交 Pull Request
+        - 可以协助测试
+        - 可以补充需求和反馈
+        - 暂时无法参与
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充信息
+      description: 可附上草图、参考链接、类似实现或其他背景。
