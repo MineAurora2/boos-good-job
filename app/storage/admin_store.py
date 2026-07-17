@@ -85,6 +85,10 @@ def validate_config(config: dict) -> None:
         _validate_number(frontend, key, 0, 600000)
     if frontend['randomDelayMaxMs'] < frontend['randomDelayMinMs']:
         raise ValueError('randomDelayMaxMs 不能小于 randomDelayMinMs')
+    if not isinstance(frontend.get('hrActiveFilterEnabled'), bool):
+        raise ValueError('hrActiveFilterEnabled 必须是开关值')
+    if frontend.get('hrActiveMinLevel') not in {'online', 'just_now', 'today', 'within_3_days', 'this_week', 'this_month'}:
+        raise ValueError('hrActiveMinLevel 不是有效的活跃档位')
 
     backend = config['backend']
     _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-14-llm-polling.1
+// @version      2026-07-17-userscript-cleanup.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -12,7 +12,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-14-llm-polling.1';
+    const SCRIPT_VERSION = '2026-07-17-userscript-cleanup.1';
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
@@ -245,6 +245,8 @@
         randomNoIntroduceRatio: 0, // 随机不带招呼语直接打招呼的百分比（0 表示始终使用招呼语）
         randomDelayMinMs: 0, // 投递前后随机延时下限
         randomDelayMaxMs: 0, // 投递前后随机延时上限
+        hrActiveFilterEnabled: false, // 是否按 HR 活跃状态过滤
+        hrActiveMinLevel: 'this_month', // 最低 HR 活跃档位
     };
 
     // 元素选择器
@@ -269,6 +271,7 @@
                 LOCATION: '.job-location .location-address, .location-address, .job-address-desc', // 工作地点
                 QUALIFICATION_TAGS: '.job-primary .job-tags span, .job-banner .job-tags span, .job-info .job-tags span, .tag-list li', // 经验学历标签
                 INDUSTRY: '.company-info a[href*="industry"], .sider-company a[href*="industry"], a[ka*="industry"]', // 公司行业
+                BOSS_ACTIVE: '.job-boss-info h2.name .boss-online-tag, .job-boss-info h2.name .boss-active-time', // HR 当前在线或历史活跃状态
             },
             CHAT: {
                 // 聊天
@@ -561,10 +564,19 @@
         },
         // 受总开关约束的可中断随机延时；关闭或区间为 0 时不等待。
         // 不接收调用方标签，交由 asyncSleep 使用默认的 runtimeLifecycle.signal，保证停止时可中断。
-        async delay() {
-            if (!this.enabled()) return;
+        async delay(shouldInterrupt = null) {
+            if (!this.enabled()) return true;
             const ms = this.randomDelayMs();
-            if (ms > 0) await tools.asyncSleep(ms);
+            if (ms <= 0) return true;
+            let remaining = ms;
+            while (remaining > 0) {
+                runtimeLifecycle.guard();
+                if (typeof shouldInterrupt === 'function' && shouldInterrupt()) return false;
+                const slice = Math.min(200, remaining);
+                await tools.asyncSleep(slice);
+                remaining -= slice;
+            }
+            return !(typeof shouldInterrupt === 'function' && shouldInterrupt());
         },
         // 达标岗位是否按概率随机跳过（调用方已确认总开关开启）。
         shouldSkip() {
@@ -575,6 +587,35 @@
             return this.roll(OPTIONS.randomNoIntroduceRatio);
         },
     };
+
+    const HR_ACTIVE_LEVELS = Object.freeze({
+        unknown: 0,
+        this_month: 1,
+        this_week: 2,
+        within_3_days: 3,
+        today: 4,
+        just_now: 5,
+        online: 6,
+    });
+
+    function normalizeHrActive(value) {
+        const text = String(value || '').replace(/\s+/g, '').trim();
+        if (!text) return 'unknown';
+        if (/^(当前在线|刚刚在线|在线)$/.test(text)) return 'online';
+        if (/刚刚活跃|刚活跃/.test(text)) return 'just_now';
+        if (/今日活跃/.test(text)) return 'today';
+        if (/3日内活跃|3天内活跃/.test(text)) return 'within_3_days';
+        if (/本周活跃/.test(text)) return 'this_week';
+        if (/本月活跃/.test(text)) return 'this_month';
+        return 'unknown';
+    }
+
+    function hrActivePasses(level) {
+        if (!OPTIONS.hrActiveFilterEnabled || level === 'unknown') return true;
+        const actual = HR_ACTIVE_LEVELS[level] ?? 0;
+        const minimum = HR_ACTIVE_LEVELS[OPTIONS.hrActiveMinLevel] ?? HR_ACTIVE_LEVELS.this_month;
+        return actual >= minimum;
+    }
 
     // 每个浏览器配置文件拥有独立 workerId；accountId 可通过油猴菜单设置。
     const deliveryIdentity = {
@@ -1321,7 +1362,7 @@
             // 记录职位链接
             let jobHrefs = [];
             let elsLen = 0;
-            // 缓存
+            // 运行状态
             let started = false;
             let pendingRoundRestart = false;
             let roundTransitioning = false;
@@ -1492,7 +1533,18 @@
                 // 接收聊天页的消息提醒
                 this.broadcast.on(this.bcTypes.STATUS, (from, data) => {
                     if (from === this.targets.chat) {
-                        logger.add(data);
+                        if (data && typeof data === 'object') {
+                            if (data.message) logger.add(data.message);
+                            if (data.currentDecision && typeof data.currentDecision === 'object') {
+                                runtime.currentDecision = data.currentDecision;
+                                runtime.currentJob = data.currentJob || data.currentDecision.title || runtime.currentJob;
+                                runtime.state = data.state || runtime.state;
+                                runtime.phase = data.phase || runtime.phase;
+                                sendRuntimeHeartbeat().catch(() => null);
+                            }
+                        } else {
+                            logger.add(data);
+                        }
                     }
                 });
                 // 发送自我介绍
@@ -1837,6 +1889,8 @@
                         runtime.counters.sent += 1;
                         runtime.state = 'sent';
                         runtime.phase = '打招呼成功';
+                        runtime.currentDecision.decisionState = 'sent';
+                        runtime.currentDecision.decisionReason = '';
                         if (finalClaimToken) {
                             await api.markDelivery(finalClaimToken, 'sent').catch((e) => {
                                 console.log('markDelivery sent failed', e);
@@ -1849,6 +1903,9 @@
                             company: finalCompany,
                             claimToken: finalClaimToken,
                             resumeIndex: finalDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                            greetingMode: finalDecision?.greetingMode || 'fixed',
+                            hrActive: runtime.currentDecision.hrActive || '',
+                            hrActiveLevel: runtime.currentDecision.hrActiveLevel || 'unknown',
                         });
                     }
                     // 出错了
@@ -1857,6 +1914,8 @@
                         runtime.counters.failed += 1;
                         runtime.state = 'error';
                         runtime.phase = '打招呼失败';
+                        runtime.currentDecision.decisionState = 'failed';
+                        runtime.currentDecision.decisionReason = data.reason || '打招呼失败';
                         if (finalClaimToken) {
                             await api.markDelivery(finalClaimToken, 'failed_unknown', 'chat_greet_failed').catch((e) => {
                                 console.log('markDelivery failed_unknown failed', e);
@@ -1869,8 +1928,14 @@
                             company: finalCompany,
                             claimToken: finalClaimToken,
                             resumeIndex: finalDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                            greetingMode: finalDecision?.greetingMode || 'fixed',
+                            hrActive: runtime.currentDecision.hrActive || '',
+                            hrActiveLevel: runtime.currentDecision.hrActiveLevel || 'unknown',
                         });
                     }
+                    await sendRuntimeHeartbeat();
+                    await antiDetection.delay(() => control.stopped || this.pause);
+                    if (control.stopped || this.pause) return;
                     loop();
                 });
             };
@@ -1991,24 +2056,17 @@
                         });
                         return loop();
                     }
-                    const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
-                    if (duplicateCheck.unavailable) {
-                        logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位');
-                        return loop();
-                    }
-                    if (duplicateCheck.greeted) {
-                        const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
-                        logger.add(duplicateMessage);
-                        console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                        return loop();
-                    }
                     // 否则发送消息计算匹配度
                     logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`);
                     runtime.state = 'evaluating';
                     runtime.phase = '岗位匹配评分';
                     const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
+                    const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
+                    const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
+                    const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
                     runtime.currentDecision = {
                         workerId: identity.workerId,
+                        accountId: identity.accountId,
                         company: jobInfo.company || '',
                         title: jobInfo.title || '',
                         stars: decision.stars ?? decision.score / 20,
@@ -2017,6 +2075,17 @@
                         discarded: Boolean(decision.discarded),
                         score: decision.score,
                         deductions: decision.deductions || decision.matches || [],
+                        scoringEnabled: decision.scoringEnabled !== false,
+                        aiFilterEnabled: Boolean(decision.aiFilterEnabled),
+                        aiPassed: decision.aiPassed ?? null,
+                        aiReason: decision.aiReason || '',
+                        hrActive: jobInfo.hrActive || '',
+                        hrActiveLevel: jobInfo.hrActiveLevel || 'unknown',
+                        hrActivePassed,
+                        finalPassed: rulePassed && aiPassed && hrActivePassed,
+                        decisionState: 'evaluating',
+                        decisionReason: '',
+                        greetingMode: '',
                     };
                     logger.add(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`);
                     logDecisionDeductions(decision, (message) => logger.add(message));
@@ -2033,13 +2102,56 @@
                         keyword: currentKeyword,
                         score: decision.score,
                         resumeIndex: decision.resumeIndex,
+                        hrActive: jobInfo.hrActive,
+                        hrActiveLevel: jobInfo.hrActiveLevel,
+                        aiFilterEnabled: Boolean(decision.aiFilterEnabled),
+                        aiPassed: decision.aiPassed ?? null,
+                        aiReason: decision.aiReason || '',
                     });
+                    await sendRuntimeHeartbeat();
+
+                    if (!hrActivePassed) {
+                        runtime.state = 'running';
+                        runtime.phase = 'HR 活跃筛选未通过';
+                        runtime.currentDecision.decisionState = 'hr_filtered';
+                        runtime.currentDecision.decisionReason = `HR 活跃档位低于 ${OPTIONS.hrActiveMinLevel}`;
+                        runtime.currentDecision.finalPassed = false;
+                        await sendRuntimeHeartbeat();
+                        await logAction({
+                            action: 'job_hr_filtered',
+                            scene: 'search',
+                            title: jobInfo.title,
+                            company: jobInfo.company,
+                            hrActive: jobInfo.hrActive,
+                            hrActiveLevel: jobInfo.hrActiveLevel,
+                            hrActiveMinLevel: OPTIONS.hrActiveMinLevel,
+                            accountId: identity.accountId,
+                            workerId: identity.workerId,
+                        });
+                        return loop();
+                    }
+
+                    if (!aiPassed) {
+                        runtime.currentDecision.decisionState = 'ai_rejected';
+                        runtime.currentDecision.decisionReason = decision.aiReason || 'AI 判断未通过';
+                        runtime.currentDecision.finalPassed = false;
+                    } else if (!rulePassed) {
+                        runtime.currentDecision.decisionState = 'below_threshold';
+                        runtime.currentDecision.decisionReason = decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`;
+                        runtime.currentDecision.finalPassed = false;
+                    }
+                    if (!runtime.currentDecision.finalPassed) await sendRuntimeHeartbeat();
+
                     // 如果分数达到阈值，打个招呼
-                    if (!decision.discarded && decision.score >= OPTIONS.thread) {
+                    if (rulePassed && aiPassed) {
                         if (control.stopped || this.pause) return;
                         // 防检测：达标岗位按概率随机跳过，打散固定的“达标即投”节奏。
                         if (antiDetection.enabled() && antiDetection.shouldSkip()) {
                             logger.add(`职位 [${jobInfo.title}] 命中防检测随机跳过，本次不投递`);
+                            runtime.currentDecision.decisionState = 'random_skipped';
+                            runtime.currentDecision.decisionReason = '命中随机跳过策略';
+                            runtime.currentDecision.finalPassed = false;
+                            await sendRuntimeHeartbeat();
                             await logAction({
                                 action: 'job_random_skipped',
                                 scene: 'search',
@@ -2049,13 +2161,30 @@
                                 score: decision.score,
                                 accountId: identity.accountId,
                                 workerId: identity.workerId,
+                                hrActive: jobInfo.hrActive,
+                                hrActiveLevel: jobInfo.hrActiveLevel,
                             });
+                            return loop();
+                        }
+                        const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
+                        if (duplicateCheck.unavailable) {
+                            logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位');
+                            return loop();
+                        }
+                        if (duplicateCheck.greeted) {
+                            const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
+                            logger.add(duplicateMessage);
+                            console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
                             return loop();
                         }
                         runtime.state = 'claiming';
                         runtime.phase = '领取投递权';
+                        runtime.currentDecision.decisionState = 'claiming';
+                        runtime.currentDecision.decisionReason = '';
+                        await sendRuntimeHeartbeat();
                         // 防检测：投递前随机延时，避免评分完成到领取之间的固定间隔。
-                        await antiDetection.delay();
+                        const beforeClaimReady = await antiDetection.delay(() => control.stopped || this.pause);
+                        if (!beforeClaimReady) return;
                         if (control.stopped || this.pause) return;
                         const claim = await deliveryFlow.claim(api, identity, jobInfo, href);
                         if (claim.reason === 'service_unavailable') {
@@ -2095,6 +2224,8 @@
                                 existingStatus: claim.existing?.status || '',
                                 accountId: identity.accountId,
                                 workerId: identity.workerId,
+                                hrActive: jobInfo.hrActive,
+                                hrActiveLevel: jobInfo.hrActiveLevel,
                             });
                             if (claim.reason === 'daily_limit') return;
                             return loop();
@@ -2112,6 +2243,15 @@
 
                         logger.add(`职位 [${jobInfo.title}] 已通过全部筛选条件，准备进入发送队列`);
                         logger.add(`账号 [${identity.accountId}] 今日占用 ${claim.count}/${claim.limit}，剩余 ${claim.remaining} 次`);
+
+                        // 领取成功后再随机等待一次，避免领取与 BOSS 沟通动作之间形成固定间隔。
+                        const beforeQueueReady = await antiDetection.delay(() => control.stopped || this.pause);
+                        if (!beforeQueueReady) {
+                            await api.releaseDelivery(claim.claimToken, 'control_interrupted_before_queue').catch(() => null);
+                            activeReservedClaimToken = '';
+                            activeClaimPhase = '';
+                            return;
+                        }
 
                         try {
                             await addToChatList(jobInfo.addUrl);
@@ -2141,6 +2281,8 @@
                                 accountId: identity.accountId,
                                 workerId: identity.workerId,
                                 claimToken: claim.claimToken,
+                                hrActive: jobInfo.hrActive,
+                                hrActiveLevel: jobInfo.hrActiveLevel,
                             });
                             clearPendingGreet();
                             return loop();
@@ -2162,6 +2304,8 @@
                         runtime.counters.queued += 1;
                         runtime.state = 'queued';
                         runtime.phase = '已进入投递队列';
+                        runtime.currentDecision.decisionState = 'queued';
+                        runtime.currentDecision.decisionReason = '';
                         await logAction({
                             action: 'greet_queued',
                             scene: 'search',
@@ -2179,6 +2323,8 @@
                             accountId: identity.accountId,
                             workerId: identity.workerId,
                             claimToken: claim.claimToken,
+                            hrActive: jobInfo.hrActive,
+                            hrActiveLevel: jobInfo.hrActiveLevel,
                         });
 
                         // 防检测：按概率随机不带招呼语直接打招呼，模拟真人偶尔空手打招呼的行为。
@@ -2187,6 +2333,7 @@
                             decision.introduce = '';
                             decision.introduceGenerated = false;
                             decision.omitIntroduce = true;
+                            decision.greetingMode = 'none';
                             logger.add(`职位 [${jobInfo.title}] 命中防检测随机策略，本次不携带招呼语`);
                         } else {
                             logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`);
@@ -2200,13 +2347,17 @@
                                 );
                                 decision.introduce = generated.introduce || this.introduce;
                                 decision.introduceGenerated = Boolean(generated.generated);
+                                decision.greetingMode = generated.generated ? 'llm' : 'fixed';
                             } catch (err) {
                                 if (isStopError(err)) throw err;
                                 decision.introduce = this.introduce;
                                 decision.introduceGenerated = false;
+                                decision.greetingMode = 'fixed';
                                 logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`);
                             }
                         }
+                        runtime.currentDecision.greetingMode = decision.greetingMode || 'fixed';
+                        await sendRuntimeHeartbeat();
                         logger.add(`最终招呼语: ${(decision.introduce || '（空，直接打招呼）').substring(0, 60)}...`);
                         try {
                             await logAction({
@@ -2218,6 +2369,9 @@
                                 accountId: identity.accountId,
                                 workerId: identity.workerId,
                                 claimToken: claim.claimToken,
+                                greetingMode: decision.greetingMode || 'fixed',
+                                hrActive: jobInfo.hrActive,
+                                hrActiveLevel: jobInfo.hrActiveLevel,
                             });
                             armPendingGreet(jobInfo.title, decision, jobInfo.company, claim.claimToken);
                             const greetWindow = tools.openTabNSetTimestamp(jobInfo.chatUrl, this.targets.chatGreet);
@@ -2258,6 +2412,8 @@
                             score: decision.score,
                             threshold: OPTIONS.thread,
                             resumeIndex: decision.resumeIndex,
+                            hrActive: jobInfo.hrActive,
+                            hrActiveLevel: jobInfo.hrActiveLevel,
                         });
                         loop();
                     }
@@ -2408,7 +2564,6 @@
                     this.introduce = await api.getIntroduce();
                     logger.add('获取自我介绍成功(旧接口)');
                 }
-                // 检查每日打招呼限制
                 try {
                     const daily = await api.checkDailyLimit(identity.accountId);
                     logger.add(`今日已打招呼 ${daily.count}/${daily.limit}，剩余 ${daily.remaining} 次`);
@@ -2460,6 +2615,10 @@
                 const education = qualificationTexts.find(text => /学历|初中|高中|中专|大专|本科|硕士|博士/.test(text)) || '';
                 const industryEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.INDUSTRY);
                 const industry = industryEl ? industryEl.innerText.trim() : '';
+                const hrActiveEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.BOSS_ACTIVE);
+                const hrActiveRaw = hrActiveEl ? hrActiveEl.innerText.trim() : '';
+                const hrActiveLevel = normalizeHrActive(hrActiveRaw);
+                const hrActive = hrActiveLevel === 'online' ? '当前在线' : hrActiveRaw;
                 const city = tools.extractCity(location);
                 const actionText = chatBtn ? chatBtn.innerText.trim() : '';
                 const chatUrl = chatBtn && chatBtn.getAttribute(SELECTORS.ZHIPIN.DETAIL.CHATURL);
@@ -2488,6 +2647,8 @@
                     industry,
                     experience,
                     education,
+                    hrActive,
+                    hrActiveLevel,
                     actionText,
                     chatUrl,
                     addUrl,
@@ -2651,7 +2812,12 @@
                     );
                     if (greetDecision?.cancelled) throw new ScriptStoppedError('greet_session_cancelled');
                     const introduce = greetDecision.introduce;
-                    await sendMsg(introduce, (msg) => console.log('[sayHi]', msg));
+                    // “不使用回复语”表示只保留此前已完成的立即沟通动作，不向输入框发送空字符串。
+                    if (introduce) {
+                        await sendMsg(introduce, (msg) => console.log('[sayHi]', msg));
+                    } else {
+                        console.log('[sayHi] 已按随机策略省略招呼语文本');
+                    }
                     await this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
                         success: true,
                         greetId: session.greetId,
@@ -2836,6 +3002,19 @@
                     text
                 ).catch(() => null);
             };
+            const publishDecision = (currentJob, currentDecision, phase = '聊天岗位匹配评分') => {
+                if (runtimeLifecycle.isStopping() || !this.broadcast) return;
+                this.broadcast.send(
+                    this.targets.search,
+                    this.bcTypes.STATUS,
+                    {
+                        currentJob,
+                        currentDecision,
+                        state: 'evaluating',
+                        phase,
+                    }
+                ).catch(() => null);
+            };
             // 分割线
             const divider = () => {
                 logger && logger.divider();
@@ -2849,6 +3028,8 @@
                 const identity = deliveryIdentity.get();
                 // 开始广播
                 startBroadcast(this.targets.chat);
+                const clientConfig = await api.getClientConfig().catch(() => null);
+                if (clientConfig?.frontend) Object.assign(OPTIONS, clientConfig.frontend);
                 // 获取默认自我介绍（兜底）
                 const defaultIntroduce = (await this.broadcast.sendAndReceive(
                     this.targets.search,
@@ -2912,20 +3093,39 @@
                                     status(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`);
                                     continue;
                                 }
-                                const duplicateCheck = await deliveryFlow.precheck(api, company, jobInfo.title);
-                                if (duplicateCheck.unavailable) {
-                                    status('重复投递检查服务不可用，为安全起见已跳过本岗位');
-                                    continue;
-                                }
-                                if (duplicateCheck.greeted) {
-                                    const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
-                                    status(duplicateMessage);
-                                    console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                                    continue;
-                                }
                                 // 获取职位匹配度
                                 status(`开始计算职位 [${jobInfo.title}] 的匹配度`);
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
+                                const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
+                                const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
+                                const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                                publishDecision(jobInfo.title, {
+                                    workerId: identity.workerId,
+                                    accountId: identity.accountId,
+                                    company,
+                                    title: jobInfo.title || '',
+                                    stars: decision.stars ?? decision.score / 20,
+                                    rawStars: decision.rawStars,
+                                    deductedStars: decision.deductedStars ?? 0,
+                                    discarded: Boolean(decision.discarded),
+                                    score: decision.score,
+                                    deductions: decision.deductions || decision.matches || [],
+                                    scoringEnabled: decision.scoringEnabled !== false,
+                                    aiFilterEnabled: Boolean(decision.aiFilterEnabled),
+                                    aiPassed: decision.aiPassed ?? null,
+                                    aiReason: decision.aiReason || '',
+                                    hrActive: jobInfo.hrActive || '',
+                                    hrActiveLevel: jobInfo.hrActiveLevel || 'unknown',
+                                    hrActivePassed,
+                                    finalPassed: rulePassed && aiPassed && hrActivePassed,
+                                    decisionState: !hrActivePassed
+                                        ? 'hr_filtered'
+                                        : (!aiPassed ? 'ai_rejected' : (!rulePassed ? 'below_threshold' : 'evaluating')),
+                                    decisionReason: !hrActivePassed
+                                        ? `HR 活跃档位低于 ${OPTIONS.hrActiveMinLevel}`
+                                        : (!aiPassed ? (decision.aiReason || 'AI 判断未通过') : (!rulePassed ? (decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`) : '')),
+                                    greetingMode: '',
+                                });
                                 status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`);
                                 logDecisionDeductions(decision, (message) => status(message));
                                 await logAction({
@@ -2940,9 +3140,39 @@
                                     education: jobInfo.education,
                                     score: decision.score,
                                     resumeIndex: decision.resumeIndex,
+                                    hrActive: jobInfo.hrActive,
+                                    hrActiveLevel: jobInfo.hrActiveLevel,
+                                    aiFilterEnabled: Boolean(decision.aiFilterEnabled),
+                                    aiPassed: decision.aiPassed ?? null,
+                                    aiReason: decision.aiReason || '',
                                 });
+                                if (!hrActivePassed) {
+                                    status(`HR 活跃档位 [${jobInfo.hrActive || '未知'}] 未达到投递阈值`);
+                                    continue;
+                                }
                                 // 如果分数达到阈值并且未聊过天，打个招呼
-                                if (!decision.discarded && decision.score >= OPTIONS.thread && !chatInfo.msgs.length) {
+                                if (rulePassed && aiPassed && !chatInfo.msgs.length) {
+                                    if (antiDetection.enabled() && antiDetection.shouldSkip()) {
+                                        status(`职位 [${jobInfo.title}] 命中随机跳过策略`);
+                                        await logAction({
+                                            action: 'job_random_skipped', scene: 'chat', title: jobInfo.title, company,
+                                            score: decision.score, accountId: identity.accountId, workerId: identity.workerId,
+                                            hrActive: jobInfo.hrActive, hrActiveLevel: jobInfo.hrActiveLevel,
+                                        });
+                                        continue;
+                                    }
+                                    const duplicateCheck = await deliveryFlow.precheck(api, company, jobInfo.title);
+                                    if (duplicateCheck.unavailable) {
+                                        status('重复投递检查服务不可用，为安全起见已跳过本岗位');
+                                        continue;
+                                    }
+                                    if (duplicateCheck.greeted) {
+                                        const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
+                                        status(duplicateMessage);
+                                        console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
+                                        continue;
+                                    }
+                                    if (!await antiDetection.delay()) continue;
                                     const claim = await deliveryFlow.claim(
                                         api,
                                         identity,
@@ -2967,9 +3197,17 @@
                                     }
                                     activeChatClaimToken = claim.claimToken;
                                     activeChatMessageStarted = false;
-                                    status(`职位 [${jobInfo.title}] 已通过全部条件，最后生成招呼语`);
+                                    if (!await antiDetection.delay()) continue;
+                                    const omitIntroduce = antiDetection.enabled() && antiDetection.shouldSkipIntroduce();
+                                    status(omitIntroduce
+                                        ? `职位 [${jobInfo.title}] 命中随机省略回复语策略`
+                                        : `职位 [${jobInfo.title}] 已通过全部条件，最后生成招呼语`);
                                     let finalIntroduce = defaultIntroduce;
+                                    let greetingMode = omitIntroduce ? 'none' : 'fixed';
                                     try {
+                                        if (omitIntroduce) {
+                                            finalIntroduce = '';
+                                        } else {
                                         const generated = await api.generateIntroduce(
                                             claim.claimToken,
                                             company,
@@ -2978,13 +3216,17 @@
                                             jobInfo.detail
                                         );
                                         finalIntroduce = generated.introduce || defaultIntroduce;
+                                        greetingMode = generated.generated ? 'llm' : 'fixed';
+                                        }
                                     } catch (e) {
                                         if (isStopError(e)) throw e;
                                         status(`定制招呼语生成失败，使用固定招呼语: ${e}`);
                                     }
                                     try {
-                                        activeChatMessageStarted = true;
-                                        await sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`));
+                                        if (finalIntroduce) {
+                                            activeChatMessageStarted = true;
+                                            await sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`));
+                                        }
                                         await api.markDelivery(claim.claimToken, 'sent', '', { allowDuringStop: true });
                                         activeChatClaimToken = '';
                                         activeChatMessageStarted = false;
@@ -3003,8 +3245,12 @@
                                             accountId: identity.accountId,
                                             workerId: identity.workerId,
                                             claimToken: claim.claimToken,
+                                            greetingMode,
+                                            hrActive: jobInfo.hrActive,
+                                            hrActiveLevel: jobInfo.hrActiveLevel,
                                         });
                                         status(`打招呼成功`);
+                                        await antiDetection.delay();
                                     } catch (e) {
                                         await api.markDelivery(claim.claimToken, 'failed_unknown', String(e), { allowDuringStop: true }).catch(() => null);
                                         activeChatClaimToken = '';
@@ -3025,7 +3271,7 @@
                                     continue;
                                 }
                                 // 未达到阈值，直接下一个
-                                else if (decision.discarded || decision.score < OPTIONS.thread) {
+                                else if (!rulePassed || !aiPassed) {
                                     await logAction({
                                         action: 'chat_rejected_below_threshold',
                                         scene: 'chat',
@@ -3148,6 +3394,16 @@
                 });
             }
         }
+    }
+
+    if (window.__GOODJOBS_TEST__ === true) {
+        window.__GOODJOBS_TEST_HOOKS__ = Object.freeze({
+            OPTIONS,
+            HR_ACTIVE_LEVELS,
+            normalizeHrActive,
+            hrActivePasses,
+        });
+        return;
     }
 
     const goodjobs = new Zhipin().run();

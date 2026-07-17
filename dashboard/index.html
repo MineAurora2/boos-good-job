@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-today-dashboard">
 </head>
 <body>
     <div class="app-shell">
@@ -68,8 +68,9 @@
                 </div>
                 <div class="top-actions">
                     <div class="range-switch" id="rangeSwitch" aria-label="时间范围">
+                        <button class="active" data-range="today">今日</button>
                         <button data-range="7">近 7 天</button>
-                        <button class="active" data-range="30">近 30 天</button>
+                        <button data-range="30">近 30 天</button>
                         <button data-range="all">全部</button>
                     </div>
                     <button class="icon-button theme-toggle" id="themeToggle" title="切换白天主题" aria-label="切换网页主题">☀</button>
@@ -115,7 +116,7 @@
                     <div><span>在线脚本</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">2 分钟内有心跳</small></div>
                     <div><span>累计接入</span><strong id="connectedClients">0</strong><small>已登记浏览器实例</small></div>
                     <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
-                    <div><span>异常事件</span><strong id="monitorFailures">0</strong><small>当前统计区间</small></div>
+                    <div><span>筛选投递率</span><strong id="filterDeliveryRate">—</strong><small id="filterDeliveryRateHint">已投递 0 / 已评估 0</small></div>
                 </div>
                 <div class="control-layout">
                     <article class="control-card control-span-12">
@@ -123,15 +124,14 @@
                         <div id="controlInstanceList" class="control-instance-grid"></div>
                     </article>
 
-                    <article class="control-card control-span-12">
-                        <div class="control-card-head"><div><span>实时日志</span><small>脚本运行与投递动作实时流</small></div><div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs">暂停滚动</button><button id="clearLogs">清空</button></div></div>
-                        <div id="liveLogs" class="live-logs"></div>
+                    <article class="control-card control-span-12 live-log-card is-collapsed" id="liveLogCard">
+                        <div class="control-card-head"><div><span>实时日志</span><small>脚本运行与投递动作实时流</small></div><button type="button" class="live-log-toggle" id="liveLogToggle" aria-controls="liveLogPanel" aria-expanded="false" title="展开实时日志"><span id="liveLogToggleText">展开日志</span><b aria-hidden="true">⌄</b></button></div>
+                        <div id="liveLogPanel" class="live-log-panel" hidden>
+                            <div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs" type="button">暂停滚动</button><button id="clearLogs" type="button">清空</button></div>
+                            <div id="liveLogs" class="live-logs"></div>
+                        </div>
                     </article>
 
-                    <article class="control-card control-span-12">
-                        <div class="control-card-head"><div><span>当前岗位决策</span><small>各账号的实时评分、AI 判定与扣星依据已并入上方浏览器实例卡片</small></div></div>
-                        <div class="current-decision-empty">各账号实时决策见「浏览器实例」卡片</div>
-                    </article>
                     <article class="control-card control-span-12">
                         <div class="control-card-head"><div><span>账号配额</span><small>按账号查看使用量并设置今日上限</small></div></div>
                         <div class="control-table-wrap"><table class="control-table"><thead><tr><th>账号</th><th>使用量</th><th>今日上限</th><th>状态</th><th>操作</th></tr></thead><tbody id="accountQuotaBody"></tbody></table></div>
@@ -380,6 +380,6 @@
     </div>
 
     <div class="toast" id="toast" role="status"></div>
-    <script src="/dashboard/app.js" defer></script>
+    <script src="/dashboard/app.js?v=20260717-today-dashboard" defer></script>
 </body>
 </html>

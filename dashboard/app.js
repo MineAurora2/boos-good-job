@@ -1,7 +1,7 @@
 const state = {
     payload: null,
     records: [],
-    range: '30',
+    range: 'today',
     trendRange: 'all',
     trendStart: '',
     trendEnd: '',
@@ -13,6 +13,7 @@ const state = {
     education: 'all',
     minSalary: null,
     maxSalary: null,
+    salaryBucket: '',
     keyword: '',
     mapProvince: '',
     mapCity: '',
@@ -28,8 +29,8 @@ const state = {
     pageSize: 10,
     sort: { key: 'loggedAt', direction: 'desc' },
     selectedIds: new Set(),
-    visibleColumns: new Set(['company', 'salary', 'city', 'industry', 'experience', 'education', 'loggedAt', 'score', 'status']),
-    columnOrder: ['company', 'salary', 'city', 'industry', 'experience', 'education', 'loggedAt', 'score', 'status'],
+    visibleColumns: new Set(['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'score', 'status']),
+    columnOrder: ['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'score', 'status'],
     columnWidths: {},
     density: 'default',
     chinaGeo: null,
@@ -39,6 +40,7 @@ const state = {
     runtimeCursor: 0,
     liveEvents: [],
     logsPaused: false,
+    logsExpanded: false,
     logAccount: 'all',
     logClearedCursor: 0,
     adminConfig: null,
@@ -54,6 +56,9 @@ const state = {
 
 const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)', 'var(--red)', 'var(--blue)'];
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
+const HR_ACTIVE_LABELS = { online: '当前在线', just_now: '刚刚活跃', today: '今日活跃', within_3_days: '3 日内活跃', this_week: '本周活跃', this_month: '本月活跃', unknown: '未知' };
+const DECISION_STATE_LABELS = { evaluating: '正在评估', hr_filtered: 'HR 活跃未达标', below_threshold: '低于投递阈值', ai_rejected: 'AI 未通过', random_skipped: '随机跳过', claiming: '正在领取投递权', queued: '等待投递', sent: '已投递', failed: '处理失败' };
+const GREETING_MODE_LABELS = { none: '仅立即沟通', fixed: '固定招呼语', llm: 'AI 招呼语' };
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
@@ -210,11 +215,40 @@ function mapCityName(record) {
     return Object.keys(CITY_COORDINATES).find((name) => city.startsWith(name) || String(record.location || '').includes(name)) || '未知城市';
 }
 
+function rangeStartDate(range, now = new Date()) {
+    if (range === 'all') return null;
+    const days = range === 'today' ? 1 : Number(range);
+    if (!Number.isFinite(days) || days < 1) return null;
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() - days + 1);
+}
+
+function evaluatedJobsForRange(summary, range, now = new Date()) {
+    const total = Number(summary?.evaluatedJobs || 0);
+    if (range === 'all') return total;
+    if (!Array.isArray(summary?.evaluatedJobsByDate)) return null;
+    const cutoff = rangeStartDate(range, now);
+    if (!cutoff) return total;
+    const startKey = localDateKey(cutoff);
+    const endKey = localDateKey(now);
+    return summary.evaluatedJobsByDate.reduce((sum, item) => {
+        const date = String(item?.date || '');
+        const count = Number(item?.count || 0);
+        return date >= startKey && date <= endKey && Number.isFinite(count) ? sum + count : sum;
+    }, 0);
+}
+
+function matchesSalaryBucket(record, range) {
+    if (!range) return true;
+    const [minimumText, maximumText = ''] = String(range).split(':');
+    const minimum = Number(minimumText);
+    const maximum = maximumText === '' ? null : Number(maximumText);
+    const value = Number(record?.salaryK);
+    return Number.isFinite(value) && Number.isFinite(minimum) && value >= minimum && (maximum === null || value < maximum);
+}
+
 function getRangeRecords() {
-    if (state.range === 'all') return [...state.records];
-    const days = Number(state.range);
-    const now = new Date();
-    const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - days + 1);
+    const cutoff = rangeStartDate(state.range);
+    if (!cutoff) return [...state.records];
     return state.records.filter((record) => {
         const date = parseDate(record.loggedAt);
         return date && date >= cutoff;
@@ -238,6 +272,7 @@ function getFilteredRecords(ignoreRange = false, ignoreMap = false) {
         if (state.education !== 'all' && (record.education || '未知学历') !== state.education) return false;
         if (state.minSalary !== null && (!Number.isFinite(record.salaryMinK) || record.salaryMinK < state.minSalary)) return false;
         if (state.maxSalary !== null && (!Number.isFinite(record.salaryMaxK) || record.salaryMaxK > state.maxSalary)) return false;
+        if (!matchesSalaryBucket(record, state.salaryBucket)) return false;
         if (!ignoreMap && state.mapProvince && normalizeProvince(record.city || record.location) !== state.mapProvince) return false;
         if (!ignoreMap && state.mapCity && mapCityName(record) !== state.mapCity) return false;
         return true;
@@ -260,8 +295,7 @@ function groupDaily(records) {
         start = new Date(`${keys[0]}T00:00:00`);
         end = new Date(`${keys.at(-1)}T00:00:00`);
     } else {
-        start = new Date();
-        start = new Date(start.getFullYear(), start.getMonth(), start.getDate() - Number(state.range) + 1);
+        start = rangeStartDate(state.range) || new Date();
     }
     const result = [];
     for (const cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
@@ -811,19 +845,19 @@ function initMapNavigation() {
 }
 
 function salaryBucket(value) {
-    if (value < 8) return '8K 以下'; if (value < 12) return '8–12K'; if (value < 16) return '12–16K'; if (value < 20) return '16–20K'; if (value < 30) return '20–30K'; return '30K 以上';
+    if (value < 5) return '0–5K'; if (value < 8) return '5–8K'; if (value < 12) return '8–12K'; if (value < 20) return '12–20K'; return '20K 以上';
 }
 
 function renderSalary(records) {
-    const labels = ['8K 以下', '8–12K', '12–16K', '16–20K', '20–30K', '30K 以上'];
+    const labels = ['0–5K', '5–8K', '8–12K', '12–20K', '20K 以上'];
     const counts = Object.fromEntries(labels.map((label) => [label, 0])), valid = records.filter((record) => Number.isFinite(record.salaryK));
     valid.forEach((record) => { counts[salaryBucket(record.salaryK)] += 1; });
     const max = Math.max(...Object.values(counts), 1);
     $('#salaryCoverage').textContent = `识别率 ${records.length ? Math.round(valid.length / records.length * 100) : 0}%`;
-    const ranges = [[0, 8], [8, 12], [12, 16], [16, 20], [20, 30], [30, null]];
+    const ranges = [[0, 5], [5, 8], [8, 12], [12, 20], [20, null]];
     $('#salaryChart').innerHTML = labels.map((label, index) => {
         const [minimum, maximum] = ranges[index];
-        const active = state.minSalary === minimum && state.maxSalary === maximum;
+        const active = state.salaryBucket === `${minimum}:${maximum ?? ''}`;
         return `<div class="salary-row ${active ? 'is-active' : ''}" data-salary-filter="${minimum}:${maximum ?? ''}"><span>${label}</span><div class="salary-track"><i style="width:${counts[label] / max * 100}%"></i></div><strong>${counts[label]}</strong></div>`;
     }).join('');
 }
@@ -878,6 +912,7 @@ function renderFilterChips() {
     const chips = [];
     if (state.city !== 'all') chips.push(`城市：${state.city}`); if (state.experience !== 'all') chips.push(`经验：${state.experience}`); if (state.education !== 'all') chips.push(`学历：${state.education}`);
     if (state.minSalary !== null) chips.push(`最低薪资 ≥ ${state.minSalary}K`); if (state.maxSalary !== null) chips.push(`最高薪资 ≤ ${state.maxSalary}K`); if (state.keyword) chips.push(`关键词：${state.keyword}`); if (state.mapProvince) chips.push(`地图：${state.mapProvince}`);
+    if (state.salaryBucket) chips.push(`薪资分布：${({ '0:5': '0–5K', '5:8': '5–8K', '8:12': '8–12K', '12:20': '12–20K', '20:': '20K 以上' })[state.salaryBucket] || state.salaryBucket}`);
     if (state.industry) chips.push(`行业：${state.industry}`); if (state.role) chips.push(`岗位类型：${state.role}`); if (state.exactDate) chips.push(`日期：${state.exactDate}`); if (state.mapCity) chips.push(`城市热力：${state.mapCity}`);
     $('#activeFilterChips').innerHTML = chips.map((chip) => `<span>${escapeHtml(chip)}</span>`).join('');
 }
@@ -894,6 +929,7 @@ const TABLE_COLUMNS = {
     industry: { label: '行业', width: 140, min: 90, max: 260, sortable: true, value: (record) => record.industry || '' },
     experience: { label: '经验', width: 105, min: 80, max: 180, sortable: true, value: (record) => record.experience || '' },
     education: { label: '学历', width: 90, min: 75, max: 150, sortable: true, value: (record) => record.education || '' },
+    hrActive: { label: 'HR 活跃', width: 110, min: 90, max: 180, sortable: true, value: (record) => record.hrActiveLevel || record.hrActive || 'unknown' },
     loggedAt: { label: '投递时间', width: 125, min: 105, max: 200, sortable: true, value: (record) => record.loggedAt || '' },
     score: { label: '匹配度', width: 105, min: 85, max: 160, sortable: true, value: (record) => Number(record.score ?? -1) },
     status: { label: '状态', width: 95, min: 80, max: 150, sortable: true, value: (record) => record.status || '' },
@@ -923,6 +959,10 @@ function renderTableCell(key, record) {
     if (key === 'industry') return `<span class="cell-value ${record.industry ? '' : 'cell-muted'}" title="${escapeHtml(record.industry || '未采集')}">${escapeHtml(record.industry || '未采集')}</span>`;
     if (key === 'experience') return `<span class="cell-value ${record.experience ? '' : 'cell-muted'}">${escapeHtml(record.experience || '未采集')}</span>`;
     if (key === 'education') return `<span class="cell-value ${record.education ? '' : 'cell-muted'}">${escapeHtml(record.education || '未采集')}</span>`;
+    if (key === 'hrActive') {
+        const level = record.hrActiveLevel || 'unknown';
+        return `<span class="hr-active-badge hr-${escapeHtml(level)}" title="${escapeHtml(record.hrActive || HR_ACTIVE_LABELS[level] || '未知')}">${escapeHtml(record.hrActive || HR_ACTIVE_LABELS[level] || '未知')}</span>`;
+    }
     if (key === 'loggedAt') return `<div class="date-cell"><span>${datetime.date}</span><small>${datetime.time}</small></div>`;
     if (key === 'score') return score === null ? '<span class="cell-muted">—</span>' : `<span class="score-pill"><i><span style="width:${Math.min(100, score)}%"></span></i>${score}</span>`;
     if (key === 'status') return `<span class="status-pill status-${escapeHtml(record.status)}">${STATUS_LABELS[record.status] || '进行中'}</span>`;
@@ -972,6 +1012,7 @@ function renderRecords(records) {
 
 function saveTablePreferences() {
     localStorage.setItem(TABLE_PREFS_KEY, JSON.stringify({
+        version: 2,
         visibleColumns: [...state.visibleColumns],
         columnOrder: state.columnOrder,
         columnWidths: state.columnWidths,
@@ -983,7 +1024,10 @@ function restoreTablePreferences() {
     try {
         const saved = JSON.parse(localStorage.getItem(TABLE_PREFS_KEY) || '{}');
         const validKeys = Object.keys(TABLE_COLUMNS);
-        if (Array.isArray(saved.visibleColumns)) state.visibleColumns = new Set(saved.visibleColumns.filter((key) => validKeys.includes(key)));
+        if (Array.isArray(saved.visibleColumns)) {
+            state.visibleColumns = new Set(saved.visibleColumns.filter((key) => validKeys.includes(key)));
+            state.visibleColumns.add('hrActive');
+        }
         if (Array.isArray(saved.columnOrder)) {
             const order = saved.columnOrder.filter((key) => validKeys.includes(key));
             state.columnOrder = [...order, ...validKeys.filter((key) => !order.includes(key))];
@@ -1123,10 +1167,8 @@ function bindChartInteractions() {
         if (datePoint) return applyChartFilter({ exactDate: state.exactDate === datePoint.dataset.date ? '' : datePoint.dataset.date });
         const salary = event.target.closest('[data-salary-filter]');
         if (salary) {
-            const [minimum, maximum] = salary.dataset.salaryFilter.split(':');
-            const min = Number(minimum), max = maximum === '' ? null : Number(maximum);
-            const active = state.minSalary === min && state.maxSalary === max;
-            return applyChartFilter({ minSalary: active ? null : min, maxSalary: active ? null : max });
+            const range = salary.dataset.salaryFilter;
+            return applyChartFilter({ salaryBucket: state.salaryBucket === range ? '' : range });
         }
         const industry = event.target.closest('[data-industry]');
         if (industry) return applyChartFilter({ industry: state.industry === industry.dataset.industry ? '' : industry.dataset.industry });
@@ -1178,7 +1220,7 @@ function openDrawer(id) {
     const datetime = formatDateTime(record.loggedAt);
     $('#drawerCompany').textContent = record.company; $('#drawerTitle').textContent = record.title; $('#drawerStatus').textContent = STATUS_LABELS[record.status] || '进行中';
     $('#drawerStatus').className = `drawer-status status-${record.status}`;
-    const details = [['薪资范围', record.salary], ['城市 / 地区', record.city || record.location || '历史记录未采集'], ['经验要求', record.experience || '未采集'], ['学历要求', record.education || '未采集'], ['所属行业', record.industry || '未采集'], ['搜索关键词', record.keyword || '未记录'], ['投递日期', `${datetime.date} ${datetime.time}`], ['匹配度', record.score ?? '未记录'], ['投递账号', record.accountId || '默认账号']];
+    const details = [['薪资范围', record.salary], ['城市 / 地区', record.city || record.location || '历史记录未采集'], ['经验要求', record.experience || '未采集'], ['学历要求', record.education || '未采集'], ['所属行业', record.industry || '未采集'], ['HR 活跃', record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '未知'], ['搜索关键词', record.keyword || '未记录'], ['投递日期', `${datetime.date} ${datetime.time}`], ['匹配度', record.score ?? '未记录'], ['投递账号', record.accountId || '默认账号']];
     $('#drawerDetails').innerHTML = details.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
     $('#detailDrawer').classList.add('open'); $('#drawerBackdrop').classList.add('open'); $('#detailDrawer').setAttribute('aria-hidden', 'false');
 }
@@ -1187,13 +1229,17 @@ function closeDrawer() { $('#detailDrawer').classList.remove('open'); $('#drawer
 
 function updateDashboard() {
     const records = getFilteredRecords();
-    renderMetrics(records); renderTrend(getFilteredRecords(true)); renderFunnel(records); renderMap(getFilteredRecords(false, true)); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics(records);
+    renderMetrics(records); renderTrend(getFilteredRecords(true)); renderFunnel(records); renderMap(getFilteredRecords(false, true)); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics();
 }
 
-function updateMonitorMetrics(records = getFilteredRecords()) {
+function updateMonitorMetrics() {
     const today = localDateKey(new Date());
-    $('#monitorTodayDelivered').textContent = records.filter((record) => record.loggedAt?.startsWith(today)).length;
-    $('#monitorFailures').textContent = records.filter((record) => record.status === 'failed_unknown').length + Number(state.payload?.summary?.queueFailures || 0);
+    const rangedRecords = getRangeRecords();
+    const delivered = rangedRecords.length;
+    const evaluated = evaluatedJobsForRange(state.payload?.summary || {}, state.range);
+    $('#monitorTodayDelivered').textContent = state.records.filter((record) => record.loggedAt?.startsWith(today)).length;
+    $('#filterDeliveryRate').textContent = evaluated > 0 ? `${Math.round(delivered / evaluated * 100)}%` : '—';
+    $('#filterDeliveryRateHint').textContent = `已投递 ${numberFormat.format(delivered)} / 已评估 ${evaluated === null ? '—' : numberFormat.format(evaluated)}`;
 }
 
 function renderRuntime() {
@@ -1223,6 +1269,19 @@ function renderLiveLogs() {
         row.append(time, source, message); container.appendChild(row);
     });
     if (!state.logsPaused) container.scrollTop = container.scrollHeight;
+}
+
+function setLiveLogsExpanded(expanded) {
+    state.logsExpanded = Boolean(expanded);
+    const card = $('#liveLogCard');
+    const panel = $('#liveLogPanel');
+    const toggle = $('#liveLogToggle');
+    card.classList.toggle('is-collapsed', !state.logsExpanded);
+    panel.hidden = !state.logsExpanded;
+    toggle.setAttribute('aria-expanded', String(state.logsExpanded));
+    toggle.title = state.logsExpanded ? '收起实时日志' : '展开实时日志';
+    $('#liveLogToggleText').textContent = state.logsExpanded ? '收起日志' : '展开日志';
+    if (state.logsExpanded && !state.logsPaused) requestAnimationFrame(() => { $('#liveLogs').scrollTop = $('#liveLogs').scrollHeight; });
 }
 
 async function loadRuntime() {
@@ -1284,19 +1343,23 @@ function decisionMarkup(decision) {
     }
     const stars = Number(decision.stars ?? decision.remainingStars ?? 5);
     const deductions = controlArray(decision.deductions || decision.matches);
+    const scoringEnabled = decision.scoringEnabled !== false;
     const deductionRows = deductions.length
         ? deductions.map((item) => `<div><span>${escapeHtml(item.keyword || item.name || '规则命中')}</span><b>−${Number(item.stars ?? item.deductStars ?? item.value ?? 1)} 星</b></div>`).join('')
-        : '<div><span>未命中扣星规则</span><b>0 星</b></div>';
-    // AI 二次筛选结果：仅在后端启用并回传时展示通过/不通过与原因。
-    let aiRow = '';
-    if (decision.aiFilterEnabled) {
-        const passed = decision.aiPassed === true;
-        const label = passed ? 'AI 通过' : 'AI 不通过';
-        const reason = decision.aiReason ? `：${escapeHtml(decision.aiReason)}` : '';
-        aiRow = `<div class="decision-ai ${passed ? 'pass' : 'fail'}"><span>${label}</span><em>${reason}</em></div>`;
-    }
-    const verdict = decision.discarded ? '准备丢弃' : (decision.state || '评分完成');
-    return `<div class="instance-decision"><div class="instance-decision-head"><span class="decision-company">${escapeHtml(decision.company || '公司未识别')}</span><span class="decision-verdict">${escapeHtml(verdict)}</span></div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div>${aiRow}<div class="decision-deductions">${deductionRows}</div></div>`;
+        : `<div><span>${scoringEnabled ? '未命中扣星规则' : '扣分规则已关闭'}</span><b>0 星</b></div>`;
+    const aiEnabled = decision.aiFilterEnabled === true || decision.aiFilterEnabled === 1;
+    const aiKnown = decision.aiPassed !== undefined && decision.aiPassed !== null;
+    const passed = decision.aiPassed === true || decision.aiPassed === 1;
+    const aiLabel = !aiEnabled ? 'AI 未启用' : (aiKnown ? (passed ? 'AI 通过' : 'AI 不通过') : 'AI 评估中');
+    const aiReason = decision.aiReason ? `：${escapeHtml(decision.aiReason)}` : '';
+    const aiRow = `<div class="decision-ai ${!aiEnabled || !aiKnown ? 'neutral' : (passed ? 'pass' : 'fail')}"><span>${aiLabel}</span><em>${aiReason}</em></div>`;
+    const activeLevel = decision.hrActiveLevel || 'unknown';
+    const hrLabel = decision.hrActive || HR_ACTIVE_LABELS[activeLevel] || '未知';
+    const hrPassed = decision.hrActivePassed === false ? '未达标' : (decision.hrActivePassed === true ? '已达标' : '默认放行');
+    const stateLabel = decision.decisionState || decision.state || (decision.discarded ? '准备丢弃' : '评分完成');
+    const verdict = DECISION_STATE_LABELS[stateLabel] || stateLabel;
+    const greeting = decision.greetingMode ? `<span class="decision-greeting">${escapeHtml(GREETING_MODE_LABELS[decision.greetingMode] || decision.greetingMode)}</span>` : '';
+    return `<div class="instance-decision"><div class="instance-decision-head"><span class="decision-company">${escapeHtml(decision.company || '公司未识别')}</span><span class="decision-verdict">${escapeHtml(verdict)}</span></div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div>`;
 }
 
 function renderControlInstances(instances) {
@@ -1349,6 +1412,7 @@ function closeDeleteConfirm(confirmed = false) {
 }
 
 function confirmDeliveryDeletion(records, skippedCount = 0) {
+    $('#deleteConfirmTitle').textContent = '确认删除投递记录？';
     const ordinary = records.filter((record) => record.status !== 'duplicate').length;
     const duplicates = records.length - ordinary;
     const parts = [];
@@ -1408,8 +1472,8 @@ function toggleTheme() {
 }
 
 function exportRecords(records, filenamePrefix = '投递报表') {
-    const rows = [['公司', '岗位', '行业', '薪资', '最低K', '最高K', '城市', '经验', '学历', '关键词', '投递时间', '匹配度', '状态', '账号']];
-    records.forEach((record) => rows.push([record.company, record.title, record.industry, record.salary, record.salaryMinK ?? '', record.salaryMaxK ?? '', record.city || record.location, record.experience, record.education, record.keyword, record.loggedAt, record.score ?? '', STATUS_LABELS[record.status] || record.status, record.accountId]));
+    const rows = [['公司', '岗位', '行业', '薪资', '最低K', '最高K', '城市', '经验', '学历', 'HR 活跃', '关键词', '投递时间', '匹配度', '状态', '账号']];
+    records.forEach((record) => rows.push([record.company, record.title, record.industry, record.salary, record.salaryMinK ?? '', record.salaryMaxK ?? '', record.city || record.location, record.experience, record.education, record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '', record.keyword, record.loggedAt, record.score ?? '', STATUS_LABELS[record.status] || record.status, record.accountId]));
     const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })), link = document.createElement('a'); link.href = url; link.download = `${filenamePrefix}_${localDateKey(new Date())}.csv`; link.click(); URL.revokeObjectURL(url); showToast(`已导出 ${records.length} 条记录`);
 }
@@ -1457,11 +1521,15 @@ const CONFIG_LABELS = {
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
+    hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveMinLevel: 'HR 最低活跃档位',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
 };
 
 const CONFIG_TAG_LIMIT = 80;
 const CONFIG_TAG_MAX_LENGTH = 80;
+const CONFIG_ENUM_OPTIONS = {
+    hrActiveMinLevel: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['this_month', '本月活跃']],
+};
 
 function configLabel(key) { return CONFIG_LABELS[key] || key; }
 
@@ -1557,7 +1625,11 @@ function makeConfigControl(path, key, value) {
     const label = document.createElement('label'); label.className = 'config-field';
     const caption = document.createElement('span'); caption.textContent = configLabel(key); label.appendChild(caption);
     let input;
-    if (typeof value === 'boolean') {
+    if (CONFIG_ENUM_OPTIONS[key]) {
+        input = document.createElement('select'); input.className = 'compact-select';
+        CONFIG_ENUM_OPTIONS[key].forEach(([optionValue, labelText]) => { const option = document.createElement('option'); option.value = optionValue; option.textContent = labelText; option.selected = optionValue === value; input.appendChild(option); });
+        input.dataset.valueType = 'enum';
+    } else if (typeof value === 'boolean') {
         label.classList.add('config-switch'); input = document.createElement('input'); input.type = 'checkbox'; input.checked = value; label.prepend(input);
         if (key === 'llm_greeting_enabled') label.title = '关闭后直接使用固定打招呼语，不调用大模型';
     } else if (Array.isArray(value)) {
@@ -1595,13 +1667,34 @@ function renderScoringGroup(container, key, values) {
     details.append(grid, addButton); container.appendChild(details);
 }
 
+function updateScoringEditorState(fieldset, enabled) {
+    const editor = fieldset.querySelector('.scoring-rule-editor');
+    fieldset.classList.toggle('scoring-rules-disabled', !enabled);
+    editor?.setAttribute('aria-disabled', String(!enabled));
+    editor?.querySelectorAll('input, button').forEach((control) => { control.disabled = !enabled; });
+    const status = fieldset.querySelector('[data-scoring-toggle-state]');
+    if (status) status.textContent = enabled ? '已启用' : '已关闭';
+}
+
+function renderScoringMasterToggle(fieldset, enabled) {
+    const bar = document.createElement('div'); bar.className = 'scoring-master-bar';
+    const copy = document.createElement('div'); copy.className = 'scoring-master-copy';
+    copy.innerHTML = '<strong>启用岗位扣分规则</strong><small>关闭后所有岗位保持 5 星，不再因关键词扣星或直接丢弃；现有规则会完整保留。</small>';
+    const label = document.createElement('label'); label.className = 'scoring-master-toggle';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = enabled; input.dataset.configPath = 'scoring_enabled'; input.setAttribute('aria-label', '启用岗位扣分规则');
+    const control = document.createElement('span'); control.className = 'llm-toggle'; control.setAttribute('aria-hidden', 'true'); control.innerHTML = '<i></i>';
+    const status = document.createElement('em'); status.dataset.scoringToggleState = ''; label.append(input, control, status); bar.append(copy, label); fieldset.appendChild(bar);
+    input.addEventListener('change', () => updateScoringEditorState(fieldset, input.checked));
+    return input;
+}
+
 function fillConfigForm(data) {
     const config = data.config; state.adminConfig = config; state.configDirty = false;
     const form = $('#visualConfigForm'); form.replaceChildren();
     const basics = document.createElement('fieldset'); basics.innerHTML = '<legend>基础资料</legend><div class="config-field-grid config-basic-grid"></div>'; const basicGrid = basics.querySelector('div');
-    Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring', 'resume_name'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
+    Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring', 'resume_name', 'scoring_enabled'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
     ['backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value))); fieldset.appendChild(grid); form.appendChild(fieldset); });
-    const scoring = document.createElement('fieldset'); const scoringLegend = document.createElement('legend'); scoringLegend.textContent = configLabel('scoring'); scoring.appendChild(scoringLegend); const scoringHint = document.createElement('p'); scoringHint.className = 'scoring-model-hint'; scoringHint.textContent = '每个岗位初始为 5 星。命中关键词后按规则扣星；同一段文字优先匹配更长的关键词。剩余星级小于 0 时直接丢弃岗位。'; scoring.appendChild(scoringHint); Object.entries(config.scoring || {}).forEach(([key, values]) => renderScoringGroup(scoring, key, values)); form.appendChild(scoring);
+    const scoring = document.createElement('fieldset'); scoring.className = 'scoring-rule-fieldset'; const scoringLegend = document.createElement('legend'); scoringLegend.textContent = configLabel('scoring'); scoring.appendChild(scoringLegend); renderScoringMasterToggle(scoring, Boolean(config.scoring_enabled)); const scoringHint = document.createElement('p'); scoringHint.className = 'scoring-model-hint'; scoringHint.textContent = '每个岗位初始为 5 星。命中关键词后按规则扣星；同一段文字优先匹配更长的关键词。剩余星级小于 0 时直接丢弃岗位。'; scoring.appendChild(scoringHint); const scoringEditor = document.createElement('div'); scoringEditor.className = 'scoring-rule-editor'; Object.entries(config.scoring || {}).forEach(([key, values]) => renderScoringGroup(scoringEditor, key, values)); scoring.appendChild(scoringEditor); updateScoringEditorState(scoring, Boolean(config.scoring_enabled)); form.appendChild(scoring);
     refreshAdminSaveState();
 }
 
@@ -1970,7 +2063,7 @@ async function saveCurrentPrompt() {
 }
 
 function resetFilters() {
-    Object.assign(state, { search: '', status: 'all', city: 'all', experience: 'all', education: 'all', minSalary: null, maxSalary: null, keyword: '', mapProvince: '', mapCity: '', industry: '', role: '', exactDate: '', page: 1 });
+    Object.assign(state, { search: '', status: 'all', city: 'all', experience: 'all', education: 'all', minSalary: null, maxSalary: null, salaryBucket: '', keyword: '', mapProvince: '', mapCity: '', industry: '', role: '', exactDate: '', page: 1 });
     state.mapLevel = 'province'; Object.assign(state.mapView, { scale: 1, x: 0, y: 0, suppressClick: false });
     $('#searchInput').value = ''; $('#statusFilter').value = 'all'; $('#cityFilter').value = 'all'; $('#experienceFilter').value = 'all'; $('#educationFilter').value = 'all'; $('#minSalaryFilter').value = ''; $('#maxSalaryFilter').value = ''; $('#keywordFilter').value = ''; updateDashboard();
 }
@@ -1990,6 +2083,7 @@ function bindEvents() {
     $('#themeToggle').addEventListener('click', toggleTheme);
     $('#prevPage').addEventListener('click', () => { state.page -= 1; renderRecords(getFilteredRecords()); }); $('#nextPage').addEventListener('click', () => { state.page += 1; renderRecords(getFilteredRecords()); });
     $('#drawerClose').addEventListener('click', closeDrawer); $('#drawerBackdrop').addEventListener('click', closeDrawer); $('#mobileMenu').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
+    $('#liveLogToggle').addEventListener('click', () => setLiveLogsExpanded(!state.logsExpanded));
     $('#pauseLogs').addEventListener('click', () => { state.logsPaused = !state.logsPaused; $('#pauseLogs').textContent = state.logsPaused ? '继续滚动' : '暂停滚动'; }); $('#clearLogs').addEventListener('click', () => { state.logClearedCursor = state.runtimeCursor; renderLiveLogs(); });
     $('#exportSelected').addEventListener('click', () => exportRecords(state.records.filter((record) => state.selectedIds.has(record.id)), '投递报表_所选'));
     $('#deleteSelected').addEventListener('click', () => deleteDeliveryRecords([...state.selectedIds]));
@@ -2067,6 +2161,7 @@ initDatePicker();
 bindTableInteractions();
 initMapNavigation();
 bindEvents();
+setLiveLogsExpanded(false);
 loadData({ silent: true });
 loadRuntime().then(connectRuntimeStream);
 loadControlState();

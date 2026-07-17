@@ -12,6 +12,9 @@ resume*.md
 !resume-example.md
 resume-lock.md
 
+# 测试 + boos直聘网页
+dev_webpage/
+
 # SQLite 数据、运行日志和审计记录均由程序在本机生成。
 *.db
 *.db-shm
@@ -36,11 +39,7 @@ __pycache__/
 .codex-test-temp/
 .test-tmp-codex/
 .test-llm-*/
-tests/.test-llm.env
-tests/.resume-management-*/
-tests/.storage-dashboard-*/
-tests/.runtime-monitor-*.json
-tests/.app-structure-*/
+tests/
 .tmp-tests/
 .test-run-tmp/
 .test-user-config-security.json
@@ -49,4 +48,3 @@ tests/.app-structure-*/
 server.out.log
 server.err.log
 goodjobs.zip
-PROJECT_MEMORY.md

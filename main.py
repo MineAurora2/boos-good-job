@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import threading
+import webbrowser
 
 from fastapi import FastAPI
 
 from app.state import STATE
 from app.routes import control_router, delivery_router, shutdown_introduce_jobs
+
+
+DASHBOARD_URL = 'http://127.0.0.1:47999/dashboard'
 
 
 @asynccontextmanager
@@ -31,13 +36,62 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-if __name__ == '__main__':
+def open_dashboard_when_started(
+    server: object,
+    stop_event: threading.Event,
+    *,
+    opener=None,
+    poll_interval: float = 0.05,
+) -> bool:
+    """Open the dashboard only after this Uvicorn server binds successfully."""
+    opener = opener or webbrowser.open
+    while not stop_event.is_set():
+        if getattr(server, 'should_exit', False):
+            return False
+        if getattr(server, 'started', False):
+            try:
+                return bool(opener(DASHBOARD_URL, new=2, autoraise=True))
+            except webbrowser.Error:
+                return False
+        stop_event.wait(poll_interval)
+    return False
+
+
+def start_dashboard_opener(
+    server: object,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """Watch one server instance without blocking its main event loop."""
+    thread = threading.Thread(
+        target=open_dashboard_when_started,
+        args=(server, stop_event),
+        name='dashboard-opener',
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def run_server() -> None:
+    """Run the local API and open its dashboard once this server is listening."""
     import uvicorn
 
-    uvicorn.run(
-        'main:app',
+    config = uvicorn.Config(
+        app,
         host='0.0.0.0',
         port=47999,
         reload=False,
         timeout_graceful_shutdown=3,
     )
+    server = uvicorn.Server(config)
+    stop_event = threading.Event()
+    opener_thread = start_dashboard_opener(server, stop_event)
+    try:
+        server.run()
+    finally:
+        stop_event.set()
+        opener_thread.join(timeout=1)
+
+
+if __name__ == '__main__':
+    run_server()

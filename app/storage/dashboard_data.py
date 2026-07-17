@@ -72,6 +72,40 @@ def parse_salary_details(salary: str | None) -> dict:
     }
 
 
+def _local_date_key(value: object) -> str:
+    """将 ISO 时间转换为服务所在时区的日期；无效值返回空串。"""
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    if text.endswith(('Z', 'z')):
+        text = f'{text[:-1]}+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return ''
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed.date().isoformat()
+
+
+def _action_counts_by_date(actions: list[dict], action_name: str) -> tuple[list[dict], int]:
+    """按本地日期聚合指定动作，并单独统计缺少有效时间的历史记录。"""
+    counts: Counter[str] = Counter()
+    undated = 0
+    for record in actions:
+        if record.get('action') != action_name:
+            continue
+        date_key = _local_date_key(record.get('loggedAt'))
+        if date_key:
+            counts[date_key] += 1
+        else:
+            undated += 1
+    return (
+        [{'date': date_key, 'count': counts[date_key]} for date_key in sorted(counts)],
+        undated,
+    )
+
+
 def _record_status(
     record: dict,
     final_by_token: dict[str, str],
@@ -181,6 +215,9 @@ def load_dashboard_data(action_log_path: Path, delivery_store: DeliveryStore) ->
             'experience': (record.get('experience') or '').strip(),
             'education': (record.get('education') or '').strip(),
             'keyword': (record.get('keyword') or '').strip(),
+            'hrActive': (record.get('hrActive') or '').strip(),
+            'hrActiveLevel': (record.get('hrActiveLevel') or 'unknown').strip(),
+            'greetingMode': (record.get('greetingMode') or '').strip(),
             'status': status,
             'score': record.get('score'),
             'accountId': (record.get('accountId') or '默认账号').strip(),
@@ -192,6 +229,7 @@ def load_dashboard_data(action_log_path: Path, delivery_store: DeliveryStore) ->
 
     deliveries.sort(key=lambda item: item.get('loggedAt') or '', reverse=True)
     action_counts = Counter(record.get('action') for record in actions)
+    evaluated_by_date, undated_evaluated = _action_counts_by_date(actions, 'job_decision_consumed')
     valid_salary = [item['salaryK'] for item in deliveries if item['salaryK'] is not None]
     unique_companies = {item['company'] for item in deliveries if item['company'] != '未记录公司'}
     active_dates = {item['loggedAt'][:10] for item in deliveries if item.get('loggedAt')}
@@ -204,6 +242,8 @@ def load_dashboard_data(action_log_path: Path, delivery_store: DeliveryStore) ->
             'averageSalaryK': round(sum(valid_salary) / len(valid_salary), 1) if valid_salary else None,
             'activeDays': len(active_dates),
             'evaluatedJobs': action_counts.get('job_decision_consumed', 0),
+            'evaluatedJobsByDate': evaluated_by_date,
+            'undatedEvaluatedJobs': undated_evaluated,
             'belowThreshold': action_counts.get('job_below_threshold', 0),
             'queueFailures': action_counts.get('greet_queue_failed', 0),
             'resumesSent': action_counts.get('resume_sent', 0),

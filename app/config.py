@@ -83,6 +83,9 @@ DEFAULT_USER_CONFIG = {
         # 投递前后附加的随机延时区间（毫秒）。
         'randomDelayMinMs': 0,
         'randomDelayMaxMs': 0,
+        # HR 活跃筛选。
+        'hrActiveFilterEnabled': False,
+        'hrActiveMinLevel': 'this_month',
     },
     'scoring': {
         'title_deduction_keywords': {

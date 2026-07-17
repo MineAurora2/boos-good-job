@@ -95,6 +95,7 @@ def _unscored_result(title: str, salary: str, detail: str) -> dict:
         'deductedStars': 0,
         'discarded': False,
         'deductions': [],
+        'scoringEnabled': False,
         'reason': '扣分规则已关闭，保持5星',
     }
 
@@ -136,6 +137,7 @@ def evaluate_job_match(job: str) -> dict:
         'deductedStars': deducted_stars,
         'discarded': discarded,
         'deductions': deductions,
+        'scoringEnabled': True,
         'reason': reason,
     }
 

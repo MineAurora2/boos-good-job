@@ -365,7 +365,8 @@ class RuntimeMonitor:
             for key in (
                 'loggedAt', 'action', 'scene', 'title', 'company', 'salary', 'location',
                 'city', 'industry', 'experience', 'education', 'score', 'stars', 'rawStars',
-                'discarded', 'accountId', 'workerId', 'reason',
+                'discarded', 'accountId', 'workerId', 'reason', 'hrActive',
+                'hrActiveLevel', 'aiFilterEnabled', 'aiPassed', 'aiReason', 'greetingMode',
             )
             if action.get(key) is not None
         }
