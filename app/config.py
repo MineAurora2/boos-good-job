@@ -284,7 +284,14 @@ class Config:
             'introduce': cls.introduce,
             'character': cls.character,
             'tags': cls.tags,
-            'frontend': cls.frontend,
+            # serverHost is bootstrapping information and therefore belongs to
+            # Tampermonkey GM storage. A server response must never redirect the
+            # client to a different backend origin.
+            'frontend': {
+                key: copy.deepcopy(value)
+                for key, value in cls.frontend.items()
+                if key != 'serverHost'
+            },
         }
 
     @classmethod

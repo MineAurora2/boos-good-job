@@ -168,6 +168,26 @@ def control_state(request: Request):
     return state
 
 
+@router.put('/api/control/desired-state/global', status_code=202, summary='更新所有已登记实例的期望状态')
+def control_update_global_desired_state(request: Request, payload: dict = Body(...)):
+    require_local_admin(request)
+    try:
+        return RUNTIME_MONITOR.set_global_desired_state(payload.get('desiredState'))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.put('/api/control/desired-state/workers/{worker_id}', status_code=202, summary='更新单个实例的期望状态')
+def control_update_worker_desired_state(worker_id: str, request: Request, payload: dict = Body(...)):
+    require_local_admin(request)
+    try:
+        return RUNTIME_MONITOR.set_worker_desired_state(worker_id, payload.get('desiredState'))
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='worker_not_found') from error
+    except (AttributeError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.put('/api/control/accounts/{account_id}', summary='更新账号别名、配额与运行策略')
 def control_update_account(account_id: str, request: Request, payload: dict = Body(...)):
     require_local_admin(request)

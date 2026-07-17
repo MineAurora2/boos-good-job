@@ -51,6 +51,7 @@ const state = {
     currentResume: '',
     control: null,
     controlOnline: false,
+    lifecycleRequests: {},
     llm: null,
     llmDirty: false,
     configDirty: false,
@@ -63,6 +64,9 @@ const DECISION_STATE_LABELS = { evaluating: '正在评估', hr_filtered: 'HR 活
 const GREETING_MODE_LABELS = { none: '仅立即沟通', fixed: '固定招呼语', llm: 'AI 招呼语' };
 const LOG_SENDER_LABELS = { system: '系统', delivery: '投递', claim: '领取投递', queue: '投递等待' };
 const LOG_VERBOSITY_RANK = { concise: 0, normal: 1, detailed: 2 };
+const DESIRED_STATE_LABELS = { running: '运行', paused: '暂停', stopped: '结束' };
+const EXECUTION_STATE_LABELS = { starting: '启动中', running: '运行中', pausing: '暂停中', paused: '已暂停', stopping: '结束中', stopped: '已结束', error: '异常' };
+const SYNC_STATE_LABELS = { pending: '等待同步', applying: '正在应用', synced: '已同步', failed: '同步失败' };
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
@@ -91,10 +95,16 @@ function renderDailyGoal(today = state.todayDelivered || 0) {
 }
 const REPORT_LAYOUT_KEY = 'goodjobs.dashboard.report-layout.v1';
 const TABLE_PREFS_KEY = 'goodjobs.dashboard.table-prefs.v1';
+const AUTH_TOKEN_KEY = 'goodjobs.dashboard.shared-token';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const numberFormat = new Intl.NumberFormat('zh-CN');
 let pendingDeleteConfirmation = null;
+let pendingStopAllConfirmation = null;
+let pendingAuthPrompt = null;
+let authPromptResolver = null;
+let authPromptDismissed = false;
+let authPromptCloseTimer = null;
 
 const LOCATION_ALIASES = {
     北京: ['北京'], 上海: ['上海'], 天津: ['天津'], 重庆: ['重庆'],
@@ -136,6 +146,71 @@ const CITY_COORDINATES = {
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+}
+
+function readAuthToken() {
+    try { return sessionStorage.getItem(AUTH_TOKEN_KEY) || ''; } catch (_) { return ''; }
+}
+
+function writeAuthToken(token) {
+    try {
+        if (token) sessionStorage.setItem(AUTH_TOKEN_KEY, token);
+        else sessionStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch (_) { /* 无存储权限时仍允许当前请求继续 */ }
+}
+
+function settleAuthPrompt(token = '') {
+    if (!pendingAuthPrompt) return;
+    const overlay = $('#authPrompt');
+    overlay.classList.remove('open');
+    clearTimeout(authPromptCloseTimer);
+    authPromptCloseTimer = setTimeout(() => { overlay.hidden = true; authPromptCloseTimer = null; }, 180);
+    const resolve = authPromptResolver;
+    pendingAuthPrompt = null;
+    authPromptResolver = null;
+    if (resolve) resolve(token);
+}
+
+function cancelAuthPrompt() {
+    authPromptDismissed = true;
+    settleAuthPrompt('');
+}
+
+function requestAuthToken(message = '请输入后端配置的共享令牌。') {
+    if (pendingAuthPrompt) return pendingAuthPrompt;
+    if (authPromptDismissed) return Promise.resolve('');
+    const overlay = $('#authPrompt');
+    const input = $('#authTokenInput');
+    const error = $('#authPromptError');
+    clearTimeout(authPromptCloseTimer);
+    authPromptCloseTimer = null;
+    input.value = '';
+    error.textContent = message;
+    error.hidden = !message;
+    overlay.hidden = false;
+    requestAnimationFrame(() => { overlay.classList.add('open'); input.focus(); });
+    pendingAuthPrompt = new Promise((resolve) => { authPromptResolver = resolve; });
+    return pendingAuthPrompt;
+}
+
+function requestHeaders(headers) {
+    const next = new Headers(headers || {});
+    const token = readAuthToken();
+    if (token && !next.has('Authorization')) next.set('Authorization', `Bearer ${token}`);
+    return next;
+}
+
+async function authorizedFetch(input, options = {}) {
+    const { headers, ...requestOptions } = options;
+    let lastResponse = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        lastResponse = await fetch(input, { ...requestOptions, headers: requestHeaders(headers) });
+        if (lastResponse.status !== 401) return lastResponse;
+        writeAuthToken('');
+        const token = await requestAuthToken(attempt ? '令牌无效，请重新输入。' : '当前后端需要共享令牌。');
+        if (!token) return lastResponse;
+    }
+    return fetch(input, { ...requestOptions, headers: requestHeaders(headers) });
 }
 
 const INDUSTRY_ICON_RULES = [
@@ -1246,10 +1321,24 @@ function updateMonitorMetrics() {
     $('#filterDeliveryRateHint').textContent = `已投递 ${numberFormat.format(delivered)} / 已评估 ${evaluated === null ? '—' : numberFormat.format(evaluated)}`;
 }
 
+function renderControlMonitorCounts() {
+    const runtime = state.runtime || { clients: [], activeClientCount: 0, connectedClientCount: 0 };
+    const control = state.control || {};
+    const clients = controlArray(control.clients || control.instances).length ? controlArray(control.clients || control.instances) : controlArray(runtime.clients);
+    const count = (value, fallback = 0) => { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; };
+    const registered = count(control.registeredWorkerCount ?? control.registeredClientCount, count(runtime.connectedClientCount, clients.length));
+    const connected = count(control.connectedClientCount ?? control.activeClientCount, count(runtime.activeClientCount, clients.filter((item) => item.online !== false).length));
+    const running = count(control.runningClientCount, clients.filter((item) => item.online !== false && item.executionState === 'running').length);
+    $('#activeClients').textContent = connected;
+    $('#connectedClients').textContent = registered;
+    $('#runningClients').textContent = running;
+    $('#navControlAlerts').textContent = connected;
+}
+
 function renderRuntime() {
     const runtime = state.runtime || { clients: [], activeClientCount: 0, connectedClientCount: 0 };
-    $('#activeClients').textContent = runtime.activeClientCount || 0; $('#connectedClients').textContent = runtime.connectedClientCount || 0; $('#navControlAlerts').textContent = runtime.activeClientCount || 0;
-    const ttl = Number(runtime.clientTtlSeconds || 120); $('#heartbeatWindowHint').textContent = ttl >= 60 ? `${Math.round(ttl / 60)} 分钟内有心跳` : `${ttl} 秒内有心跳`;
+    renderControlMonitorCounts();
+    const ttl = Number(runtime.clientTtlSeconds || 30); $('#heartbeatWindowHint').textContent = ttl >= 60 ? `${Math.round(ttl / 60)} 分钟内有心跳` : `${ttl} 秒内有心跳`;
 }
 
 function eventPayload(event) {
@@ -1390,7 +1479,7 @@ function setLiveLogsExpanded(expanded) {
 
 async function loadRuntime() {
     try {
-        const response = await fetch('/api/runtime', { cache: 'no-store' }); if (!response.ok) return;
+        const response = await authorizedFetch('/api/runtime', { cache: 'no-store' }); if (!response.ok) return;
         const runtime = await response.json();
         const previousCursor = state.runtimeCursor;
         const incomingEvents = runtime.events || [];
@@ -1414,6 +1503,58 @@ function controlText(value, fallback = '—') { return value === undefined || va
 function controlTime(value) { const text = controlText(value, ''); return text.includes('T') ? text.replace('T', ' ').slice(0, 19) : text || '—'; }
 function controlStars(value) { const count = Math.max(0, Math.min(5, Number(value) || 0)); return Array.from({ length: 5 }, (_, index) => `<span class="${index < count ? 'active' : ''}">★</span>`).join(''); }
 
+function desiredStateOf(item) {
+    const desiredState = String(item?.desiredState || 'stopped').toLowerCase();
+    return Object.prototype.hasOwnProperty.call(DESIRED_STATE_LABELS, desiredState) ? desiredState : 'stopped';
+}
+
+function executionStateOf(item) {
+    const executionState = String(item?.executionState || item?.phase || item?.state || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(EXECUTION_STATE_LABELS, executionState)) return executionState;
+    if (item?.paused === true) return 'paused';
+    return desiredStateOf(item) === 'running' ? 'starting' : desiredStateOf(item);
+}
+
+function syncStateOf(item) {
+    const syncState = String(item?.syncState || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(SYNC_STATE_LABELS, syncState)) return syncState;
+    if (item?.controlError || item?.lastControlError) return 'failed';
+    const desiredState = desiredStateOf(item);
+    const executionState = executionStateOf(item);
+    const matches = executionState === desiredState;
+    if (matches) return 'synced';
+    return item?.online === false ? 'pending' : 'applying';
+}
+
+function lifecycleRequestKey(scope, workerId = '') { return scope === 'global' ? 'global' : `worker:${workerId}`; }
+
+function lifecycleControlsLocked(scope, workerId = '') {
+    const requests = state.lifecycleRequests || {};
+    if (requests.global?.pending) return true;
+    if (scope === 'global') {
+        return Object.entries(requests).some(([key, request]) => key.startsWith('worker:') && request?.pending);
+    }
+    return Boolean(requests[lifecycleRequestKey(scope, workerId)]?.pending);
+}
+
+function lifecycleButtonsMarkup(scope, workerId, desiredState) {
+    const pending = lifecycleControlsLocked(scope, workerId);
+    const workerAttribute = scope === 'worker' ? ` data-worker-id="${escapeHtml(workerId)}"` : '';
+    return [
+        ['running', '▶', '开启', 'start'],
+        ['paused', 'Ⅱ', '暂停', 'pause'],
+        ['stopped', '■', '结束', 'danger'],
+    ].map(([value, icon, label, className]) => `<button type="button" class="control-command ${className}${desiredState === value ? ' active' : ''}" data-control-scope="${scope}"${workerAttribute} data-desired-state="${value}" aria-pressed="${desiredState === value}"${pending ? ' disabled aria-busy="true"' : ''}><span aria-hidden="true">${icon}</span> ${label}</button>`).join('');
+}
+
+function controlAxesMarkup(item) {
+    const online = item.online !== false;
+    const executionState = executionStateOf(item);
+    const syncState = syncStateOf(item);
+    const syncLabel = !online && syncState === 'pending' ? '离线待执行' : SYNC_STATE_LABELS[syncState];
+    return `<div class="control-state-axes" aria-label="实例状态"><span class="axis connection ${online ? 'connected' : 'offline'}"><i></i><small>连接</small><b>${online ? '已连接' : '离线'}</b></span><span class="axis execution ${executionState}"><i></i><small>执行</small><b>${EXECUTION_STATE_LABELS[executionState]}</b></span><span class="axis sync ${syncState}"><i></i><small>同步</small><b>${syncLabel}</b></span></div>`;
+}
+
 function normalizedControlState() {
     const data = state.control || {};
     const runtime = state.runtime || {};
@@ -1430,6 +1571,11 @@ function normalizedControlState() {
         global,
         task,
         instances,
+        registeredWorkerCount: Number(data.registeredWorkerCount ?? data.registeredClientCount ?? instances.length),
+        connectedClientCount: Number(data.connectedClientCount ?? data.activeClientCount ?? instances.filter((item) => item.online !== false).length),
+        runningClientCount: Number(data.runningClientCount ?? instances.filter((item) => item.online !== false && executionStateOf(item) === 'running').length),
+        controlEpoch: data.controlEpoch || '',
+        revision: Number(data.revision || 0),
         queue,
         keywords: data.keywords || { items: currentKeywords, current: currentKeywords[0] || '' },
         filters: data.filters || {},
@@ -1468,14 +1614,55 @@ function decisionMarkup(decision) {
 
 function renderControlInstances(instances) {
     const container = $('#controlInstanceList'); container.replaceChildren();
-    const online = instances.filter((item) => item.online !== false && (item.online || item.state !== 'offline')).length;
+    const online = instances.filter((item) => item.online !== false).length;
     $('#controlInstanceSummary').textContent = instances.length ? `${online} 个在线 / ${instances.length} 个实例` : '等待脚本接入';
     if (!instances.length) { container.innerHTML = '<div class="control-empty">尚未收到浏览器实例心跳</div>'; return; }
     instances.forEach((item) => {
         const workerId = item.workerId || item.id || '';
-        const card = document.createElement('div'); card.className = `control-instance-card ${item.online ? 'online' : ''}`;
-        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong></div><span class="control-instance-state">${escapeHtml(item.phase || item.state || '等待')}</span></div><div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>运行状态<b>${item.paused ? '本地暂停' : '运行中'}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen).slice(11) || '—')}</b></span></div>${decisionMarkup(item.currentDecision)}`;
+        const desiredState = desiredStateOf(item);
+        const executionState = executionStateOf(item);
+        const syncState = syncStateOf(item);
+        const request = state.lifecycleRequests[lifecycleRequestKey('worker', workerId)];
+        const feedback = request?.pending
+            ? `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}”指令…`
+            : request?.failed
+                ? `操作失败：${escapeHtml(request.message || '请求未完成')}，可直接重试`
+                : `期望状态：${DESIRED_STATE_LABELS[desiredState]} · ${SYNC_STATE_LABELS[syncState]}${item.revision ? ` · r${Number(item.revision)}` : ''}`;
+        const card = document.createElement('div');
+        card.className = `control-instance-card ${item.online !== false ? 'online' : 'offline'} sync-${syncState}`;
+        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span><span>操作编号<b>${escapeHtml(item.operationId || '—')}</b></span></div><div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
         container.appendChild(card);
+    });
+}
+
+function renderGlobalLifecycle(instances) {
+    const request = state.lifecycleRequests.global;
+    const controlsLocked = lifecycleControlsLocked('global');
+    const desiredStates = [...new Set(instances.map(desiredStateOf))];
+    const desiredState = desiredStates.length === 1 ? desiredStates[0] : '';
+    const syncStates = instances.map(syncStateOf);
+    const aggregateSync = syncStates.includes('failed') ? 'failed' : syncStates.includes('applying') ? 'applying' : syncStates.includes('pending') ? 'pending' : 'synced';
+    const status = $('#globalControlStatus');
+    status.className = `control-global-status ${desiredState ? `desired-${desiredState}` : 'desired-mixed'} sync-${aggregateSync}${request?.pending ? ' pending' : ''}${request?.failed ? ' failed' : ''}`;
+    $('#globalDesiredState').textContent = !instances.length
+        ? '全局状态：等待实例接入'
+        : desiredState
+            ? `全局期望：${DESIRED_STATE_LABELS[desiredState]}`
+            : '全局期望：实例状态不一致';
+    const syncedCount = syncStates.filter((value) => value === 'synced').length;
+    $('#globalControlFeedback').textContent = request?.pending
+        ? `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令…`
+        : request?.failed
+            ? `操作失败：${request.message || '请求未完成'}，可直接重试`
+            : instances.length
+                ? `${syncedCount} / ${instances.length} 个实例已同步${aggregateSync === 'failed' ? '，存在失败实例' : ''}`
+                : '操作会应用到当前已登记的全部实例';
+    $$('.control-global-bar [data-desired-state]').forEach((button) => {
+        button.disabled = controlsLocked;
+        button.setAttribute('aria-busy', String(controlsLocked));
+        const active = Boolean(desiredState && button.dataset.desiredState === desiredState);
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', String(active));
     });
 }
 
@@ -1485,7 +1672,7 @@ function renderAccountQuotas(accounts) {
 
 function renderControlCenter() {
     const data = normalizedControlState();
-    renderControlInstances(data.instances); renderAccountQuotas(data.accounts);
+    renderGlobalLifecycle(data.instances); renderControlInstances(data.instances); renderAccountQuotas(data.accounts); renderControlMonitorCounts();
     renderDailyGoal();
 }
 
@@ -1502,6 +1689,50 @@ async function loadControlState() {
 async function updateControlResource(url, payload, successMessage) {
     try { const result = await apiJson(url, { method: 'PUT', body: JSON.stringify(payload) }); showToast(successMessage); await loadControlState(); return result; }
     catch (error) { showToast(`保存失败：${error.message}`); return null; }
+}
+
+async function setDesiredLifecycleState(scope, workerId, desiredState) {
+    if (!Object.prototype.hasOwnProperty.call(DESIRED_STATE_LABELS, desiredState)) return null;
+    const key = lifecycleRequestKey(scope, workerId);
+    if (lifecycleControlsLocked(scope, workerId)) {
+        showToast('控制请求进行中，请稍后再试');
+        return null;
+    }
+    state.lifecycleRequests[key] = { pending: true, failed: false, desiredState, message: '' };
+    renderControlCenter();
+    const url = scope === 'global'
+        ? '/api/control/desired-state/global'
+        : `/api/control/desired-state/workers/${encodeURIComponent(workerId)}`;
+    try {
+        const result = await apiJson(url, { method: 'PUT', body: JSON.stringify({ desiredState }) });
+        state.lifecycleRequests[key] = { pending: false, failed: false, desiredState, operationId: result.operationId || '', revision: Number(result.revision || 0) };
+        renderControlCenter();
+        showToast(`${scope === 'global' ? '全部实例' : '实例'}“${DESIRED_STATE_LABELS[desiredState]}”指令已提交`);
+        await loadControlState();
+        return result;
+    } catch (error) {
+        state.lifecycleRequests[key] = { pending: false, failed: true, desiredState, message: error.message };
+        renderControlCenter();
+        showToast(`控制失败：${error.message}`);
+        return null;
+    }
+}
+
+function closeStopAllConfirm(confirmed = false) {
+    const overlay = $('#controlStopConfirm');
+    overlay.classList.remove('open');
+    setTimeout(() => { overlay.hidden = true; }, 180);
+    const resolve = pendingStopAllConfirmation;
+    pendingStopAllConfirmation = null;
+    if (resolve) resolve(confirmed);
+}
+
+function confirmStopAll() {
+    if (pendingStopAllConfirmation) return Promise.resolve(false);
+    const overlay = $('#controlStopConfirm');
+    overlay.hidden = false;
+    requestAnimationFrame(() => { overlay.classList.add('open'); $('#controlStopCancel').focus(); });
+    return new Promise((resolve) => { pendingStopAllConfirmation = resolve; });
 }
 
 function showToast(message) { const toast = $('#toast'); toast.textContent = message; toast.classList.add('show'); clearTimeout(showToast.timer); showToast.timer = setTimeout(() => toast.classList.remove('show'), 2600); }
@@ -1603,7 +1834,7 @@ function markDataConnection(ok) {
 async function loadData({ silent = false } = {}) {
     $('#refreshButton').classList.add('loading');
     try {
-        const response = await fetch('/api/dashboard', { cache: 'no-store' }); if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const response = await authorizedFetch('/api/dashboard', { cache: 'no-store' }); if (!response.ok) throw new Error(`HTTP ${response.status}`);
         state.payload = await response.json(); state.records = Array.isArray(state.payload.deliveries) ? state.payload.deliveries : [];
         const existingIds = new Set(state.records.map((record) => record.id)); state.selectedIds = new Set([...state.selectedIds].filter((id) => existingIds.has(id)));
         const generated = parseDate(state.payload.generatedAt); $('#lastUpdated').textContent = generated ? `${String(generated.getHours()).padStart(2, '0')}:${String(generated.getMinutes()).padStart(2, '0')} 已同步` : '已同步'; $('#footerTime').textContent = `最后更新 ${state.payload.generatedAt || '—'}`;
@@ -1614,7 +1845,7 @@ async function loadData({ silent = false } = {}) {
 }
 
 async function apiJson(url, options = {}) {
-    const response = await fetch(url, { cache: 'no-store', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
+    const response = await authorizedFetch(url, { cache: 'no-store', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
     return data;
@@ -1623,7 +1854,7 @@ async function apiJson(url, options = {}) {
 const CONFIG_LABELS = {
     llm_greeting_enabled: '使用 LLM 生成打招呼语', scoring_enabled: '启用岗位扣星规则', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
-    frontend: '浏览器脚本参数', serverHost: '本地服务地址', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
+    frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
     hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveMinLevel: 'HR 最低活跃档位',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
@@ -1631,6 +1862,7 @@ const CONFIG_LABELS = {
 
 const CONFIG_TAG_LIMIT = 80;
 const CONFIG_TAG_MAX_LENGTH = 80;
+const HIDDEN_CONFIG_PATHS = new Set(['frontend.serverHost']);
 const CONFIG_ENUM_OPTIONS = {
     hrActiveMinLevel: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['this_month', '本月活跃']],
 };
@@ -1797,7 +2029,7 @@ function fillConfigForm(data) {
     const form = $('#visualConfigForm'); form.replaceChildren();
     const basics = document.createElement('fieldset'); basics.innerHTML = '<legend>基础资料</legend><div class="config-field-grid config-basic-grid"></div>'; const basicGrid = basics.querySelector('div');
     Object.entries(config).filter(([key]) => !['backend', 'frontend', 'scoring', 'resume_name', 'scoring_enabled'].includes(key)).forEach(([key, value]) => basicGrid.appendChild(makeConfigControl(key, key, value))); form.appendChild(basics);
-    ['backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value))); fieldset.appendChild(grid); form.appendChild(fieldset); });
+    ['backend', 'frontend'].forEach((groupKey) => { const fieldset = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = configLabel(groupKey); fieldset.appendChild(legend); const grid = document.createElement('div'); grid.className = 'config-field-grid'; Object.entries(config[groupKey] || {}).filter(([key]) => !HIDDEN_CONFIG_PATHS.has(`${groupKey}.${key}`)).forEach(([key, value]) => grid.appendChild(makeConfigControl(`${groupKey}.${key}`, key, value))); fieldset.appendChild(grid); form.appendChild(fieldset); });
     const scoring = document.createElement('fieldset'); scoring.className = 'scoring-rule-fieldset'; const scoringLegend = document.createElement('legend'); scoringLegend.textContent = configLabel('scoring'); scoring.appendChild(scoringLegend); renderScoringMasterToggle(scoring, Boolean(config.scoring_enabled)); const scoringHint = document.createElement('p'); scoringHint.className = 'scoring-model-hint'; scoringHint.textContent = '每个岗位初始为 5 星。命中关键词后按规则扣星；同一段文字优先匹配更长的关键词。剩余星级小于 0 时直接丢弃岗位。'; scoring.appendChild(scoringHint); const scoringEditor = document.createElement('div'); scoringEditor.className = 'scoring-rule-editor'; Object.entries(config.scoring || {}).forEach(([key, values]) => renderScoringGroup(scoringEditor, key, values)); scoring.appendChild(scoringEditor); updateScoringEditorState(scoring, Boolean(config.scoring_enabled)); form.appendChild(scoring);
     refreshAdminSaveState();
 }
@@ -2195,6 +2427,26 @@ function bindEvents() {
     $('#deleteConfirmCancel').addEventListener('click', () => closeDeleteConfirm(false));
     $('#deleteConfirmSubmit').addEventListener('click', () => closeDeleteConfirm(true));
     $('#deleteConfirm').addEventListener('click', (event) => { if (event.target.id === 'deleteConfirm') closeDeleteConfirm(false); });
+    $('#controlStopCancel').addEventListener('click', () => closeStopAllConfirm(false));
+    $('#controlStopSubmit').addEventListener('click', () => closeStopAllConfirm(true));
+    $('#controlStopConfirm').addEventListener('click', (event) => { if (event.target.id === 'controlStopConfirm') closeStopAllConfirm(false); });
+    $('#authPromptCancel').addEventListener('click', cancelAuthPrompt);
+    $('#authPrompt').addEventListener('click', (event) => { if (event.target.id === 'authPrompt') cancelAuthPrompt(); });
+    $('#authForm').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const input = $('#authTokenInput');
+        const error = $('#authPromptError');
+        const token = input.value.trim();
+        if (token.length < 32 || token.length > 256) {
+            error.textContent = '共享令牌长度必须为 32–256 位。';
+            error.hidden = false;
+            input.focus();
+            return;
+        }
+        authPromptDismissed = false;
+        writeAuthToken(token);
+        settleAuthPrompt(token);
+    });
     $$('#densitySwitch button').forEach((button) => button.addEventListener('click', () => { state.density = button.dataset.density; $('#applications').dataset.density = state.density; $$('#densitySwitch button').forEach((item) => item.classList.toggle('active', item === button)); saveTablePreferences(); }));
     $('#columnManagerButton').addEventListener('click', (event) => { event.stopPropagation(); $('#columnManagerMenu').hidden = !$('#columnManagerMenu').hidden; });
     $('#columnManagerMenu').addEventListener('change', (event) => {
@@ -2242,9 +2494,23 @@ function bindEvents() {
         card.dataset[kind === 'key' ? 'keyDirty' : 'proxyDirty'] = '1'; input.value = ''; input.type = 'password'; input.placeholder = '保存后清除'; markLlmDirty(card);
     });
     $('#refreshControl').addEventListener('click', loadControlState);
-    $('#controlSection').addEventListener('click', (event) => {
+    $('#controlSection').addEventListener('click', async (event) => {
+        const lifecycleButton = event.target.closest('[data-desired-state]');
+        if (lifecycleButton) {
+            const scope = lifecycleButton.dataset.controlScope || 'worker';
+            const workerId = lifecycleButton.dataset.workerId || '';
+            const desiredState = lifecycleButton.dataset.desiredState || '';
+            if (scope === 'worker' && !workerId) { showToast('实例标识缺失，无法下发控制指令'); return; }
+            if (lifecycleControlsLocked(scope, workerId)) {
+                showToast('控制请求进行中，请稍后再试');
+                return;
+            }
+            if (scope === 'global' && desiredState === 'stopped' && !(await confirmStopAll())) return;
+            setDesiredLifecycleState(scope, workerId, desiredState);
+            return;
+        }
         const button = event.target.closest('[data-control-action]'); if (!button) return;
-        const action = button.dataset.controlAction, workerId = button.dataset.workerId || ''; let payload = {};
+        const action = button.dataset.controlAction; let payload = {};
         if (button.dataset.commandValue !== undefined) payload.value = button.dataset.commandValue;
         if (action === 'refresh_instances' || action === 'test_database') { loadControlState(); return; }
         if (action === 'save_account_limit') { const accountId = button.dataset.commandValue || ''; const input = $(`[data-account-limit="${CSS.escape(accountId)}"]`); updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit: Number(input?.value || 0) }, '账号配额已保存'); return; }
@@ -2254,7 +2520,12 @@ function bindEvents() {
     $('#liveLogSenderFilter').addEventListener('change', (event) => { state.logSender = event.target.value; renderLiveLogs(); });
     $$('.live-log-segments [data-log-verbosity]').forEach((button) => button.addEventListener('click', () => setLogVerbosity(button.dataset.logVerbosity)));
     document.addEventListener('click', (event) => { if (!event.target.closest('.column-manager')) $('#columnManagerMenu').hidden = true; });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('#deleteConfirm').hidden) closeDeleteConfirm(false); });
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        if (!$('#deleteConfirm').hidden) closeDeleteConfirm(false);
+        if (!$('#controlStopConfirm').hidden) closeStopAllConfirm(false);
+        if (!$('#authPrompt').hidden) cancelAuthPrompt();
+    });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeDrawer(); $('#columnManagerMenu').hidden = true; } });
 }
 

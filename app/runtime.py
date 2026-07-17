@@ -46,6 +46,12 @@ DEFAULT_PLAN = {
 EVENT_SENDERS = frozenset({'system', 'delivery', 'claim', 'queue'})
 EVENT_VERBOSITIES = frozenset({'detailed', 'normal', 'concise'})
 EVENT_LEVELS = frozenset({'debug', 'info', 'warning', 'error', 'fatal', 'action'})
+DESIRED_STATES = frozenset({'running', 'paused', 'stopped'})
+EXECUTION_STATES = frozenset({
+    'starting', 'running', 'pausing', 'paused', 'stopping', 'stopped', 'error',
+})
+CONTROL_ACK_STATUSES = frozenset({'applying', 'applied', 'failed'})
+CONTROL_PROTOCOL_VERSION = 1
 
 
 class RuntimeMonitor:
@@ -58,7 +64,7 @@ class RuntimeMonitor:
     def __init__(
         self,
         *,
-        client_ttl_seconds: int = 120,
+        client_ttl_seconds: int = 30,
         max_events: int = 1000,
         max_commands: int = 500,
         state_path: Path | str | None = None,
@@ -76,6 +82,9 @@ class RuntimeMonitor:
         self._safety = deepcopy(DEFAULT_SAFETY)
         self._plan = deepcopy(DEFAULT_PLAN)
         self._account_policies: dict[str, dict] = {}
+        self._control_epoch = secrets.token_hex(16)
+        self._control_revision = 0
+        self._workers: dict[str, dict] = {}
         self.started_at = datetime.now().isoformat(timespec='seconds')
         self.started_monotonic = time.monotonic()
         self._load_state()
@@ -141,6 +150,79 @@ class RuntimeMonitor:
             self._plan.update({key: value for key, value in data['plan'].items() if key in DEFAULT_PLAN})
         if isinstance(data.get('accounts'), dict):
             self._account_policies = data['accounts']
+        control_epoch = self._clean_text(data.get('controlEpoch'), 160)
+        if control_epoch:
+            self._control_epoch = control_epoch
+        try:
+            self._control_revision = max(
+                0, int(data.get('revision', data.get('controlRevision')) or 0),
+            )
+        except (TypeError, ValueError):
+            self._control_revision = 0
+        workers = data.get('workers')
+        if isinstance(workers, dict):
+            for raw_worker_id, raw_worker in workers.items():
+                worker_id = self._clean_text(raw_worker_id, 160)
+                if not worker_id or not isinstance(raw_worker, dict):
+                    continue
+                desired_state = self._normalize_choice(
+                    raw_worker.get('desiredState'), DESIRED_STATES, 'stopped',
+                )
+                try:
+                    revision = max(0, int(raw_worker.get('revision') or 0))
+                except (TypeError, ValueError):
+                    revision = 0
+                worker = {
+                    'workerId': worker_id,
+                    'accountId': self._clean_text(raw_worker.get('accountId'), 120),
+                    'alias': self._clean_text(raw_worker.get('alias'), 120),
+                    'role': self._clean_text(raw_worker.get('role'), 40),
+                    'scriptVersion': self._clean_text(raw_worker.get('scriptVersion'), 80),
+                    'registeredAt': self._clean_text(raw_worker.get('registeredAt'), 40) or self._now_iso(),
+                    'updatedAt': self._clean_text(raw_worker.get('updatedAt'), 40) or self._now_iso(),
+                    'desiredState': desired_state,
+                    'revision': revision,
+                    'operationId': self._clean_text(raw_worker.get('operationId'), 160) or None,
+                    'controlAck': None,
+                    'protocolVersion': 0,
+                    'sessionId': '',
+                    'sessionEpoch': 0,
+                    'sequence': 0,
+                }
+                try:
+                    worker['protocolVersion'] = max(0, int(raw_worker.get('protocolVersion') or 0))
+                    worker['sessionEpoch'] = max(0, int(raw_worker.get('sessionEpoch') or 0))
+                    worker['sequence'] = max(0, int(raw_worker.get('sequence') or 0))
+                except (TypeError, ValueError):
+                    worker['protocolVersion'] = 0
+                    worker['sessionEpoch'] = 0
+                    worker['sequence'] = 0
+                worker['sessionId'] = self._clean_text(raw_worker.get('sessionId'), 160)
+                ack = raw_worker.get('controlAck')
+                if isinstance(ack, dict):
+                    ack_status = self._normalize_choice(ack.get('status'), CONTROL_ACK_STATUSES, '')
+                    try:
+                        ack_revision = max(0, int(ack.get('revision') or 0))
+                    except (TypeError, ValueError):
+                        ack_revision = -1
+                    if ack_status and ack_revision >= 0:
+                        worker['controlAck'] = {
+                            'epoch': self._clean_text(ack.get('epoch'), 160),
+                            'revision': ack_revision,
+                            'operationId': self._clean_text(ack.get('operationId'), 160) or None,
+                            'status': ack_status,
+                            'executionState': self._normalize_choice(
+                                ack.get('executionState'), EXECUTION_STATES, 'stopped',
+                            ),
+                            'message': self._clean_text(ack.get('message'), 1000),
+                            'acknowledgedAt': self._clean_text(ack.get('acknowledgedAt'), 40) or self._now_iso(),
+                        }
+                self._workers[worker_id] = worker
+        if self._workers:
+            self._control_revision = max(
+                self._control_revision,
+                max(worker['revision'] for worker in self._workers.values()),
+            )
 
     def _persist_state_locked(
         self,
@@ -148,6 +230,9 @@ class RuntimeMonitor:
         safety: dict | None = None,
         plan: dict | None = None,
         accounts: dict | None = None,
+        control_epoch: str | None = None,
+        control_revision: int | None = None,
+        workers: dict | None = None,
     ) -> None:
         """通过同目录临时文件替换持久化策略；调用时必须已持有条件锁。"""
         if not self._state_path:
@@ -157,6 +242,9 @@ class RuntimeMonitor:
             'safety': self._safety if safety is None else safety,
             'plan': self._plan if plan is None else plan,
             'accounts': self._account_policies if accounts is None else accounts,
+            'controlEpoch': self._control_epoch if control_epoch is None else control_epoch,
+            'revision': self._control_revision if control_revision is None else control_revision,
+            'workers': self._workers if workers is None else workers,
             'updatedAt': self._now_iso(),
         }
         atomic_write_text(self._state_path, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -342,6 +430,97 @@ class RuntimeMonitor:
         result.reverse()
         return result
 
+    @staticmethod
+    def _optional_id(value, limit: int = 160) -> str | None:
+        candidate = str(value or '').strip()[:limit]
+        return candidate or None
+
+    @staticmethod
+    def _integer_field(value, field: str, *, minimum: int = 0) -> int:
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f'invalid_{field}') from error
+        if result < minimum:
+            raise ValueError(f'invalid_{field}')
+        return result
+
+    @classmethod
+    def _execution_state_from_payload(cls, payload: dict, control_ack: dict | None) -> str:
+        candidates = [payload.get('executionState')]
+        if control_ack:
+            candidates.append(control_ack.get('executionState'))
+        for value in candidates:
+            candidate = cls._clean_text(value, 40).lower()
+            if candidate in EXECUTION_STATES:
+                return candidate
+
+        # Heartbeats from pre-control-protocol clients remain observable while they upgrade.
+        if not payload.get('protocolVersion'):
+            legacy_state = cls._clean_text(payload.get('state'), 40).lower()
+            if legacy_state in EXECUTION_STATES:
+                return legacy_state
+            if legacy_state in {'closed', 'exited'}:
+                return 'stopped'
+            return 'paused' if payload.get('paused') else 'running'
+        raise ValueError('invalid_execution_state')
+
+    def _sync_state(self, worker: dict, execution_state: str) -> str:
+        ack = worker.get('controlAck')
+        if not isinstance(ack, dict):
+            return 'pending'
+        if (
+            ack.get('epoch') != self._control_epoch
+            or ack.get('revision') != worker.get('revision')
+            or ack.get('operationId') != worker.get('operationId')
+        ):
+            return 'pending'
+        if ack.get('status') == 'failed':
+            return 'failed'
+        if ack.get('status') != 'applied':
+            return 'applying'
+        return 'synced' if execution_state == worker.get('desiredState') else 'applying'
+
+    def _control_for_worker_locked(self, worker_id: str) -> dict:
+        worker = self._workers[worker_id]
+        return {
+            'epoch': self._control_epoch,
+            'revision': worker['revision'],
+            'operationId': worker.get('operationId'),
+            'desiredState': worker['desiredState'],
+        }
+
+    @staticmethod
+    def _fresh_heartbeat(previous: dict | None, protocol_version: int, session_id: str, session_epoch: int, sequence: int) -> tuple[bool, str]:
+        if not previous:
+            return True, 'accepted'
+        previous_protocol = int(previous.get('_protocolVersion', previous.get('protocolVersion')) or 0)
+        if protocol_version < CONTROL_PROTOCOL_VERSION:
+            return (False, 'stale_protocol') if previous_protocol >= CONTROL_PROTOCOL_VERSION else (True, 'accepted')
+        if previous_protocol < CONTROL_PROTOCOL_VERSION:
+            return True, 'accepted'
+        previous_epoch = int(previous.get('_sessionEpoch', previous.get('sessionEpoch')) or 0)
+        if session_epoch < previous_epoch:
+            return False, 'stale_session'
+        previous_session_id = previous.get('_sessionId', previous.get('sessionId'))
+        if session_epoch == previous_epoch and session_id != previous_session_id:
+            return False, 'stale_session'
+        previous_sequence = int(previous.get('_sequence', previous.get('sequence')) or 0)
+        if session_epoch == previous_epoch and sequence <= previous_sequence:
+            return False, 'stale_sequence'
+        return True, 'accepted'
+
+    def _heartbeat_response(self, worker_id: str, accepted: bool, reason: str) -> dict:
+        snapshot = self.snapshot()
+        with self._condition:
+            control = self._control_for_worker_locked(worker_id)
+        snapshot['commands'] = []
+        snapshot['control'] = control
+        snapshot['heartbeatAccepted'] = accepted
+        if not accepted:
+            snapshot['heartbeatReason'] = reason
+        return snapshot
+
     def heartbeat(self, payload: dict) -> dict:
         """接收工作器心跳并返回当前客户端快照。
 
@@ -351,6 +530,24 @@ class RuntimeMonitor:
         worker_id = self._clean_text(payload.get('workerId'), 160)
         if not worker_id:
             raise ValueError('missing_worker_id')
+        raw_ack = payload.get('controlAck') if isinstance(payload.get('controlAck'), dict) else None
+        try:
+            protocol_version = int(payload.get('protocolVersion') or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError('invalid_protocol_version') from error
+        if protocol_version < 0:
+            raise ValueError('invalid_protocol_version')
+        if protocol_version >= CONTROL_PROTOCOL_VERSION:
+            session_id = self._clean_text(payload.get('sessionId'), 160)
+            if not session_id:
+                raise ValueError('missing_session_id')
+            session_epoch = self._integer_field(payload.get('sessionEpoch'), 'session_epoch')
+            sequence = self._integer_field(payload.get('sequence'), 'sequence')
+        else:
+            session_id = ''
+            session_epoch = 0
+            sequence = 0
+        execution_state = self._execution_state_from_payload(payload, raw_ack)
         now_monotonic = time.monotonic()
         logs = payload.get('logs') if isinstance(payload.get('logs'), list) else []
         events = payload.get('events') if isinstance(payload.get('events'), list) else []
@@ -364,8 +561,9 @@ class RuntimeMonitor:
             'scriptVersion': self._clean_text(payload.get('scriptVersion') or 'unknown', 80),
             'role': self._clean_text(payload.get('role') or 'unknown', 40),
             'state': self._clean_text(payload.get('state') or 'online', 40),
+            'executionState': execution_state,
             'phase': self._clean_text(payload.get('phase'), 120),
-            'paused': bool(payload.get('paused')),
+            'paused': execution_state in {'pausing', 'paused', 'stopping', 'stopped'},
             'keyword': self._clean_text(payload.get('keyword'), 120),
             'currentJob': self._clean_text(payload.get('currentJob'), 300),
             'currentJobUrl': self._clean_text(payload.get('currentJobUrl'), 1000),
@@ -377,11 +575,109 @@ class RuntimeMonitor:
             'consecutiveFailures': max(0, int(payload.get('consecutiveFailures') or 0)),
             'lastSeen': self._now_iso(),
             '_seenMonotonic': now_monotonic,
+            '_protocolVersion': protocol_version,
+            '_sessionId': session_id,
+            '_sessionEpoch': session_epoch,
+            '_sequence': sequence,
         }
         with self._condition:
             previous = self._clients.get(worker_id)
+            previous_session = previous or self._workers.get(worker_id)
+            accepted, heartbeat_reason = self._fresh_heartbeat(
+                previous_session, protocol_version, session_id, session_epoch, sequence,
+            )
+            if not accepted:
+                if worker_id not in self._workers:
+                    # This only applies to a corrupted in-memory state; a stale heartbeat may
+                    # never create a new registration or replace a newer session.
+                    raise ValueError('worker_not_registered')
+                return self._heartbeat_response(worker_id, False, heartbeat_reason)
             if not safe_client['alias']:
                 safe_client['alias'] = (previous or {}).get('alias') or self._account_policies.get(safe_client['accountId'], {}).get('alias', '')
+
+            workers = deepcopy(self._workers)
+            worker = workers.get(worker_id)
+            workers_changed = worker is None
+            if worker is None:
+                worker = {
+                    'workerId': worker_id,
+                    'accountId': safe_client['accountId'],
+                    'alias': safe_client['alias'],
+                    'role': safe_client['role'],
+                    'scriptVersion': safe_client['scriptVersion'],
+                    'registeredAt': safe_client['lastSeen'],
+                    'updatedAt': safe_client['lastSeen'],
+                    'desiredState': 'stopped',
+                    'revision': 0,
+                    'operationId': None,
+                    'controlAck': None,
+                    'protocolVersion': protocol_version,
+                    'sessionId': session_id,
+                    'sessionEpoch': session_epoch,
+                    'sequence': sequence,
+                }
+                workers[worker_id] = worker
+            for field in ('accountId', 'alias', 'role', 'scriptVersion'):
+                if worker.get(field) != safe_client[field]:
+                    worker[field] = safe_client[field]
+                    worker['updatedAt'] = safe_client['lastSeen']
+                    workers_changed = True
+            if protocol_version >= CONTROL_PROTOCOL_VERSION:
+                session_values = {
+                    'protocolVersion': protocol_version,
+                    'sessionId': session_id,
+                    'sessionEpoch': session_epoch,
+                    'sequence': sequence,
+                }
+                if any(worker.get(key) != value for key, value in session_values.items()):
+                    worker.update(session_values)
+                    workers_changed = True
+
+            if raw_ack:
+                try:
+                    ack_revision = int(raw_ack.get('revision'))
+                except (TypeError, ValueError):
+                    ack_revision = -1
+                ack_status = self._clean_text(raw_ack.get('status'), 40).lower()
+                ack_operation_id = self._optional_id(raw_ack.get('operationId'))
+                if (
+                    self._clean_text(raw_ack.get('epoch'), 160) == self._control_epoch
+                    and ack_revision == worker['revision']
+                    and ack_operation_id == worker.get('operationId')
+                    and ack_status in CONTROL_ACK_STATUSES
+                ):
+                    ack_execution_state = self._clean_text(raw_ack.get('executionState'), 40).lower()
+                    if ack_execution_state not in EXECUTION_STATES:
+                        ack_execution_state = execution_state
+                    previous_ack = worker.get('controlAck')
+                    terminal_ack = (
+                        isinstance(previous_ack, dict)
+                        and previous_ack.get('epoch') == self._control_epoch
+                        and previous_ack.get('revision') == worker['revision']
+                        and previous_ack.get('operationId') == worker.get('operationId')
+                        and previous_ack.get('status') in {'applied', 'failed'}
+                    )
+                    if not terminal_ack or ack_status in {'applied', 'failed'}:
+                        acknowledged_at = self._clean_text(raw_ack.get('acknowledgedAt'), 40)
+                        if not acknowledged_at and isinstance(previous_ack, dict):
+                            acknowledged_at = previous_ack.get('acknowledgedAt') or ''
+                        normalized_ack = {
+                            'epoch': self._control_epoch,
+                            'revision': worker['revision'],
+                            'operationId': worker.get('operationId'),
+                            'status': ack_status,
+                            'executionState': ack_execution_state,
+                            'message': self._clean_text(raw_ack.get('message'), 1000),
+                            'acknowledgedAt': acknowledged_at or safe_client['lastSeen'],
+                        }
+                        if normalized_ack != previous_ack:
+                            worker['controlAck'] = normalized_ack
+                            worker['updatedAt'] = safe_client['lastSeen']
+                            workers_changed = True
+
+            if workers_changed:
+                self._persist_state_locked(workers=workers)
+                self._workers = workers
             self._clients[worker_id] = safe_client
         if not previous:
             self.publish('client_connected', {key: value for key, value in safe_client.items() if not key.startswith('_')})
@@ -426,10 +722,7 @@ class RuntimeMonitor:
                 'type': 'worker_last_error',
                 'message': safe_client['lastError'],
             })
-        snapshot = self.snapshot()
-        # 心跳接口只用于监控；浏览器自动化由本地控制，不接收后端可执行命令。
-        snapshot['commands'] = []
-        return snapshot
+        return self._heartbeat_response(worker_id, True, heartbeat_reason)
 
     def record_action(self, action: dict) -> None:
         """把业务动作投影为监控事件；失败类动作还会生成一条运行错误。"""
@@ -554,6 +847,76 @@ class RuntimeMonitor:
         self.publish('account_policy_updated', result)
         return result
 
+    @classmethod
+    def _desired_state(cls, value) -> str:
+        desired_state = cls._clean_text(value, 40).lower()
+        if desired_state not in DESIRED_STATES:
+            raise ValueError('invalid_desired_state')
+        return desired_state
+
+    def _new_control_operation(self, revision: int) -> str:
+        return f"control-{revision:x}-{secrets.token_hex(8)}"
+
+    def set_global_desired_state(self, desired_state: str, *, actor: str = 'dashboard') -> dict:
+        desired_state = self._desired_state(desired_state)
+        updated_at = self._now_iso()
+        with self._condition:
+            revision = self._control_revision + 1
+            operation_id = self._new_control_operation(revision)
+            workers = deepcopy(self._workers)
+            for worker in workers.values():
+                worker.update({
+                    'desiredState': desired_state,
+                    'revision': revision,
+                    'operationId': operation_id,
+                    'updatedAt': updated_at,
+                })
+            self._persist_state_locked(control_revision=revision, workers=workers)
+            self._control_revision = revision
+            self._workers = workers
+            self._condition.notify_all()
+            result = {
+                'operationId': operation_id,
+                'revision': revision,
+                'desiredState': desired_state,
+                'targetCount': len(workers),
+            }
+        self.audit('global_desired_state_updated', result, actor)
+        self.publish('desired_state_updated', {**result, 'scope': 'global'})
+        return result
+
+    def set_worker_desired_state(self, worker_id: str, desired_state: str, *, actor: str = 'dashboard') -> dict:
+        worker_id = self._clean_text(worker_id, 160)
+        if not worker_id:
+            raise KeyError('worker_not_found')
+        desired_state = self._desired_state(desired_state)
+        updated_at = self._now_iso()
+        with self._condition:
+            if worker_id not in self._workers:
+                raise KeyError('worker_not_found')
+            revision = self._control_revision + 1
+            operation_id = self._new_control_operation(revision)
+            workers = deepcopy(self._workers)
+            workers[worker_id].update({
+                'desiredState': desired_state,
+                'revision': revision,
+                'operationId': operation_id,
+                'updatedAt': updated_at,
+            })
+            self._persist_state_locked(control_revision=revision, workers=workers)
+            self._control_revision = revision
+            self._workers = workers
+            self._condition.notify_all()
+            result = {
+                'operationId': operation_id,
+                'revision': revision,
+                'desiredState': desired_state,
+                'targetCount': 1,
+            }
+        self.audit('worker_desired_state_updated', {**result, 'workerId': worker_id}, actor)
+        self.publish('desired_state_updated', {**result, 'scope': 'worker', 'workerId': worker_id})
+        return result
+
     def effective_control(self, worker_id: str, account_id: str) -> dict:
         """合并全局与账号策略，返回工作器当前应采用的只读控制快照。"""
         with self._condition:
@@ -571,21 +934,74 @@ class RuntimeMonitor:
         now = time.monotonic()
         clients = []
         with self._condition:
-            for client in self._clients.values():
-                item = {key: deepcopy(value) for key, value in client.items() if not key.startswith('_')}
-                item['online'] = (
-                    now - client['_seenMonotonic'] <= self.client_ttl_seconds
-                    and item.get('state') not in {'stopped', 'closed', 'exited'}
-                )
+            for worker_id, worker in self._workers.items():
+                client = self._clients.get(worker_id)
+                item = deepcopy(worker)
+                if client:
+                    item.update({
+                        key: deepcopy(value)
+                        for key, value in client.items()
+                        if not key.startswith('_')
+                    })
+                    online = (
+                        now - client['_seenMonotonic'] <= self.client_ttl_seconds
+                        and item.get('state') not in {'closed', 'exited'}
+                    )
+                else:
+                    online = False
+                    item.update({
+                        'state': 'offline',
+                        'phase': '',
+                        'paused': worker['desiredState'] != 'running',
+                        'keyword': '',
+                        'currentJob': '',
+                        'currentJobUrl': '',
+                        'currentDecision': {},
+                        'queue': [],
+                        'path': '',
+                        'counters': {},
+                        'lastError': '',
+                        'consecutiveFailures': 0,
+                        'lastSeen': '',
+                    })
+                execution_state = item.get('executionState')
+                if execution_state not in EXECUTION_STATES:
+                    ack = worker.get('controlAck')
+                    execution_state = (
+                        ack.get('executionState')
+                        if isinstance(ack, dict) and ack.get('executionState') in EXECUTION_STATES
+                        else 'stopped'
+                    )
+                item.update({
+                    'online': online,
+                    'executionState': execution_state,
+                    'desiredState': worker['desiredState'],
+                    'revision': worker['revision'],
+                    'operationId': worker.get('operationId'),
+                    'controlAck': deepcopy(worker.get('controlAck')),
+                    'syncState': self._sync_state(worker, execution_state),
+                    'control': self._control_for_worker_locked(worker_id),
+                })
                 clients.append(item)
             cursor = self._cursor
+            control_epoch = self._control_epoch
+            control_revision = self._control_revision
         clients.sort(key=lambda item: (not item['online'], item['accountId'], item['workerId']))
+        connected_count = sum(1 for item in clients if item['online'])
+        running_count = sum(
+            1 for item in clients
+            if item['online'] and item['executionState'] == 'running'
+        )
         return {
             'serverStartedAt': self.started_at,
             'clientTtlSeconds': self.client_ttl_seconds,
             'cursor': cursor,
-            'activeClientCount': sum(1 for item in clients if item['online']),
-            'connectedClientCount': len(clients),
+            'controlEpoch': control_epoch,
+            'revision': control_revision,
+            'registeredWorkerCount': len(clients),
+            'activeClientCount': running_count,
+            'connectedClientCount': connected_count,
+            'runningClientCount': running_count,
             'clients': clients,
         }
 

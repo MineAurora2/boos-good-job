@@ -1,23 +1,51 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-17-runtime-log-filters.1
+// @version      2026-07-17-remote-control.2
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @connect      *
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-17-runtime-log-filters.1';
+    const SCRIPT_VERSION = '2026-07-17-remote-control.2';
+    const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
+    const CHILD_EXECUTION_PERMISSION_KEY = '__goodjobs_child_execution_permission';
+    const CHILD_EXECUTION_PERMISSION_TTL_MS = 15000;
     const GREET_SESSION_KEY = '__goodjobs_pending_greet_session';
     const MANAGED_CHILD_NAMES = ['__zhipin_detail', '__zhipin_chat', '__zhipin_chat_greet'];
+
+    function writeChildExecutionPermission(state) {
+        try {
+            localStorage.setItem(CHILD_EXECUTION_PERMISSION_KEY, JSON.stringify({
+                state: state === 'running' ? 'running' : 'stopped',
+                updatedAt: Date.now(),
+            }));
+        } catch (_) { /* storage unavailable: child windows fail closed */ }
+    }
+
+    function childExecutionPermitted(now = Date.now()) {
+        try {
+            const value = JSON.parse(localStorage.getItem(CHILD_EXECUTION_PERMISSION_KEY) || '{}');
+            return value.state === 'running'
+                && Number.isFinite(Number(value.updatedAt))
+                && now - Number(value.updatedAt) >= 0
+                && now - Number(value.updatedAt) <= CHILD_EXECUTION_PERMISSION_TTL_MS;
+        } catch (_) {
+            return false;
+        }
+    }
 
     class ScriptStoppedError extends Error {
         constructor(reason = 'script_stopped') {
@@ -41,6 +69,7 @@
         lastCommandType: '',
         lastCommandAt: 0,
         stopPromise: null,
+        stopListeners: new Set(),
         get signal() {
             return this.controller.signal;
         },
@@ -48,8 +77,8 @@
             return this.state !== 'running' || this.signal.aborted;
         },
         guard() {
-            if (this.isStopping() || localStorage.getItem(SCRIPT_DISABLED_KEY) === '1') {
-                throw new ScriptStoppedError(this.reason || 'disabled');
+            if (this.isStopping()) {
+                throw new ScriptStoppedError(this.reason || 'stopped');
             }
         },
         addCleanup(cleanup) {
@@ -60,6 +89,11 @@
             }
             this.cleanups.add(cleanup);
             return () => this.cleanups.delete(cleanup);
+        },
+        addStopListener(listener) {
+            if (typeof listener !== 'function') return () => void 0;
+            this.stopListeners.add(listener);
+            return () => this.stopListeners.delete(listener);
         },
         trackWindow(openedWindow) {
             if (!openedWindow) return openedWindow;
@@ -103,9 +137,24 @@
                     ]);
                 }
                 this.state = 'stopped';
+                for (const listener of Array.from(this.stopListeners)) {
+                    try { listener(reason); } catch (error) {
+                        console.warn('[goodJobs] 执行器停止通知失败', error);
+                    }
+                }
                 console.info(`[goodJobs] 当前页面执行链已停止: ${reason}`);
             })();
             return this.stopPromise;
+        },
+        async restart(signal = null) {
+            if (this.state === 'running' && !this.signal.aborted) return;
+            if (this.stopPromise) await this.stopPromise;
+            if (signal?.aborted) throw new ScriptStoppedError('control_superseded');
+            this.state = 'running';
+            this.reason = '';
+            this.controller = new AbortController();
+            this.cleanups = new Set();
+            this.stopPromise = null;
         },
         publish(type) {
             const command = { type, id: `${Date.now()}-${Math.random().toString(16).slice(2)}` };
@@ -125,10 +174,6 @@
                 });
             };
             const onStorage = (event) => {
-                if (event.key === SCRIPT_DISABLED_KEY && event.newValue === '1') {
-                    onCommand({ type: 'exit', id: 'disabled-storage' });
-                    return;
-                }
                 if (event.key !== SCRIPT_COMMAND_KEY || !event.newValue) return;
                 try { onCommand(JSON.parse(event.newValue)); } catch (_) { /* ignore malformed command */ }
             };
@@ -137,72 +182,17 @@
                 this.channel = new BroadcastChannel(SCRIPT_LIFECYCLE_CHANNEL);
                 this.channel.addEventListener('message', (event) => onCommand(event.data));
             }
-            this.addCleanup(() => {
-                window.removeEventListener('storage', onStorage);
-                try { this.channel?.close(); } catch (_) { /* ignore */ }
-                this.channel = null;
-            });
+            // 控制命令总线属于常驻代理，不能随自动化执行器停止而销毁。
         },
     };
 
-    const scriptLifecycle = {
-        isDisabled() {
-            return localStorage.getItem(SCRIPT_DISABLED_KEY) === '1';
-        },
-        async exit() {
-            if (!window.confirm('确定要退出并关闭 goodJobs 脚本吗？\n关闭后将停止搜索、投递、聊天和心跳。')) return false;
-            const shouldCloseCurrentWindow = MANAGED_CHILD_NAMES.includes(window.name);
-            localStorage.setItem(SCRIPT_DISABLED_KEY, '1');
-            runtimeLifecycle.publish('exit');
-            await runtimeLifecycle.stop('user_exit');
-            if (runtimeLifecycle.childWindows.size) {
-                await new Promise((resolve) => window.setTimeout(resolve, 2100));
-                runtimeLifecycle.closeChildWindows();
-            }
-            if (shouldCloseCurrentWindow) {
-                try { window.close(); } catch (_) { /* ignore */ }
-            } else {
-                try { window.name = ''; } catch (_) { /* ignore */ }
-                window.location.reload();
-            }
-            return true;
-        },
-        enable() {
-            localStorage.removeItem(SCRIPT_DISABLED_KEY);
-            window.location.reload();
-        },
-        async restart() {
-            localStorage.removeItem(SCRIPT_DISABLED_KEY);
-            runtimeLifecycle.publish('restart');
-            await runtimeLifecycle.stop('user_restart');
-            if (runtimeLifecycle.childWindows.size) {
-                await new Promise((resolve) => window.setTimeout(resolve, 2100));
-                runtimeLifecycle.closeChildWindows();
-            }
-            localStorage.setItem('__zhipin_search', String(Date.now()));
-            try { window.name = '__zhipin_search'; } catch (_) { /* ignore */ }
-            const searchUrl = `${window.location.origin}/web/geek/job`;
-            if (window.location.pathname.startsWith('/web/geek/job')) window.location.reload();
-            else window.location.replace(searchUrl);
-        },
-    };
-
-    if (typeof GM_registerMenuCommand === 'function') {
-        GM_registerMenuCommand(
-            scriptLifecycle.isDisabled() ? '启用 goodJobs 脚本' : '退出并关闭 goodJobs 脚本',
-            () => scriptLifecycle.isDisabled() ? scriptLifecycle.enable() : scriptLifecycle.exit()
-        );
-        GM_registerMenuCommand('重启 goodJobs 脚本', () => scriptLifecycle.restart());
-    }
-
-    if (scriptLifecycle.isDisabled()) {
-        console.info('[goodJobs] 脚本已关闭，可通过篡改猴菜单“启用 goodJobs 脚本”重新开启。');
-        return;
-    }
+    // 旧版本的本地禁用状态不再参与运行控制，统一由 Dashboard desired-state 决定。
+    try { localStorage.removeItem(SCRIPT_DISABLED_KEY); } catch (_) { /* ignore legacy cleanup */ }
 
     runtimeLifecycle.installCommandListener(async (command) => {
-        const reason = command.type === 'restart' ? 'remote_restart' : 'remote_exit';
-        await runtimeLifecycle.stop(reason);
+        if (!['stop', 'reload'].includes(command?.type)) return;
+        writeChildExecutionPermission('stopped');
+        await runtimeLifecycle.stop(command.type === 'reload' ? 'remote_reload' : 'remote_stop');
         if (runtimeLifecycle.childWindows.size) {
             await new Promise((resolve) => window.setTimeout(resolve, 2100));
             runtimeLifecycle.closeChildWindows();
@@ -211,13 +201,7 @@
             try { window.close(); } catch (_) { /* ignore */ }
             return;
         }
-        if (command.type === 'restart') {
-            const searchUrl = `${window.location.origin}/web/geek/job`;
-            if (window.location.pathname.startsWith('/web/geek/job')) window.location.reload();
-            else window.location.replace(searchUrl);
-        } else {
-            window.location.reload();
-        }
+        if (command.type === 'reload') window.location.reload();
     });
 
     // 配置项
@@ -702,6 +686,82 @@
         return actual >= minimum;
     }
 
+    const CONNECTION_SETTINGS_KEY = '__goodjobs_backend_connection';
+    let volatileConnectionSettings = null;
+
+    function normalizeServerOrigin(value) {
+        let text = String(value || '').trim();
+        if (!text) throw new Error('后端地址不能为空');
+        if (!/^[a-z][a-z\d+.-]*:\/\//i.test(text)) text = `http://${text}`;
+        let parsed;
+        try {
+            parsed = new URL(text);
+        } catch (_) {
+            throw new Error('后端地址格式无效');
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('后端地址仅支持 HTTP 或 HTTPS');
+        if (!parsed.hostname || parsed.username || parsed.password) throw new Error('后端地址不能包含凭据');
+        if ((parsed.pathname && parsed.pathname !== '/') || parsed.search || parsed.hash) {
+            throw new Error('后端地址只能填写 origin，不能包含路径、查询参数或片段');
+        }
+        return parsed.origin;
+    }
+
+    const connectionSettings = {
+        read() {
+            let value = null;
+            try {
+                if (typeof GM_getValue === 'function') value = GM_getValue(CONNECTION_SETTINGS_KEY, null);
+            } catch (_) { /* use volatile fallback */ }
+            if (!value) value = volatileConnectionSettings;
+            if (!value || typeof value !== 'object') value = {};
+            let baseUrl = OPTIONS.serverHost;
+            try { baseUrl = normalizeServerOrigin(value.baseUrl || baseUrl); } catch (_) { /* keep default */ }
+            return { baseUrl, token: String(value.token || '').trim() };
+        },
+        write(next) {
+            const value = { baseUrl: normalizeServerOrigin(next.baseUrl), token: String(next.token || '').trim() };
+            volatileConnectionSettings = value;
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(CONNECTION_SETTINGS_KEY, value);
+            } catch (_) { /* keep volatile fallback */ }
+            OPTIONS.serverHost = value.baseUrl;
+            return value;
+        },
+        headers() {
+            const token = this.read().token;
+            return token ? { Authorization: `Bearer ${token}` } : {};
+        },
+        configure() {
+            const current = this.read();
+            const rawBaseUrl = window.prompt('请输入 goodJobs 后端 IP/域名与端口：', current.baseUrl);
+            if (rawBaseUrl === null) return;
+            try {
+                const baseUrl = normalizeServerOrigin(rawBaseUrl);
+                const hostChanged = baseUrl !== current.baseUrl;
+                const token = window.prompt(
+                    '公网连接请输入共享访问令牌；局域网免鉴权可留空：',
+                    hostChanged ? '' : current.token
+                );
+                if (token === null) return;
+                this.write({ baseUrl, token });
+                window.alert('后端连接设置已保存，页面将重新连接。');
+                window.location.reload();
+            } catch (error) {
+                window.alert(error.message || String(error));
+            }
+        },
+    };
+
+    OPTIONS.serverHost = connectionSettings.read().baseUrl;
+
+    function applyFrontendConfig(frontend) {
+        if (!frontend || typeof frontend !== 'object') return;
+        const { serverHost: _ignoredServerHost, ...runtimeOptions } = frontend;
+        Object.assign(OPTIONS, runtimeOptions);
+        OPTIONS.serverHost = connectionSettings.read().baseUrl;
+    }
+
     // 每个浏览器配置文件拥有独立 workerId；accountId 可通过油猴菜单设置。
     const deliveryIdentity = {
         accountKey: '__goodjobs_account_id',
@@ -733,38 +793,15 @@
             );
             if (accountId && accountId.trim()) {
                 localStorage.setItem(this.accountKey, accountId.trim());
-                banner(`账号标识已保存：${accountId.trim()}，刷新页面后生效`);
+                window.alert(`账号标识已保存：${accountId.trim()}，页面将重新连接。`);
+                window.location.reload();
             }
         },
     };
 
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('设置 goodJobs 账号标识', () => deliveryIdentity.configure());
-    }
-
-    /**
-     * 横幅
-     * @param {string} text 显示的文本
-     */
-    function banner(text) {
-        const el = document.createElement('div');
-        el.style.cssText = `
-                position: fixed;
-                top: 60px;
-                left: 50%;
-                transform: translateX(-50%);
-                z-index: 9999;
-                background-color: rgba(0,0,0,.5);
-                padding: 4px 20px;
-                text-align: center;
-                border-radius: 8px;
-                color: #fff;
-        `;
-        el.innerText = text;
-        document.body.appendChild(el);
-        setTimeout(function () {
-            el.remove();
-        }, 3000);
+        GM_registerMenuCommand('设置 goodJobs 后端连接', () => connectionSettings.configure());
     }
 
     /**
@@ -1050,8 +1087,16 @@
                 };
                 const onLoad = (resp) => {
                     if (Number(resp?.status) !== 200) {
-                        if (!runtimeLifecycle.isStopping()) banner(`请求失败: ${resp?.status || '未知'}`);
-                        finish(reject, new Error(`HTTP ${resp?.status || 0}`));
+                        let detail = '';
+                        try {
+                            const raw = resp.response ?? resp.responseText;
+                            const parsed = raw && typeof raw === 'object' ? raw : JSON.parse(raw || '{}');
+                            detail = String(parsed.detail || '');
+                        } catch (_) { /* keep HTTP fallback */ }
+                        const error = new Error(detail || `HTTP ${resp?.status || 0}`);
+                        error.status = Number(resp?.status || 0);
+                        error.detail = detail;
+                        finish(reject, error);
                         return;
                     }
                     try {
@@ -1062,7 +1107,6 @@
                     }
                 };
                 const onError = (error) => {
-                    if (!runtimeLifecycle.isStopping()) banner('请求出错');
                     finish(reject, error instanceof Error ? error : new Error(`请求出错: ${JSON.stringify(error)}`));
                 };
 
@@ -1075,7 +1119,7 @@
                     requestHandle = request({
                         method,
                         url: OPTIONS.serverHost + path,
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 'Content-Type': 'application/json', ...connectionSettings.headers() },
                         data,
                         timeout: requestOptions.timeout ?? (requestOptions.allowDuringStop ? 2500 : 1000 * 60 * 10),
                         onload: onLoad,
@@ -1224,14 +1268,21 @@
                 };
                 const handleResponse = (resp) => {
                     if (Number(resp?.status) !== 200) {
-                        finish(null);
+                        let detail = '';
+                        try {
+                            const raw = resp.response ?? resp.responseText;
+                            const parsed = raw && typeof raw === 'object' ? raw : JSON.parse(raw || '{}');
+                            detail = String(parsed.detail || '');
+                        } catch (_) { /* keep status-only result */ }
+                        finish({ ok: false, httpStatus: Number(resp?.status || 0), detail });
                         return;
                     }
                     try {
                         const raw = resp.response ?? resp.responseText;
-                        finish(raw && typeof raw === 'object' ? raw : JSON.parse(raw || '{}'));
+                        const value = raw && typeof raw === 'object' ? raw : JSON.parse(raw || '{}');
+                        finish({ ok: true, ...value });
                     } catch (_) {
-                        finish(null);
+                        finish({ ok: false, httpStatus: Number(resp?.status || 0), detail: 'invalid_response' });
                     }
                 };
 
@@ -1246,248 +1297,410 @@
                     const pending = request({
                         method: 'POST',
                         url: OPTIONS.serverHost + '/api/runtime/heartbeat',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 'Content-Type': 'application/json', ...connectionSettings.headers() },
                         data: JSON.stringify(payload),
                         timeout: 10000,
                         onload: handleResponse,
-                        onerror: () => finish(null),
-                        ontimeout: () => finish(null),
-                        onabort: () => finish(null),
+                        onerror: () => finish({ ok: false, httpStatus: 0, detail: 'network_error' }),
+                        ontimeout: () => finish({ ok: false, httpStatus: 0, detail: 'timeout' }),
+                        onabort: () => finish({ ok: false, httpStatus: 0, detail: 'aborted' }),
                     });
                     if (pending && typeof pending.then === 'function') {
-                        pending.then(handleResponse).catch(() => finish(null));
+                        pending.then(handleResponse).catch(() => finish({ ok: false, httpStatus: 0, detail: 'network_error' }));
                     }
                 } catch (_) {
-                    finish(null);
+                    finish({ ok: false, httpStatus: 0, detail: 'request_unavailable' });
                 }
             });
         }
     }
 
-    // 日志记录
+    // 无 DOM 日志器：运行日志只上报到 Dashboard，不在 BOSS 页面展示或控制。
     class Logger {
-        constructor(startFn, pauseFn, onLog, exitFn) {
-            // 校验函数
-            if (startFn && typeof startFn !== 'function') {
-                throw new Error('参数错误，startFn应为函数');
-            }
-            if (pauseFn && typeof pauseFn !== 'function') {
-                throw new Error('参数错误，pauseFn应为函数');
-            }
-            // 创建元素
-            const ctn = document.createElement('div');
-            const btnBox = document.createElement('div');
-            const clearBtn = document.createElement('button');
-            const runBtn = document.createElement('button');
-            const foldBtn = document.createElement('button');
-            const exitBtn = document.createElement('button');
-            const restartBtn = document.createElement('button');
-            const msgList = document.createElement('div');
-            const style = document.createElement('style');
-            const messageListId = `goodjobs-log-messages-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-            ctn.className = 'goodjobs-log-panel';
-            btnBox.className = 'goodjobs-log-controls';
-            msgList.className = 'goodjobs-log-messages';
-            msgList.id = messageListId;
-            style.textContent = `
-                .goodjobs-log-panel .goodjobs-log-controls button {
-                    appearance: none;
-                    min-width: 0;
-                    height: 34px;
-                    padding: 0 6px;
-                    border: 1px solid rgba(255, 255, 255, 0.14);
-                    border-radius: 5px;
-                    color: #e7f2f6;
-                    background: rgba(255, 255, 255, 0.07);
-                    font: inherit;
-                    line-height: 1;
-                    cursor: pointer;
-                    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
-                }
-                .goodjobs-log-panel .goodjobs-log-controls button:hover {
-                    border-color: rgba(142, 238, 255, 0.5);
-                    background: rgba(142, 238, 255, 0.13);
-                }
-                .goodjobs-log-panel .goodjobs-log-controls button:focus-visible {
-                    outline: 2px solid #8eeeff;
-                    outline-offset: 1px;
-                }
-                .goodjobs-log-panel .goodjobs-log-controls button:active {
-                    background: rgba(142, 238, 255, 0.2);
-                }
-                .goodjobs-log-panel .goodjobs-log-controls button[aria-pressed="true"] {
-                    border-color: rgba(87, 222, 170, 0.55);
-                    color: #a9f4d7;
-                    background: rgba(87, 222, 170, 0.15);
-                }
-                .goodjobs-log-panel .goodjobs-log-controls .goodjobs-log-exit {
-                    color: #ffb2ba;
-                    background: rgba(255, 80, 96, 0.12);
-                }
-                .goodjobs-log-panel .goodjobs-log-controls .goodjobs-log-restart {
-                    color: #a9f4ff;
-                    background: rgba(57, 215, 242, 0.1);
-                }
-                @media (max-width: 440px) {
-                    .goodjobs-log-panel .goodjobs-log-controls button {
-                        height: 36px;
-                        padding: 0 3px;
-                        font-size: 12px;
-                    }
-                }
-            `;
-            ctn.style.cssText = `
-                position: fixed;
-                bottom: 12px;
-                left: 12px;
-                width: min(380px, calc(100vw - 24px));
-                max-height: calc(100vh - 24px);
-                box-sizing: border-box;
-                overflow: hidden;
-                border: 1px solid rgba(255, 255, 255, 0.14);
-                background-color: rgba(7, 18, 24, 0.88);
-                color: #fff;
-                z-index: 9999;
-                font-size: 14px;
-                border-radius: 8px;
-                box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
-                backdrop-filter: blur(8px);
-            `;
-            btnBox.style.cssText = `
-                width: 100%;
-                min-height: 42px;
-                padding: 4px;
-                box-sizing: border-box;
-                display: grid;
-                grid-auto-flow: column;
-                grid-auto-columns: minmax(0, 1fr);
-                align-items: center;
-                gap: 4px;
-            `;
-            msgList.style.cssText = `
-                width: 100%;
-                height: 240px;
-                max-height: calc(100vh - 74px);
-                padding: 2px 12px 8px;
-                box-sizing: border-box;
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-            `;
-            clearBtn.innerText = "清空";
-            runBtn.innerText = "开始";
-            foldBtn.innerText = "收起";
-            exitBtn.innerText = "退出";
-            restartBtn.innerText = "重启";
-            clearBtn.type = runBtn.type = foldBtn.type = exitBtn.type = restartBtn.type = 'button';
-            clearBtn.title = '清空日志';
-            runBtn.title = '开始运行';
-            foldBtn.title = '收起日志';
-            restartBtn.title = '重启脚本';
-            exitBtn.title = '退出脚本';
-            clearBtn.setAttribute('aria-label', clearBtn.title);
-            runBtn.setAttribute('aria-label', runBtn.title);
-            foldBtn.setAttribute('aria-label', foldBtn.title);
-            restartBtn.setAttribute('aria-label', restartBtn.title);
-            exitBtn.setAttribute('aria-label', exitBtn.title);
-            runBtn.setAttribute('aria-pressed', 'false');
-            foldBtn.setAttribute('aria-expanded', 'true');
-            foldBtn.setAttribute('aria-controls', messageListId);
-            restartBtn.className = 'goodjobs-log-restart';
-            exitBtn.className = 'goodjobs-log-exit';
-            document.body.appendChild(ctn);
-            ctn.appendChild(style);
-            ctn.appendChild(btnBox);
-            btnBox.appendChild(clearBtn);
-            btnBox.appendChild(runBtn);
-            btnBox.appendChild(foldBtn);
-            btnBox.appendChild(restartBtn);
-            btnBox.appendChild(exitBtn);
-            ctn.appendChild(msgList);
-            this.ctn = ctn;
-            this.list = msgList;
-            this.runBtn = runBtn;
-            this.clearBtn = clearBtn;
-            this.foldBtn = foldBtn;
-            this.exitBtn = exitBtn;
-            this.restartBtn = restartBtn;
-            this.__startFn = startFn || (() => void 0);
-            this.__pauseFn = pauseFn || (() => void 0);
+        constructor(startFn, pauseFn, onLog) {
+            this.__startFn = typeof startFn === 'function' ? startFn : (() => void 0);
+            this.__pauseFn = typeof pauseFn === 'function' ? pauseFn : (() => void 0);
             this.__onLog = typeof onLog === 'function' ? onLog : (() => void 0);
-            this.__exitFn = typeof exitFn === 'function' ? exitFn : (() => scriptLifecycle.exit());
-            this.__pause = true;
-            clearBtn.addEventListener('click', () => this.clear());
-            runBtn.addEventListener('click', () => {
-                this.__pause = !this.__pause;
-                if (this.__pause) {
-                    runBtn.innerText = "继续";
-                    runBtn.title = '继续运行';
-                    runBtn.setAttribute('aria-label', '继续运行');
-                    runBtn.setAttribute('aria-pressed', 'false');
-                    this.__pauseFn();
-                } else {
-                    runBtn.innerText = "暂停";
-                    runBtn.title = '暂停运行';
-                    runBtn.setAttribute('aria-label', '暂停运行');
-                    runBtn.setAttribute('aria-pressed', 'true');
-                    this.__startFn();
-                }
-            });
-            let logsExpanded = true;
-            foldBtn.addEventListener('click', () => {
-                logsExpanded = !logsExpanded;
-                msgList.style.height = logsExpanded ? '240px' : '32px';
-                foldBtn.innerText = logsExpanded ? '收起' : '展开';
-                foldBtn.title = logsExpanded ? '收起日志' : '展开日志';
-                foldBtn.setAttribute('aria-label', foldBtn.title);
-                foldBtn.setAttribute('aria-expanded', String(logsExpanded));
-                if (!logsExpanded) {
-                    this.list.scrollTop = this.list.scrollHeight;
-                }
-            });
-            exitBtn.addEventListener('click', () => this.__exitFn());
-            restartBtn.addEventListener('click', () => scriptLifecycle.restart());
+        }
+
+        start() {
+            return this.__startFn();
+        }
+
+        pause() {
+            return this.__pauseFn();
         }
 
         add(message, metadata = {}) {
             const entry = createRuntimeLogEntry(message, metadata);
-            const item = document.createElement('div');
-            item.textContent = entry.message;
-            item.dataset.sender = entry.sender;
-            item.dataset.verbosity = entry.verbosity;
-            item.dataset.level = entry.level;
-            if (entry.level === 'error' || entry.level === 'fatal') item.style.color = '#ffb2ba';
-            else if (entry.level === 'warning') item.style.color = '#ffe2a3';
-            this.list.appendChild(item);
-            this.list.scrollTop = this.list.scrollHeight;
             this.__onLog(entry.message, entry);
         }
 
         divider() {
-            const item = document.createElement('div');
-            item.style.cssText = `
-                width: 100%;
-                border-top: 1px dashed rgba(255, 255, 255, 0.6);
-            `;
-            this.list.appendChild(item);
-            this.list.scrollTop = this.list.scrollHeight;
+            this.add('----------------', { sender: 'system', verbosity: 'detailed' });
         }
 
-        clear() {
-            while (this.list.firstChild) {
-                this.list.removeChild(this.list.firstChild);
+        clear() { /* Dashboard owns log display state. */ }
+
+        remove() { /* No page-owned DOM to remove. */ }
+    }
+
+    const STATUS_ICON_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAO+SURBVFhH1VdNSFRRFHaXb6IyIoqQd5N8V9AIlUKjstTC1MhxiohwIS1yFkERBFOLcFFEhpVU6KYIoiKCxBCMiIqChqKSEiuMjJJy2dLlje8653nfue+NjtSiAx869+87/2cmL+9/FUcUVy8UJdtM8DN/VWKidKUjipOO6w3FhFSRcGU6JmRqgShZzd+YlywRosARXmfMlVMW2WxwZS8U52/OWeBWx5W/rYdzgSun8oW3n789q8SE1z4vqyMAL3KOSNHkIY+YWFZVowpb9vlYvmW7dcaC613kXJbA7dksLz12Uu149EIlxictNL4cVutOnVWLvLXWPQISmXP6ojM9IuawsG7wsU/W8vm7qu0f8tH8ZtTfa3j2Sq1qbNWKbLx2S5WlOmfe0sZ55ZxbC1zEiQHv0BFNiMdBtKY9aZ0BEApTyab0sH9ncVmloYTXz7m19WGuh+VEXtV7PfhQBMrPdKvE11/TSrwe0fnCz1heQPOwD0nfog09fdbeivombTXcba4hF8gLzW8/qqUV1dZd9IigAtMdLHAICUfJZSYWCBFnIgF2f/iiKk5367/4vOnmPVU38ND/n7/tuN6kT45uxw8AZEnRgYMBciLFPhJQK5NxuektuJ7WwisjEwYMFr6J2JNltIZHSClYhc+F8Vq1/kKnSoz/1OvxsYlAzMlTZpgIfod0hIzzTVjN3UfWQ4mCsnJV++CE2jNxRSPx44ZqePJc75ccPu7fQRnyNYIj5FHyQJJv4gIuIvP5Gh4tatvpkxM23z4XCAGAHsDXZhTItGe4gm+i1omM1ty9bXoNleEl45YC9UNX9T6Sl+5Unr9srRlIaQV0+2Wb5G7EkNZQTtQTZEeH2vW+yydvHe9R8bERK95UxlCec2DmaAV0E7I2pV9SZlKRS4Hqvj619X6Xqhu8pFpG31keQ5KSwmENDMmfKUTdhr/xA4gbLtfcHQisV6DThQwjnDOJ6JzpRR+unMoTIt9UwJoDcDkNGcwDcw9liskHi/GXl5nZL9At+dvWPEBTsA4ZyYhwhMfRBsipX8ALfB9A6QcU0Eq4Xj8/CFAtA9kGEmJuhgffG8I6oOPKYc6tJcoLAJKPEgpAC0aJobwQAnympCXLw8i1AmHWk0RNRYB/KQkDciY05gQ+BcMk5so71kUDSE6QmEmI1h0+9wPk6UDmR4oQ+bMpkTNcmcbU5VRZRf8g4Q/NB3D7nCwPkcy35KfWo3OA43qfsiZcLqJHNsIS8r2RY/r3Y6bP/wvJDK8UQmRC/0LO0dV/ANbB80cYbkAqAAAAAElFTkSuQmCC';
+    const EXECUTION_LABELS = {
+        starting: '启动中', running: '运行中', pausing: '暂停中', paused: '已暂停',
+        stopping: '结束中', stopped: '已结束', error: '运行异常',
+    };
+    const CONNECTION_LABELS = {
+        connecting: '正在连接后端', connected: '后端已连接', disconnected: '后端已断开',
+        auth: '后端鉴权失败', standby: '其他标签页控制',
+    };
+
+    class StatusIndicator {
+        constructor() {
+            this.connectionState = 'connecting';
+            this.executionState = 'stopped';
+            this.root = null;
+        }
+
+        mount() {
+            if (this.root || !document?.createElement) return;
+            const attach = () => {
+                if (this.root || !document.body) return;
+                const existing = document.getElementById?.('goodjobs-runtime-status');
+                if (existing) {
+                    this.root = existing;
+                    return this.render();
+                }
+                const root = document.createElement('div');
+                const image = document.createElement('img');
+                const copy = document.createElement('div');
+                const connection = document.createElement('strong');
+                const execution = document.createElement('span');
+                root.id = 'goodjobs-runtime-status';
+                root.setAttribute('role', 'status');
+                root.setAttribute('aria-live', 'polite');
+                root.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;width:min(218px,calc(100vw - 24px));height:58px;box-sizing:border-box;display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:10px;padding:8px 11px;border:1px solid rgba(111,226,232,.28);border-radius:8px;background:rgba(10,24,29,.94);box-shadow:0 8px 24px rgba(0,0,0,.26);color:#f4fbfc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;pointer-events:none;user-select:none;letter-spacing:0;';
+                image.src = STATUS_ICON_DATA_URL;
+                image.alt = '';
+                image.width = 40;
+                image.height = 40;
+                image.style.cssText = 'display:block;width:40px;height:40px;object-fit:contain;';
+                copy.style.cssText = 'min-width:0;display:grid;gap:3px;line-height:1.2;letter-spacing:0;';
+                connection.dataset.goodjobsConnection = '1';
+                connection.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650;letter-spacing:0;';
+                execution.dataset.goodjobsExecution = '1';
+                execution.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;';
+                copy.appendChild(connection);
+                copy.appendChild(execution);
+                root.appendChild(image);
+                root.appendChild(copy);
+                document.body.appendChild(root);
+                this.root = root;
+                this.render();
+            };
+            if (document.body) attach();
+            else window.addEventListener('DOMContentLoaded', attach, { once: true });
+        }
+
+        update(connectionState, executionState) {
+            if (connectionState) this.connectionState = connectionState;
+            if (executionState) this.executionState = executionState;
+            this.mount();
+            this.render();
+        }
+
+        render() {
+            if (!this.root) return;
+            const connection = this.root.querySelector?.('[data-goodjobs-connection]');
+            const execution = this.root.querySelector?.('[data-goodjobs-execution]');
+            if (connection) connection.textContent = CONNECTION_LABELS[this.connectionState] || '后端状态未知';
+            if (execution) execution.textContent = `脚本：${EXECUTION_LABELS[this.executionState] || this.executionState}`;
+            const color = this.connectionState === 'connected' ? '#53e394' : (this.connectionState === 'connecting' ? '#68dce7' : '#ff8d8d');
+            this.root.style.borderColor = `${color}55`;
+            this.root.dataset.connectionState = this.connectionState;
+            this.root.dataset.executionState = this.executionState;
+            this.root.title = `${CONNECTION_LABELS[this.connectionState] || '后端状态未知'} · ${EXECUTION_LABELS[this.executionState] || this.executionState} · ${OPTIONS.serverHost}`;
+        }
+    }
+
+    class ControlAgent {
+        constructor() {
+            this.api = new Api();
+            this.identity = deliveryIdentity.get();
+            this.runner = null;
+            this.telemetryProvider = () => ({});
+            this.logs = [];
+            this.executionState = 'stopped';
+            this.connectionState = 'connecting';
+            this.statusIndicator = new StatusIndicator();
+            this.sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            this.sessionEpoch = Math.max(0, Number(localStorage.getItem('__goodjobs_session_epoch') || 0)) + 1;
+            localStorage.setItem('__goodjobs_session_epoch', String(this.sessionEpoch));
+            this.sequence = 0;
+            this.controlAck = null;
+            this.currentControl = null;
+            this.pendingControl = null;
+            this.queuedControl = null;
+            this.transitionGeneration = 0;
+            this.transitionController = null;
+            this.heartbeatBusy = false;
+            this.lastHeartbeatOkAt = 0;
+            this.timer = null;
+        }
+
+        attachRunner(runner) {
+            this.runner = runner;
+        }
+
+        setTelemetryProvider(provider) {
+            this.telemetryProvider = typeof provider === 'function' ? provider : (() => ({}));
+        }
+
+        queueLog(message, metadata = {}) {
+            const entry = createRuntimeLogEntry(message, metadata);
+            this.logs.push(entry);
+            if (this.logs.length > 200) this.logs.splice(0, this.logs.length - 200);
+        }
+
+        isTransitionCurrent(generation) {
+            return generation == null || Number(generation) === this.transitionGeneration;
+        }
+
+        setExecutionState(state, generation = null) {
+            if (!this.isTransitionCurrent(generation)) return false;
+            if (state && EXECUTION_LABELS[state]) this.executionState = state;
+            this.statusIndicator.update(this.connectionState, this.executionState);
+            return true;
+        }
+
+        start() {
+            this.statusIndicator.update('connecting', this.executionState);
+            this.pulse();
+            this.timer = window.setInterval(() => this.pulse(), 5000);
+            const pulse = () => this.pulse();
+            window.addEventListener('focus', pulse);
+            window.addEventListener('online', pulse);
+            window.addEventListener('pageshow', pulse);
+            document.addEventListener?.('visibilitychange', () => {
+                if (document.visibilityState === 'visible') pulse();
+            });
+        }
+
+        async pulse() {
+            if (this.heartbeatBusy) return;
+            this.heartbeatBusy = true;
+            const logs = this.logs.splice(0, 50);
+            try {
+                const telemetry = this.telemetryProvider() || {};
+                const result = await this.api.heartbeat({
+                    workerId: this.identity.workerId,
+                    accountId: this.identity.accountId,
+                    alias: localStorage.getItem('__goodjobs_worker_alias') || '',
+                    scriptVersion: SCRIPT_VERSION,
+                    protocolVersion: CONTROL_PROTOCOL_VERSION,
+                    sessionId: this.sessionId,
+                    sessionEpoch: this.sessionEpoch,
+                    sequence: ++this.sequence,
+                    role: telemetry.role || 'controller',
+                    state: this.executionState,
+                    executionState: this.executionState,
+                    phase: telemetry.phase || EXECUTION_LABELS[this.executionState],
+                    paused: ['pausing', 'paused', 'stopping', 'stopped'].includes(this.executionState),
+                    keyword: telemetry.keyword || '',
+                    currentJob: telemetry.currentJob || '',
+                    currentJobUrl: telemetry.currentJobUrl || '',
+                    currentDecision: telemetry.currentDecision || {},
+                    queue: Array.isArray(telemetry.queue) ? telemetry.queue : [],
+                    path: window.location.pathname,
+                    counters: telemetry.counters || {},
+                    lastError: telemetry.lastError || '',
+                    consecutiveFailures: telemetry.consecutiveFailures || 0,
+                    controlAck: this.controlAck,
+                    logs,
+                });
+                if (!result?.ok) {
+                    this.logs.unshift(...logs);
+                    const authFailure = [401, 426, 503].includes(Number(result?.httpStatus));
+                    this.connectionState = authFailure ? 'auth' : 'disconnected';
+                    if (Date.now() - this.lastHeartbeatOkAt >= 30000) this.requestSafetyPause('backend_disconnected');
+                    this.statusIndicator.update(this.connectionState, this.executionState);
+                    return;
+                }
+                this.lastHeartbeatOkAt = Date.now();
+                if (result.heartbeatAccepted === false) {
+                    this.connectionState = 'standby';
+                    this.requestSafetyPause('stale_session');
+                    this.statusIndicator.update(this.connectionState, this.executionState);
+                    return;
+                }
+                this.connectionState = 'connected';
+                this.statusIndicator.update(this.connectionState, this.executionState);
+                if (result.control?.desiredState === 'stopped') {
+                    writeChildExecutionPermission('stopped');
+                } else if (result.control?.desiredState === 'running'
+                    && ['starting', 'running'].includes(this.executionState)) {
+                    writeChildExecutionPermission('running');
+                }
+                if (result.control) this.applyControl(result.control);
+            } catch (error) {
+                this.logs.unshift(...logs);
+                this.connectionState = 'disconnected';
+                if (Date.now() - this.lastHeartbeatOkAt >= 30000) this.requestSafetyPause('backend_disconnected');
+                this.statusIndicator.update(this.connectionState, this.executionState);
+            } finally {
+                if (this.logs.length > 200) this.logs.splice(200);
+                this.heartbeatBusy = false;
             }
         }
 
-        remove() {
-            this.ctn.remove();
+        sameControl(left, right) {
+            return Boolean(left && right
+                && left.epoch === right.epoch
+                && Number(left.revision) === Number(right.revision)
+                && left.operationId === right.operationId);
+        }
+
+        requestSafetyPause(reason = 'backend_disconnected') {
+            if (!this.runner?.applyDesiredState || !['starting', 'running'].includes(this.executionState)) return;
+            if (this.pendingControl?.desiredState === 'stopped' || this.pendingControl?.safety) return;
+            this.startTransition({
+                desiredState: 'paused',
+                safety: true,
+                reason,
+            }, { preempt: true, safety: true });
+        }
+
+        startTransition(control, { preempt = false, safety = false } = {}) {
+            if (preempt) {
+                try { this.transitionController?.abort(new ScriptStoppedError('control_superseded')); }
+                catch (_) { this.transitionController?.abort(); }
+            }
+            const generation = ++this.transitionGeneration;
+            const controller = new AbortController();
+            this.transitionController = controller;
+            this.pendingControl = control;
+            const desiredState = control.desiredState;
+            const stableState = desiredState;
+
+            if (!safety) {
+                this.currentControl = control;
+                this.controlAck = {
+                    epoch: control.epoch,
+                    revision: Number(control.revision || 0),
+                    operationId: control.operationId || '',
+                    status: 'applying',
+                    executionState: this.executionState,
+                    message: '',
+                    acknowledgedAt: new Date().toISOString(),
+                };
+            }
+
+            Promise.resolve().then(() => {
+                if (!this.isTransitionCurrent(generation) || controller.signal.aborted) {
+                    throw new ScriptStoppedError('control_superseded');
+                }
+                return this.runner?.applyDesiredState?.(desiredState, {
+                    generation,
+                    signal: controller.signal,
+                    preempt,
+                    safety,
+                    reason: control.reason || '',
+                });
+            })
+                .then((result) => {
+                    if (!this.isTransitionCurrent(generation)) return;
+                    const nextState = typeof result === 'string' ? result : (result?.state || desiredState);
+                    const applied = typeof result === 'object' ? result.applied !== false : nextState === stableState;
+                    const failed = typeof result === 'object' && result.failed === true;
+                    this.setExecutionState(nextState, generation);
+                    if (safety) {
+                        if (nextState === 'paused') {
+                            this.queueLog(`控制连接中断，已安全暂停：${control.reason || 'backend_disconnected'}`, {
+                                sender: 'system', verbosity: 'concise', level: 'warning',
+                            });
+                        }
+                        return;
+                    }
+                    this.controlAck = {
+                        ...this.controlAck,
+                        status: failed ? 'failed' : (applied ? 'applied' : 'applying'),
+                        executionState: nextState,
+                        message: failed ? String(result.message || '无法应用控制状态').slice(0, 500) : '',
+                        acknowledgedAt: new Date().toISOString(),
+                    };
+                })
+                .catch((error) => {
+                    if (!this.isTransitionCurrent(generation)) return;
+                    if (safety && isStopError(error)) return;
+                    this.setExecutionState('error', generation);
+                    if (safety) {
+                        this.queueLog(`控制连接中断，安全暂停失败：${error?.message || error}`, {
+                            sender: 'system', verbosity: 'concise', level: 'error',
+                        });
+                        return;
+                    }
+                    this.controlAck = {
+                        ...this.controlAck,
+                        status: 'failed',
+                        executionState: 'error',
+                        message: String(error?.message || error).slice(0, 500),
+                        acknowledgedAt: new Date().toISOString(),
+                    };
+                })
+                .finally(() => {
+                    if (!this.isTransitionCurrent(generation)) return;
+                    this.pendingControl = null;
+                    this.transitionController = null;
+                    this.pulse();
+                    const queued = this.queuedControl;
+                    this.queuedControl = null;
+                    if (queued) this.applyControl(queued);
+                });
+        }
+
+        applyControl(control) {
+            if (!['running', 'paused', 'stopped'].includes(control?.desiredState)) return;
+            if (this.pendingControl) {
+                if (this.sameControl(this.pendingControl, control)) return;
+                if (control.desiredState === 'stopped') {
+                    this.queuedControl = null;
+                    this.startTransition(control, { preempt: true });
+                } else {
+                    this.queuedControl = control;
+                }
+                return;
+            }
+            const stableState = control.desiredState === 'running' ? 'running' : control.desiredState;
+            if (this.sameControl(this.currentControl, control)) {
+                if (this.controlAck?.status === 'failed') return;
+                if (this.controlAck?.status === 'applied' && this.executionState === stableState) return;
+            }
+            if (this.executionState === stableState && this.currentControl) {
+                this.currentControl = control;
+                this.controlAck = {
+                    epoch: control.epoch,
+                    revision: Number(control.revision || 0),
+                    operationId: control.operationId || '',
+                    status: 'applied',
+                    executionState: stableState,
+                    message: '',
+                    acknowledgedAt: new Date().toISOString(),
+                };
+                this.pulse();
+                return;
+            }
+            this.startTransition(control);
         }
     }
 
     // boss 直聘
     class Zhipin {
-        constructor() {
+        constructor(controlAgent = null) {
+            this.controlAgent = controlAgent;
+            this.automationControl = null;
+            this.searchPrepared = false;
             // 窗口标签
             this.targets = {
                 search: "__zhipin_search",
@@ -1512,7 +1725,80 @@
             // 记录状态
             this.pause = false;
             this.tags = [];
-            this.introduce = ''
+            this.introduce = '';
+            runtimeLifecycle.addStopListener((reason) => this.resetExecutor(reason));
+        }
+
+        resetExecutor(reason = '') {
+            writeChildExecutionPermission('stopped');
+            this.pause = true;
+            this.searchPrepared = false;
+            this.automationControl = null;
+            this.broadcast = null;
+            this.tags = [];
+            this.introduce = '';
+            this.controlAgent?.setTelemetryProvider(null);
+            if (this.controlAgent && !['stopped', 'error'].includes(this.controlAgent.executionState)) {
+                this.controlAgent.setExecutionState('stopped');
+                if (reason && reason !== 'remote_stop') {
+                    this.controlAgent.queueLog(`自动化执行器已清理：${reason}`, {
+                        sender: 'system', verbosity: 'concise', level: 'warning',
+                    });
+                }
+            }
+        }
+
+        async applyDesiredState(desiredState, transition = {}) {
+            if (transition.signal?.aborted) throw new ScriptStoppedError('control_superseded');
+            if (desiredState === 'stopped') writeChildExecutionPermission('stopped');
+            if (desiredState === 'running') {
+                if (runtimeLifecycle.isStopping()) {
+                    this.controlAgent?.setExecutionState('starting', transition.generation);
+                    await runtimeLifecycle.restart(transition.signal);
+                    if (transition.signal?.aborted
+                        || (this.controlAgent && !this.controlAgent.isTransitionCurrent(transition.generation))) {
+                        throw new ScriptStoppedError('control_superseded');
+                    }
+                }
+                writeChildExecutionPermission('running');
+                if (!window.location.pathname.startsWith(SEARCHPATH.zhipin)) {
+                    this.controlAgent?.setExecutionState('starting', transition.generation);
+                    const navigate = () => {
+                        if (transition.signal?.aborted
+                            || (this.controlAgent && !this.controlAgent.isTransitionCurrent(transition.generation))) return;
+                        localStorage.setItem(this.targets.search, String(Date.now()));
+                        try { window.name = this.targets.search; } catch (_) { /* ignore */ }
+                        window.location.replace(`${window.location.origin}${SEARCHPATH.zhipin}`);
+                    };
+                    const navigationTimer = window.setTimeout(navigate, 250);
+                    const cancelNavigation = () => window.clearTimeout(navigationTimer);
+                    transition.signal?.addEventListener('abort', cancelNavigation, { once: true });
+                    runtimeLifecycle.addCleanup(cancelNavigation);
+                    return { state: 'starting', applied: false };
+                }
+                if (!this.searchPrepared) this.run();
+                const deadline = Date.now() + 1500;
+                while (!this.automationControl && Date.now() < deadline) {
+                    await new Promise((resolve) => window.setTimeout(resolve, 20));
+                }
+                if (!this.automationControl) throw new Error('自动化执行器初始化失败');
+                return this.automationControl.start(transition);
+            }
+            if (!this.automationControl) {
+                this.pause = desiredState === 'paused';
+                if (desiredState === 'stopped' && !runtimeLifecycle.isStopping()) {
+                    runtimeLifecycle.publish('stop');
+                    await runtimeLifecycle.stop('remote_stop');
+                    runtimeLifecycle.closeChildWindows();
+                }
+                return desiredState;
+            }
+            if (desiredState === 'paused') return this.automationControl.pause(Boolean(transition.safety), transition);
+            return this.automationControl.stop(transition);
+        }
+
+        async suspendForDisconnect(reason = 'backend_disconnected') {
+            this.controlAgent?.requestSafetyPause(reason);
         }
 
         // 注册广播
@@ -1523,6 +1809,8 @@
 
         // 搜索页
         async __search(tagIdx) {
+            if (this.searchPrepared) return;
+            this.searchPrepared = true;
             // api
             const api = new Api();
             const identity = deliveryIdentity.get();
@@ -1535,6 +1823,7 @@
             let elsLen = 0;
             // 运行状态
             let started = false;
+            let initializationPromise = null;
             let pendingRoundRestart = false;
             let roundTransitioning = false;
             let currentRound = 0;
@@ -1557,146 +1846,150 @@
             };
             const control = {
                 stopped: false,
-                heartbeatBusy: false,
-                health: {
-                    startedAt: new Date().toISOString(),
-                    lastHeartbeatAt: '',
-                    lastHeartbeatOkAt: '',
-                    heartbeatFailures: 0,
-                },
             };
 
             const queueRuntimeLog = (message, metadata = {}) => {
                 const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : { level: metadata };
-                runtime.logs.push(createRuntimeLogEntry(message, {
-                    ...normalizedMetadata,
-                    loggedAt: normalizedMetadata.loggedAt || new Date().toISOString(),
-                }));
-                if (runtime.logs.length > 200) runtime.logs.splice(0, runtime.logs.length - 200);
-            };
-
-            const sendRuntimeHeartbeat = async (statePatch = null) => {
-                if (control.heartbeatBusy) return;
-                control.heartbeatBusy = true;
-                let logs = [];
-                let logsRestored = false;
-                const restoreLogs = () => {
-                    if (logsRestored || !logs.length) return;
-                    runtime.logs.unshift(...logs.slice(-100));
-                    logsRestored = true;
-                };
-                try {
-                    if (statePatch) Object.assign(runtime, statePatch);
-                    logs = runtime.logs.splice(0, 50);
-                    control.health.lastHeartbeatAt = new Date().toISOString();
-                    const result = await api.heartbeat({
-                        workerId: identity.workerId,
-                        accountId: identity.accountId,
-                        alias: localStorage.getItem('__goodjobs_worker_alias') || '',
-                        scriptVersion: SCRIPT_VERSION,
-                        role: 'search',
-                        state: runtime.state,
-                        phase: runtime.phase,
-                        paused: this.pause,
-                        keyword: runtime.keyword,
-                        currentJob: runtime.currentJob,
-                        currentJobUrl: runtime.currentJobUrl,
-                        currentDecision: runtime.currentDecision,
-                        queue: jobHrefs.slice(0, 50).map((url, index) => ({
-                            id: url,
-                            url,
-                            status: index === 0 ? 'next' : 'pending',
-                            keyword: currentKeyword,
-                        })),
-                        path: window.location.pathname,
-                        counters: runtime.counters,
-                        lastError: runtime.lastError,
-                        consecutiveFailures: runtime.consecutiveFailures,
-                        config: { threshold: OPTIONS.thread, onlyGreet: OPTIONS.onlyGreet },
-                        health: { ...control.health, visible: document.visibilityState === 'visible', broadcastReady: Boolean(this.broadcast) },
-                        logs,
-                    });
-                    if (!result) {
-                        restoreLogs();
-                        control.health.heartbeatFailures += 1;
-                    } else {
-                        control.health.lastHeartbeatOkAt = new Date().toISOString();
-                        control.health.heartbeatFailures = 0;
-                        // 后端心跳只用于监控，不接受或执行远程控制命令。
-                    }
-                } catch (error) {
-                    restoreLogs();
-                    control.health.heartbeatFailures += 1;
-                    console.warn('[goodJobs] 运行状态心跳失败，将在下一轮重试', error);
-                } finally {
-                    control.heartbeatBusy = false;
+                if (this.controlAgent) {
+                    this.controlAgent.queueLog(message, normalizedMetadata);
+                } else {
+                    runtime.logs.push(createRuntimeLogEntry(message, {
+                        ...normalizedMetadata,
+                        loggedAt: normalizedMetadata.loggedAt || new Date().toISOString(),
+                    }));
+                    if (runtime.logs.length > 200) runtime.logs.splice(0, runtime.logs.length - 200);
                 }
             };
 
-            // 日志启动暂停事件
-            const logger = new Logger(() => {
+            this.controlAgent?.setTelemetryProvider(() => ({
+                role: 'search',
+                phase: runtime.phase,
+                keyword: runtime.keyword,
+                currentJob: runtime.currentJob,
+                currentJobUrl: runtime.currentJobUrl,
+                currentDecision: runtime.currentDecision,
+                queue: jobHrefs.slice(0, 50).map((url, index) => ({
+                    id: url,
+                    url,
+                    status: index === 0 ? 'next' : 'pending',
+                    keyword: currentKeyword,
+                })),
+                counters: runtime.counters,
+                lastError: runtime.lastError,
+                consecutiveFailures: runtime.consecutiveFailures,
+            }));
+
+            const sendRuntimeHeartbeat = async (statePatch = null, transition = null) => {
+                if (statePatch) Object.assign(runtime, statePatch);
+                const mapped = runtime.state === 'idle' ? 'stopped' : runtime.state;
+                if (EXECUTION_LABELS[mapped]) this.controlAgent?.setExecutionState(mapped, transition?.generation);
+                return this.controlAgent?.pulse();
+            };
+
+            const transitionIsCurrent = (transition = {}) => (
+                !transition.signal?.aborted
+                && (!this.controlAgent || this.controlAgent.isTransitionCurrent(transition.generation))
+            );
+
+            const updateTransitionState = (state, transition = {}) => {
+                if (!transitionIsCurrent(transition)) return false;
+                return this.controlAgent?.setExecutionState(state, transition.generation) !== false;
+            };
+
+            const teardownExecutor = async (reason) => {
+                this.pause = true;
+                control.stopped = true;
+                runtimeLifecycle.publish('stop');
+                await runtimeLifecycle.stop(reason);
+                runtimeLifecycle.closeChildWindows();
+                this.resetExecutor(reason);
+            };
+
+            const startAutomation = async (transition = {}) => {
+                if (!transitionIsCurrent(transition)) return { state: 'stopped', applied: false };
+                if (runtimeLifecycle.isStopping()) return { state: 'starting', applied: false };
+                control.stopped = false;
                 this.pause = false;
                 runtime.state = 'running';
                 runtime.phase = '继续运行';
+                updateTransitionState('starting', transition);
                 if (!started) {
-                    main().catch((error) => {
-                        if (!isStopError(error)) logger.add(`初始化失败: ${error}`, { sender: 'system', verbosity: 'concise', level: 'error' });
-                    });
-                    return;
+                    if (!initializationPromise) {
+                        initializationPromise = main().catch(async (error) => {
+                            if (!isStopError(error)) {
+                                logger.add(`初始化失败: ${error}`, { sender: 'system', verbosity: 'concise', level: 'error' });
+                                await teardownExecutor('initialization_failed');
+                            }
+                            throw error;
+                        }).finally(() => {
+                            initializationPromise = null;
+                        });
+                    }
+                    await initializationPromise;
+                    if (!transitionIsCurrent(transition)) return { state: runtime.state, applied: false };
+                    if (this.pause) {
+                        updateTransitionState('paused', transition);
+                        return { state: 'paused', applied: false, failed: true, message: runtime.phase };
+                    }
+                    updateTransitionState('running', transition);
+                    return 'running';
                 }
                 if (pendingRoundRestart) {
                     pendingRoundRestart = false;
-                    return startRound();
+                    await startRound();
+                } else {
+                    loop();
                 }
-                loop();
-            }, () => {
-                this.pause = true;
-                runtime.state = 'paused';
-                runtime.phase = '用户暂停';
-                sendRuntimeHeartbeat();
-            }, queueRuntimeLog);
-            runtimeLifecycle.addCleanup(() => logger.remove());
+                if (!transitionIsCurrent(transition)) return { state: runtime.state, applied: false };
+                updateTransitionState('running', transition);
+                return 'running';
+            };
 
-            const heartbeatTimer = window.setInterval(() => sendRuntimeHeartbeat(), 8000);
-            const resumeHeartbeat = () => {
-                if (control.stopped || scriptLifecycle.isDisabled()) return;
-                sendRuntimeHeartbeat();
+            const pauseAutomation = async (safetyPause = false, transition = {}) => {
+                this.pause = true;
+                runtime.state = 'pausing';
+                runtime.phase = safetyPause ? '控制连接中断，安全暂停中' : '等待当前动作安全收尾';
+                updateTransitionState('pausing', transition);
+                sendRuntimeHeartbeat(null, transition);
+                while (!control.stopped && !transition.signal?.aborted && (
+                    (typeof loopRunning !== 'undefined' && loopRunning)
+                    || (typeof startRoundRunning !== 'undefined' && startRoundRunning)
+                    || roundTransitioning
+                    || (typeof pendingGreetId !== 'undefined' && Boolean(pendingGreetId))
+                )) {
+                    await new Promise((resolve) => window.setTimeout(resolve, 100));
+                }
+                if (control.stopped || !transitionIsCurrent(transition)) {
+                    return { state: control.stopped ? 'stopping' : runtime.state, applied: false };
+                }
+                runtime.state = 'paused';
+                runtime.phase = safetyPause ? '后端断开，已安全暂停' : '网页控制暂停';
+                updateTransitionState('paused', transition);
+                sendRuntimeHeartbeat(null, transition);
+                return 'paused';
             };
-            const onVisibilityChange = () => {
-                if (document.visibilityState === 'visible') resumeHeartbeat();
-            };
-            const onBeforeUnload = () => {
-                window.clearInterval(heartbeatTimer);
+
+            const stopAutomation = async (transition = {}) => {
+                this.pause = true;
                 control.stopped = true;
-                sendRuntimeHeartbeat({ state: 'stopped', phase: '页面关闭' });
+                runtime.state = 'stopping';
+                runtime.phase = '正在结束并清理执行链';
+                updateTransitionState('stopping', transition);
+                await teardownExecutor('remote_stop');
+                runtime.state = 'stopped';
+                runtime.phase = '网页控制结束，等待再次开启';
+                updateTransitionState('stopped', transition);
+                return 'stopped';
             };
-            document.addEventListener('visibilitychange', onVisibilityChange);
-            window.addEventListener('focus', resumeHeartbeat);
-            window.addEventListener('online', resumeHeartbeat);
-            window.addEventListener('pageshow', resumeHeartbeat);
-            window.addEventListener('beforeunload', onBeforeUnload);
-            runtimeLifecycle.addCleanup(() => {
-                window.clearInterval(heartbeatTimer);
-                control.stopped = true;
-                const stoppedHeartbeat = api.heartbeat({
-                    workerId: identity.workerId,
-                    accountId: identity.accountId,
-                    scriptVersion: SCRIPT_VERSION,
-                    role: 'search',
-                    state: 'stopped',
-                    phase: runtimeLifecycle.reason === 'user_restart' ? '脚本重启' : '脚本退出',
-                    paused: true,
-                    path: window.location.pathname,
-                    counters: runtime.counters,
-                    logs: [],
-                });
-                document.removeEventListener('visibilitychange', onVisibilityChange);
-                window.removeEventListener('focus', resumeHeartbeat);
-                window.removeEventListener('online', resumeHeartbeat);
-                window.removeEventListener('pageshow', resumeHeartbeat);
-                window.removeEventListener('beforeunload', onBeforeUnload);
-                return stoppedHeartbeat;
-            });
+
+            // 日志仅上报，运行控制只接受 ControlAgent 下发的 desired-state。
+            const logger = new Logger(startAutomation, () => pauseAutomation(false), queueRuntimeLog);
+            this.automationControl = {
+                start: startAutomation,
+                pause: pauseAutomation,
+                stop: stopAutomation,
+            };
+            runtimeLifecycle.addCleanup(() => logger.remove());
 
             // 开始广播
             const startBroadcast = () => {
@@ -2698,7 +2991,6 @@
 
             // 主函数
             const main = async () => {
-                started = true;
                 runtime.state = 'running';
                 runtime.phase = '初始化脚本';
                 logger.add('--程序启动--', { sender: 'system', verbosity: 'concise' });
@@ -2711,7 +3003,7 @@
                     return null;
                 });
                 if (clientConfig && clientConfig.frontend) {
-                    Object.assign(OPTIONS, clientConfig.frontend);
+                    applyFrontendConfig(clientConfig.frontend);
                     logger.add('获取前端配置成功', { sender: 'system', verbosity: 'detailed' });
                 }
                 logger.add(`浏览器实例: ${identity.workerId}`, { sender: 'system', verbosity: 'detailed' });
@@ -2741,6 +3033,9 @@
                     if (daily.reached) {
                         logger.add('今日打招呼已达上限，暂停运行', { sender: 'claim', verbosity: 'concise', level: 'warning' });
                         this.pause = true;
+                        runtime.state = 'paused';
+                        runtime.phase = '今日打招呼已达上限';
+                        started = true;
                         return;
                     }
                 } catch (e) {
@@ -2748,17 +3043,10 @@
                     logger.add('每日限制检查失败', { sender: 'claim', verbosity: 'concise', level: 'error' });
                 }
                 await startRound();
+                started = true;
             };
 
-            // 初始化
-            const init = () => {
-                // 如果时间戳小于阈值，直接运行
-                if (start - tools.getTimestamp(this.targets.search) < OPTIONS.timestampTimeout) {
-                    logger.runBtn.click();
-                }
-            };
-
-            init();
+            // 首次保持 stopped，等待 ControlAgent 从 Dashboard 获取 desired-state。
         }
 
         // 详情页
@@ -3206,7 +3494,7 @@
                 // 开始广播
                 startBroadcast(this.targets.chat);
                 const clientConfig = await api.getClientConfig().catch(() => null);
-                if (clientConfig?.frontend) Object.assign(OPTIONS, clientConfig.frontend);
+                if (clientConfig?.frontend) applyFrontendConfig(clientConfig.frontend);
                 // 获取默认自我介绍（兜底）
                 const defaultIntroduce = (await this.broadcast.sendAndReceive(
                     this.targets.search,
@@ -3522,10 +3810,7 @@
                     await sayHi();
                 }
                 else if (isChat) {
-                    // 日志
                     logger = new Logger();
-                    logger.runBtn.remove();
-                    logger.clearBtn.remove();
                     // 等待加载
                     await tools.asyncSleep(3000);
                     runtimeLifecycle.guard();
@@ -3581,10 +3866,32 @@
             hrActivePasses,
             createRuntimeLogEntry,
             createRuntimeActionPayload,
+            normalizeServerOrigin,
+            applyFrontendConfig,
+            connectionSettings,
             Logger,
+            StatusIndicator,
+            ControlAgent,
+            Zhipin,
+            runtimeLifecycle,
+            writeChildExecutionPermission,
+            childExecutionPermitted,
         });
         return;
     }
 
-    const goodjobs = new Zhipin().run();
+    if (MANAGED_CHILD_NAMES.includes(window.name)) {
+        if (childExecutionPermitted()) {
+            new Zhipin().run();
+        } else {
+            try { window.close(); } catch (_) { /* fail closed without disturbing the parent page */ }
+        }
+    } else {
+        // 每次普通页面重新加载都先撤销旧授权，等待本次控制会话从后端重新确认 running。
+        writeChildExecutionPermission('stopped');
+        const controlAgent = new ControlAgent();
+        const goodjobs = new Zhipin(controlAgent);
+        controlAgent.attachRunner(goodjobs);
+        controlAgent.start();
+    }
 })();

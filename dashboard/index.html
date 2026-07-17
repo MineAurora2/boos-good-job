@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-live-log-filters">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-control-center">
 </head>
 <body>
     <div class="app-shell">
@@ -112,9 +112,22 @@
                     <div class="control-sync"><span id="controlSyncDot"></span><div><strong id="controlSyncText">正在连接控制服务</strong><small id="controlUpdatedAt">尚未同步</small></div><button id="refreshControl" type="button">刷新</button></div>
                 </div>
 
+                <div class="control-global-bar panel" aria-label="全部浏览器实例控制">
+                    <div class="control-global-status" id="globalControlStatus">
+                        <span class="control-power" aria-hidden="true">●</span>
+                        <div><strong id="globalDesiredState">全局状态：等待实例接入</strong><small id="globalControlFeedback" aria-live="polite">操作会应用到当前已登记的全部实例</small></div>
+                    </div>
+                    <div class="control-primary-actions" role="group" aria-label="全部实例生命周期">
+                        <button type="button" class="control-command start" data-control-scope="global" data-desired-state="running"><span aria-hidden="true">▶</span> 开启全部</button>
+                        <button type="button" class="control-command pause" data-control-scope="global" data-desired-state="paused"><span aria-hidden="true">Ⅱ</span> 暂停全部</button>
+                        <button type="button" class="control-command danger" data-control-scope="global" data-desired-state="stopped"><span aria-hidden="true">■</span> 结束全部</button>
+                    </div>
+                </div>
+
                 <div class="monitor-metrics panel">
-                    <div><span>在线脚本</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">2 分钟内有心跳</small></div>
-                    <div><span>累计接入</span><strong id="connectedClients">0</strong><small>已登记浏览器实例</small></div>
+                    <div><span>已连接实例</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">30 秒内有心跳</small></div>
+                    <div><span>已登记实例</span><strong id="connectedClients">0</strong><small>包含当前离线实例</small></div>
+                    <div><span>正在运行</span><strong id="runningClients">0</strong><small>执行状态为运行中</small></div>
                     <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
                     <div><span>筛选投递率</span><strong id="filterDeliveryRate">—</strong><small id="filterDeliveryRateHint">已投递 0 / 已评估 0</small></div>
                 </div>
@@ -388,7 +401,34 @@
         </section>
     </div>
 
+    <div class="confirm-overlay" id="controlStopConfirm" hidden>
+        <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="controlStopConfirmTitle">
+            <span class="eyebrow">STOP ALL WORKERS</span>
+            <h2 id="controlStopConfirmTitle">确认结束全部实例？</h2>
+            <p>所有当前已登记实例都会收到结束指令。实例仍保持后端连接，可稍后从这里重新开启。</p>
+            <div class="confirm-warning">正在处理的原子动作会先安全收尾，随后清理执行器、待处理占位和脚本子窗口。</div>
+            <div class="confirm-actions">
+                <button id="controlStopCancel" type="button">取消</button>
+                <button id="controlStopSubmit" type="button" class="danger-action">结束全部</button>
+            </div>
+        </section>
+    </div>
+
+    <div class="auth-overlay" id="authPrompt" hidden>
+        <form class="auth-dialog" id="authForm" role="dialog" aria-modal="true" aria-labelledby="authPromptTitle">
+            <span class="eyebrow">SECURE ACCESS</span>
+            <h2 id="authPromptTitle">输入后端共享令牌</h2>
+            <p>当前连接需要身份验证。令牌仅保存在本标签页会话中，关闭标签页后自动清除。</p>
+            <label for="authTokenInput"><span>共享令牌</span><input id="authTokenInput" name="token" type="password" minlength="32" maxlength="256" autocomplete="current-password" required></label>
+            <p class="auth-error" id="authPromptError" role="alert" hidden></p>
+            <div class="confirm-actions">
+                <button id="authPromptCancel" type="button">取消</button>
+                <button id="authPromptSubmit" type="submit">验证并继续</button>
+            </div>
+        </form>
+    </div>
+
     <div class="toast" id="toast" role="status"></div>
-    <script src="/dashboard/app.js?v=20260717-live-log-filters" defer></script>
+    <script src="/dashboard/app.js?v=20260717-control-center" defer></script>
 </body>
 </html>

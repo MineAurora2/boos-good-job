@@ -136,10 +136,11 @@ http://127.0.0.1:47999/dashboard
 ```
 
 统计面板同时提供：
-- 本机配置管理：编辑 `user_config.json` 常用参数与高级评分规则
+- 配置管理：编辑 `user_config.json` 常用参数与高级评分规则
 - 简历管理：选择、新建和编辑 `resumes/` 中的 Markdown/TXT 简历，并设置 LLM 使用的当前简历
 - 提示词管理：通过 `prompt_overrides.json` 安全覆盖固定提示词，不直接改 Python 源码
-- 实时监控：展示脚本版本、在线实例、当前阶段、计数器和实时日志
+- 实时控制：按全部实例或单个浏览器执行开启、暂停和结束，并展示连接、执行、同步状态
+- 实时监控：展示脚本版本、在线实例、当前阶段、计数器和集中实时日志
 - 高级统计：真实中国省级地图、行业 TOP 10，以及城市、经验、学历、薪资上下限和关键词筛选
 
 常用自动化配置：
@@ -150,7 +151,32 @@ http://127.0.0.1:47999/dashboard
 
 ### 6. 部署浏览器脚本
 
-把 `web_script.js` 内容粘贴到 Tampermonkey 中，然后打开 Boss 直聘页面即可。统计面板由直接运行的后端负责打开，油猴脚本不会创建面板标签页。
+把 `web_script.js` 内容粘贴到 Tampermonkey 中，然后打开 Boss 直聘页面。油猴脚本只显示左下角只读状态窗，不再提供本地启停或日志面板。
+
+在 Tampermonkey 菜单中完成：
+
+- `设置 goodJobs 账号标识`：同一 Boss 账号在多个浏览器运行时填写相同标识
+- `设置 goodJobs 后端连接`：填写 `http(s)://IP或域名:端口`；局域网可不填令牌，公网连接填写共享令牌
+
+首次接入实例默认是“已结束”，不会自动投递。打开后端 Dashboard，在“脚本实时监控”中点击全局或实例的“开启”后才会运行；“结束”只销毁当前自动化执行链，控制心跳仍然保留，因此可以再次从网页开启。
+
+### 7. 远程访问安全
+
+后端对环回、RFC1918、IPv6 ULA 和链路本地地址免令牌。公网访问必须在 `.env` 配置 32–256 位共享令牌：
+
+```env
+GOODJOB_SHARED_TOKEN=replace-with-a-random-token-at-least-32-characters
+```
+
+公网入口必须使用 HTTPS 反向代理。只有自有代理地址可以加入 `GOODJOB_TRUSTED_PROXIES`，禁止使用 `*`：
+
+```env
+GOODJOB_TRUSTED_PROXIES=127.0.0.1/32
+```
+
+可信代理必须在每个请求中覆盖 `X-Forwarded-For` 和 `X-Forwarded-Proto`；任一头缺失、重复或非法时后端都会拒绝请求。未加入可信列表的本机或局域网 peer 不得携带这两个转发头，以免错误获得局域网免令牌权限。
+
+Dashboard 的令牌只保存在当前标签页 `sessionStorage`；油猴令牌只保存在 Tampermonkey GM storage，不会写入 `user_config.json`、URL 或日志。
 
 ## 最小使用路径
 
@@ -164,4 +190,5 @@ http://127.0.0.1:47999/dashboard
    - `frontend.thread`
 5. 启动后端 `python main.py`（服务就绪后会自动打开统计面板）
 6. 浏览器装入 `web_script.js`
-7. 打开 Boss 直聘页面测试
+7. 打开 Boss 直聘页面，在 Tampermonkey 菜单设置账号标识和后端连接
+8. 在 Dashboard 的“脚本实时监控”中点击“开启”

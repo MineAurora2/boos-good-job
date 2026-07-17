@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import threading
 import webbrowser
 
 from fastapi import FastAPI
 
+from app.security import HybridAuthMiddleware, SecurityPolicy
 from app.state import STATE
 from app.routes import control_router, delivery_router, shutdown_introduce_jobs
 
@@ -28,8 +30,20 @@ async def lifespan(_app: FastAPI):
 def create_app() -> FastAPI:
     """Build the API from the two domain-level routers."""
     application = FastAPI(lifespan=lifespan)
+    application.add_middleware(HybridAuthMiddleware, policy=SecurityPolicy.from_env())
     application.include_router(delivery_router)
     application.include_router(control_router)
+
+    @application.get('/api/connection', summary='Test the authenticated backend connection')
+    async def connection_status():
+        return {
+            'ok': True,
+            'connected': True,
+            'status': 'ok',
+            'scriptApiVersion': 1,
+            'serverTime': datetime.now(timezone.utc).isoformat(),
+        }
+
     return application
 
 
@@ -81,6 +95,7 @@ def run_server() -> None:
         host='0.0.0.0',
         port=47999,
         reload=False,
+        proxy_headers=False,
         timeout_graceful_shutdown=3,
     )
     server = uvicorn.Server(config)

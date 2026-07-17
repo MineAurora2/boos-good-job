@@ -13,6 +13,7 @@ from starlette.requests import Request
 from app import paths
 from app.config import Config
 from app.runtime import RUNTIME_MONITOR
+from app.security import is_lan_client_host
 from app.storage.delivery_store import DeliveryStore
 from app.storage.io import append_jsonl
 
@@ -130,10 +131,12 @@ class ApplicationState:
 
 
 def require_local_admin(request: Request) -> None:
-    """Restrict local configuration and resume management to loopback clients."""
+    """Reuse the app boundary for management routes without a second denial."""
+    if getattr(request.state, 'goodjob_authorized', False):
+        return
     host = request.client.host if request.client else ''
-    if host not in {'127.0.0.1', '::1', 'localhost', 'testclient'}:
-        raise HTTPException(status_code=403, detail='管理功能只允许从本机访问')
+    if not is_lan_client_host(host):
+        raise HTTPException(status_code=403, detail='Management access requires an authorized client')
 
 
 STATE = ApplicationState(paths.PROJECT_ROOT)

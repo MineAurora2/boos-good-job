@@ -22,7 +22,6 @@
     "delivery_db_path": "delivery_state.db"
   },
   "frontend": {
-    "serverHost": "http://127.0.0.1:47999",
     "resumeIndex": 0,
     "thread": 50,
     "timestampTimeout": 3000,
