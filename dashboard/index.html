@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-today-dashboard">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-live-log-filters">
 </head>
 <body>
     <div class="app-shell">
@@ -127,8 +127,17 @@
                     <article class="control-card control-span-12 live-log-card is-collapsed" id="liveLogCard">
                         <div class="control-card-head"><div><span>实时日志</span><small>脚本运行与投递动作实时流</small></div><button type="button" class="live-log-toggle" id="liveLogToggle" aria-controls="liveLogPanel" aria-expanded="false" title="展开实时日志"><span id="liveLogToggleText">展开日志</span><b aria-hidden="true">⌄</b></button></div>
                         <div id="liveLogPanel" class="live-log-panel" hidden>
-                            <div class="live-log-tools"><select id="liveLogAccountFilter" aria-label="按账号筛选日志"><option value="all">全部账号</option></select><button id="pauseLogs" type="button">暂停滚动</button><button id="clearLogs" type="button">清空</button></div>
-                            <div id="liveLogs" class="live-logs"></div>
+                            <div class="live-log-tools">
+                                <label class="live-log-filter" for="liveLogAccountFilter"><span>账号</span><select id="liveLogAccountFilter"><option value="all">全部账号</option></select></label>
+                                <label class="live-log-filter" for="liveLogSenderFilter"><span>发送方</span><select id="liveLogSenderFilter"><option value="all">全部发送方</option><option value="system">系统</option><option value="delivery">投递</option><option value="claim">领取投递</option><option value="queue">投递等待</option></select></label>
+                                <div class="live-log-verbosity"><span id="liveLogVerbosityLabel">日志等级</span><div class="live-log-segments" role="group" aria-labelledby="liveLogVerbosityLabel"><button type="button" data-log-verbosity="detailed" aria-pressed="false" title="显示全部日志">详细</button><button type="button" class="active" data-log-verbosity="normal" aria-pressed="true" title="显示正常与简洁日志">正常</button><button type="button" data-log-verbosity="concise" aria-pressed="false" title="仅显示简洁日志">简洁</button></div></div>
+                                <div class="live-log-actions">
+                                    <button id="pauseLogs" class="live-log-icon-button" type="button" aria-controls="liveLogs" aria-label="暂停自动滚动" aria-pressed="false" title="暂停自动滚动"><span id="pauseLogsIcon" aria-hidden="true">Ⅱ</span></button>
+                                    <button id="clearLogs" class="live-log-icon-button danger" type="button" aria-controls="liveLogs" aria-label="清空当前日志视图" title="清空当前日志视图"><span aria-hidden="true">⌫</span></button>
+                                </div>
+                            </div>
+                            <div class="live-log-summary"><span id="liveLogCount" aria-live="polite">显示 0 / 0 条日志</span></div>
+                            <div id="liveLogs" class="live-logs" role="log" aria-label="实时运行日志" aria-live="polite" aria-atomic="false" aria-relevant="additions text"></div>
                         </div>
                     </article>
 
@@ -380,6 +389,6 @@
     </div>
 
     <div class="toast" id="toast" role="status"></div>
-    <script src="/dashboard/app.js?v=20260717-today-dashboard" defer></script>
+    <script src="/dashboard/app.js?v=20260717-live-log-filters" defer></script>
 </body>
 </html>

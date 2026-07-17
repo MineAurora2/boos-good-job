@@ -7,37 +7,24 @@
 ## 项目功能
 
 - [x] 自动投简历
-
 - [x] 多账号投简历
-
 - [x] 统计面板
-
 - [x] 配置面板
-
 - [x] 固定打招呼
-
 - [x] AI智能打招呼
-
 - [x] 关键词筛选岗位
-
-- [x] LLM筛选岗位
-
-- [x] LLM接入管理器
-
+- [x] AI筛选岗位
+- [x] 大模型接口管理器
 - [x] 重复岗位跳过
-
 - [x] HR 活跃度筛选
-
 - [x] 随机化投递节奏与随机省略招呼语
-
-- [x] 直接运行后端时自动打开统计面板
 
 
 ## TODO
-- [] AI多简历系统
-- [] 自动发送附件简历
-- [] AI聊天系统
-- [] 防检测系统
+- [ ] AI多简历系统
+- [ ] 自动发送附件简历
+- [ ] AI聊天系统
+- [ ] 防检测系统
 
 ------
 
@@ -52,79 +39,6 @@
 
 - Boos每个账号每日投递上线: 150
 - 推荐接入LLM,智能根据简历匹配岗位与打招呼,提高HR回复率
-
-## 系统架构
-
-```mermaid
-flowchart LR
-    User[用户] --> Boss[Boss 直聘网页]
-    User --> Dashboard[统计与管理面板]
-
-    subgraph Browser[浏览器端]
-        Boss --> Script[Tampermonkey 脚本<br/>web_script.js]
-        Script --> Search[关键词轮换与岗位扫描]
-        Script --> Chat[聊天页操作<br/>发送招呼语与简历]
-        Search <-->|BroadcastChannel / localStorage| Chat
-    end
-
-    subgraph Backend[本地 FastAPI 服务 :47999]
-        API[HTTP API<br/>routes/delivery.py<br/>routes/control.py]
-        Score[规则评分引擎<br/>app/scoring.py]
-        Runtime[运行监控与控制中心<br/>app/runtime.py]
-        LLMManager[LLM 接入管理器<br/>多接口调度与故障回退]
-        Aggregator[仪表盘数据聚合<br/>dashboard_data.py]
-
-        API --> Score
-        API --> Runtime
-        API --> LLMManager
-        API --> Aggregator
-    end
-
-    subgraph AI[外部 AI 服务]
-        LLM[OpenAI 兼容 LLM API<br/>岗位筛选 / 定制招呼语]
-    end
-
-    subgraph Storage[本地配置与数据存储]
-        Config[user_config.json / .env<br/>运行参数与 LLM 配置]
-        Resume[resumes/<br/>本地简历]
-        DB[(delivery_state.db<br/>投递状态 / 去重 / 每日配额)]
-        Logs[(JSONL 日志<br/>动作 / 评分 / AI 筛选)]
-        ControlState[control_center_state.json<br/>安全开关与账号策略]
-        Prompts[prompt_overrides.json<br/>提示词覆盖]
-    end
-
-    Script <-->|岗位评分、领取令牌、状态更新| API
-    Script -->|心跳、日志、错误| Runtime
-    Runtime -->|暂停、恢复、停止、仅扫描| Script
-
-    LLMManager <-->|兼容 OpenAI API| LLM
-    LLMManager --> Resume
-    LLMManager --> Prompts
-
-    API --> Config
-    API <--> DB
-    API --> Logs
-    Runtime <--> ControlState
-    Aggregator --> DB
-    Aggregator --> Logs
-
-    Dashboard <-->|统计、配置、简历、LLM 与运行控制 API| API
-    Dashboard -->|静态页面| User
-
-    classDef browser fill:#dbeafe,stroke:#2563eb,color:#172554;
-    classDef backend fill:#dcfce7,stroke:#16a34a,color:#14532d;
-    classDef ai fill:#f3e8ff,stroke:#9333ea,color:#581c87;
-    classDef storage fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
-    classDef control fill:#cffafe,stroke:#0891b2,color:#164e63;
-
-    class Boss,Script,Search,Chat browser;
-    class API,Score,LLMManager,Aggregator backend;
-    class LLM ai;
-    class Config,Resume,DB,Logs,ControlState,Prompts storage;
-    class Dashboard,Runtime control;
-```
-
-## 投递流程（UML）
 
 
 ## 项目介绍
@@ -147,7 +61,6 @@ flowchart LR
   - `app/storage/`：`io.py` 原子写入与 JSONL、`delivery_store.py`/`resume_store.py`/`admin_store.py` 投递、简历与管理配置存储、`dashboard_data.py` 面板数据聚合
 - `dashboard/`：统计管理面板前端资源（HTML/CSS/JS 与地图数据）
 - `scripts/`：地图等离线数据构建脚本
-- `tests/`：无网络的回归测试
 - `web_script.js`：Boss 页面 Tampermonkey 单文件脚本
 - `user_config.example.json`：可直接复制使用的当前格式配置模板
 - `resumes/`：网页管理并提供给 LLM 使用的真实简历目录
@@ -252,14 +165,3 @@ http://127.0.0.1:47999/dashboard
 5. 启动后端 `python main.py`（服务就绪后会自动打开统计面板）
 6. 浏览器装入 `web_script.js`
 7. 打开 Boss 直聘页面测试
-
-
-#### 新增功能
-
-- 新增 HR 活跃筛选，将招聘者状态归一化为 `当前在线`、`刚刚活跃`、`今日活跃`、`3 日内活跃`、`本周活跃`、`本月活跃` 六档
-- 新增防检测随机化总开关，可控制岗位顺序打乱、达标岗位随机跳过、投递前后随机等待和随机不使用招呼语。总开关关闭时恢复确定性执行。
-- 新增岗位扣星规则总开关
-- 前端: 在账号实例卡片中展示扣星结果、HR 判断、AI 完整原因、招呼语模式和最终结论
-- 前端: 统计面板-薪资分析-岗位薪资分布-薪资分布,调整为 0–5K、5–8K、8–12K、12–20K、20K 以上
-- 移除岗位缓存系统
-- 启动后端自动打开网页

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-17-userscript-cleanup.1
+// @version      2026-07-17-runtime-log-filters.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -12,7 +12,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-17-userscript-cleanup.1';
+    const SCRIPT_VERSION = '2026-07-17-runtime-log-filters.1';
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
@@ -459,11 +459,96 @@
 
     async function safeLogAction(api, payload) {
         try {
-            await api.logAction(payload);
+            await api.logAction(createRuntimeActionPayload(payload, deliveryIdentity.get()));
         } catch (error) {
             if (isStopError(error)) throw error;
             console.log('logAction failed', error);
         }
+    }
+
+    const RUNTIME_LOG_SENDERS = new Set(['system', 'delivery', 'claim', 'queue']);
+    const RUNTIME_LOG_VERBOSITIES = new Set(['detailed', 'normal', 'concise']);
+    const RUNTIME_LOG_LEVELS = new Set(['debug', 'info', 'warning', 'error', 'fatal']);
+
+    function inferRuntimeLogMetadata(message) {
+        const text = String(message ?? '');
+        let sender = 'system';
+        if (/领取投递权|投递协调|重复投递|每日限制|今日.*(?:上限|占用|剩余)|claim/i.test(text)) {
+            sender = 'claim';
+        } else if (/队列|排队|等待|预加载|下一轮|没有更多职位|继续向下|暂停中|手动选择.*筛选|空轮/.test(text)) {
+            sender = 'queue';
+        } else if (/职位|岗位|投递|打招呼|消息|简历|招呼语|匹配度|浏览/.test(text)) {
+            sender = 'delivery';
+        }
+
+        let level = 'info';
+        if (/失败|出错|错误|异常|超时|无法|拦截|不可用/.test(text)) {
+            level = 'error';
+        } else if (/跳过|忽略|暂停|未达到|没有|重试|已达上限/.test(text)) {
+            level = 'warning';
+        }
+
+        let verbosity = 'normal';
+        if (/程序启动|打招呼成功|打招呼失败|发送成功|已达上限|程序运行出错|循环时出错/.test(text)) {
+            verbosity = 'concise';
+        } else if (/预加载第|\| 浏览:|正在获取|开始计算|岗位星级|扣星命中|最终招呼语|获取.*成功|浏览器实例|账号标识|脚本版本|\[sendMsg\]|方法[A-C]|聚焦输入框|点击发送按钮/.test(text)) {
+            verbosity = 'detailed';
+        }
+        return { sender, verbosity, level };
+    }
+
+    function createRuntimeLogEntry(message, metadata = {}) {
+        const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : { level: metadata };
+        const text = String(message ?? '').slice(0, 2000);
+        const inferred = inferRuntimeLogMetadata(text);
+        const sender = RUNTIME_LOG_SENDERS.has(normalizedMetadata.sender)
+            ? normalizedMetadata.sender
+            : inferred.sender;
+        const verbosity = RUNTIME_LOG_VERBOSITIES.has(normalizedMetadata.verbosity)
+            ? normalizedMetadata.verbosity
+            : inferred.verbosity;
+        const level = RUNTIME_LOG_LEVELS.has(normalizedMetadata.level)
+            ? normalizedMetadata.level
+            : inferred.level;
+        return {
+            sender,
+            verbosity,
+            level,
+            message: text,
+            loggedAt: typeof normalizedMetadata.loggedAt === 'string'
+                ? normalizedMetadata.loggedAt.slice(0, 40)
+                : '',
+        };
+    }
+
+    function createRuntimeActionPayload(payload = {}, identity = {}) {
+        const actionPayload = payload && typeof payload === 'object' ? payload : {};
+        const action = String(actionPayload.action || '').trim().toLowerCase();
+        let sender = 'system';
+        if (action.startsWith('delivery_claim') || action.includes('duplicate')) {
+            sender = 'claim';
+        } else if (action === 'chat_open_requested' || /queue|queued|wait/.test(action)) {
+            sender = 'queue';
+        } else if (/^(job|greet|chat|resume)_/.test(action)) {
+            sender = 'delivery';
+        }
+
+        let verbosity = 'normal';
+        if (/(?:sent|failed|error|rejected)$/.test(action)) verbosity = 'concise';
+        else if (action === 'job_decision_consumed') verbosity = 'detailed';
+
+        let level = 'info';
+        if (/failed|error/.test(action)) level = 'error';
+        else if (/rejected|skip|filtered|below|already|missing/.test(action)) level = 'warning';
+
+        return {
+            ...actionPayload,
+            accountId: actionPayload.accountId || identity.accountId || '',
+            workerId: actionPayload.workerId || identity.workerId || '',
+            sender: RUNTIME_LOG_SENDERS.has(actionPayload.sender) ? actionPayload.sender : sender,
+            verbosity: RUNTIME_LOG_VERBOSITIES.has(actionPayload.verbosity) ? actionPayload.verbosity : verbosity,
+            level: RUNTIME_LOG_LEVELS.has(actionPayload.level) ? actionPayload.level : level,
+        };
     }
 
     const deliveryFlow = {
@@ -1183,50 +1268,108 @@
     class Logger {
         constructor(startFn, pauseFn, onLog, exitFn) {
             // 校验函数
-            if (startFn && !Function.prototype.isPrototypeOf(startFn)) {
+            if (startFn && typeof startFn !== 'function') {
                 throw new Error('参数错误，startFn应为函数');
             }
-            if (pauseFn && !Function.prototype.isPrototypeOf(pauseFn)) {
+            if (pauseFn && typeof pauseFn !== 'function') {
                 throw new Error('参数错误，pauseFn应为函数');
             }
             // 创建元素
             const ctn = document.createElement('div');
             const btnBox = document.createElement('div');
-            const clearBtn = document.createElement('div');
-            const runBtn = document.createElement('div');
-            const foldBtn = document.createElement('div');
-            const exitBtn = document.createElement('div');
-            const restartBtn = document.createElement('div');
+            const clearBtn = document.createElement('button');
+            const runBtn = document.createElement('button');
+            const foldBtn = document.createElement('button');
+            const exitBtn = document.createElement('button');
+            const restartBtn = document.createElement('button');
             const msgList = document.createElement('div');
+            const style = document.createElement('style');
+            const messageListId = `goodjobs-log-messages-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            ctn.className = 'goodjobs-log-panel';
+            btnBox.className = 'goodjobs-log-controls';
+            msgList.className = 'goodjobs-log-messages';
+            msgList.id = messageListId;
+            style.textContent = `
+                .goodjobs-log-panel .goodjobs-log-controls button {
+                    appearance: none;
+                    min-width: 0;
+                    height: 34px;
+                    padding: 0 6px;
+                    border: 1px solid rgba(255, 255, 255, 0.14);
+                    border-radius: 5px;
+                    color: #e7f2f6;
+                    background: rgba(255, 255, 255, 0.07);
+                    font: inherit;
+                    line-height: 1;
+                    cursor: pointer;
+                    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+                }
+                .goodjobs-log-panel .goodjobs-log-controls button:hover {
+                    border-color: rgba(142, 238, 255, 0.5);
+                    background: rgba(142, 238, 255, 0.13);
+                }
+                .goodjobs-log-panel .goodjobs-log-controls button:focus-visible {
+                    outline: 2px solid #8eeeff;
+                    outline-offset: 1px;
+                }
+                .goodjobs-log-panel .goodjobs-log-controls button:active {
+                    background: rgba(142, 238, 255, 0.2);
+                }
+                .goodjobs-log-panel .goodjobs-log-controls button[aria-pressed="true"] {
+                    border-color: rgba(87, 222, 170, 0.55);
+                    color: #a9f4d7;
+                    background: rgba(87, 222, 170, 0.15);
+                }
+                .goodjobs-log-panel .goodjobs-log-controls .goodjobs-log-exit {
+                    color: #ffb2ba;
+                    background: rgba(255, 80, 96, 0.12);
+                }
+                .goodjobs-log-panel .goodjobs-log-controls .goodjobs-log-restart {
+                    color: #a9f4ff;
+                    background: rgba(57, 215, 242, 0.1);
+                }
+                @media (max-width: 440px) {
+                    .goodjobs-log-panel .goodjobs-log-controls button {
+                        height: 36px;
+                        padding: 0 3px;
+                        font-size: 12px;
+                    }
+                }
+            `;
             ctn.style.cssText = `
                 position: fixed;
-                bottom: 16px;
-                left: 16px;
-                width: 380px;
-                background-color: rgba(0, 0, 0, 0.5);
+                bottom: 12px;
+                left: 12px;
+                width: min(380px, calc(100vw - 24px));
+                max-height: calc(100vh - 24px);
+                box-sizing: border-box;
+                overflow: hidden;
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                background-color: rgba(7, 18, 24, 0.88);
                 color: #fff;
                 z-index: 9999;
                 font-size: 14px;
-                border-radius: 10px;
+                border-radius: 8px;
+                box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
+                backdrop-filter: blur(8px);
             `;
             btnBox.style.cssText = `
-                width: 380px;
-                height: 32px;
-                display: flex;
+                width: 100%;
+                min-height: 42px;
+                padding: 4px;
+                box-sizing: border-box;
+                display: grid;
+                grid-auto-flow: column;
+                grid-auto-columns: minmax(0, 1fr);
                 align-items: center;
-                justify-content: flex-end;
-            `;
-            clearBtn.style.cssText = runBtn.style.cssText = foldBtn.style.cssText = exitBtn.style.cssText = restartBtn.style.cssText = `
-                width: 60px;
-                height: 32px;
-                line-height: 32px;
-                text-align: center;
-                cursor: pointer;
+                gap: 4px;
             `;
             msgList.style.cssText = `
-                width: 380px;
+                width: 100%;
                 height: 240px;
+                max-height: calc(100vh - 74px);
                 padding: 2px 12px 8px;
+                box-sizing: border-box;
                 overflow-y: auto;
                 display: flex;
                 flex-direction: column;
@@ -1236,12 +1379,25 @@
             runBtn.innerText = "开始";
             foldBtn.innerText = "收起";
             exitBtn.innerText = "退出";
-            exitBtn.style.color = '#ff9aa5';
-            exitBtn.style.background = 'rgba(255, 80, 96, 0.12)';
             restartBtn.innerText = "重启";
-            restartBtn.style.color = '#8eeeff';
-            restartBtn.style.background = 'rgba(57, 215, 242, 0.1)';
+            clearBtn.type = runBtn.type = foldBtn.type = exitBtn.type = restartBtn.type = 'button';
+            clearBtn.title = '清空日志';
+            runBtn.title = '开始运行';
+            foldBtn.title = '收起日志';
+            restartBtn.title = '重启脚本';
+            exitBtn.title = '退出脚本';
+            clearBtn.setAttribute('aria-label', clearBtn.title);
+            runBtn.setAttribute('aria-label', runBtn.title);
+            foldBtn.setAttribute('aria-label', foldBtn.title);
+            restartBtn.setAttribute('aria-label', restartBtn.title);
+            exitBtn.setAttribute('aria-label', exitBtn.title);
+            runBtn.setAttribute('aria-pressed', 'false');
+            foldBtn.setAttribute('aria-expanded', 'true');
+            foldBtn.setAttribute('aria-controls', messageListId);
+            restartBtn.className = 'goodjobs-log-restart';
+            exitBtn.className = 'goodjobs-log-exit';
             document.body.appendChild(ctn);
+            ctn.appendChild(style);
             ctn.appendChild(btnBox);
             btnBox.appendChild(clearBtn);
             btnBox.appendChild(runBtn);
@@ -1253,44 +1409,59 @@
             this.list = msgList;
             this.runBtn = runBtn;
             this.clearBtn = clearBtn;
+            this.foldBtn = foldBtn;
             this.exitBtn = exitBtn;
             this.restartBtn = restartBtn;
             this.__startFn = startFn || (() => void 0);
             this.__pauseFn = pauseFn || (() => void 0);
-            this.__onLog = Function.prototype.isPrototypeOf(onLog) ? onLog : (() => void 0);
-            this.__exitFn = Function.prototype.isPrototypeOf(exitFn) ? exitFn : (() => scriptLifecycle.exit());
+            this.__onLog = typeof onLog === 'function' ? onLog : (() => void 0);
+            this.__exitFn = typeof exitFn === 'function' ? exitFn : (() => scriptLifecycle.exit());
             this.__pause = true;
             clearBtn.addEventListener('click', () => this.clear());
             runBtn.addEventListener('click', () => {
                 this.__pause = !this.__pause;
                 if (this.__pause) {
                     runBtn.innerText = "继续";
+                    runBtn.title = '继续运行';
+                    runBtn.setAttribute('aria-label', '继续运行');
+                    runBtn.setAttribute('aria-pressed', 'false');
                     this.__pauseFn();
                 } else {
                     runBtn.innerText = "暂停";
+                    runBtn.title = '暂停运行';
+                    runBtn.setAttribute('aria-label', '暂停运行');
+                    runBtn.setAttribute('aria-pressed', 'true');
                     this.__startFn();
                 }
             });
+            let logsExpanded = true;
             foldBtn.addEventListener('click', () => {
-                if (foldBtn.innerText === "展开") {
-                    msgList.style.height = "240px";
-                    foldBtn.innerText = "收起";
-                } else {
-                    msgList.style.height = "32px";
+                logsExpanded = !logsExpanded;
+                msgList.style.height = logsExpanded ? '240px' : '32px';
+                foldBtn.innerText = logsExpanded ? '收起' : '展开';
+                foldBtn.title = logsExpanded ? '收起日志' : '展开日志';
+                foldBtn.setAttribute('aria-label', foldBtn.title);
+                foldBtn.setAttribute('aria-expanded', String(logsExpanded));
+                if (!logsExpanded) {
                     this.list.scrollTop = this.list.scrollHeight;
-                    foldBtn.innerText = "展开";
                 }
             });
             exitBtn.addEventListener('click', () => this.__exitFn());
             restartBtn.addEventListener('click', () => scriptLifecycle.restart());
         }
 
-        add(message) {
+        add(message, metadata = {}) {
+            const entry = createRuntimeLogEntry(message, metadata);
             const item = document.createElement('div');
-            item.textContent = message;
+            item.textContent = entry.message;
+            item.dataset.sender = entry.sender;
+            item.dataset.verbosity = entry.verbosity;
+            item.dataset.level = entry.level;
+            if (entry.level === 'error' || entry.level === 'fatal') item.style.color = '#ffb2ba';
+            else if (entry.level === 'warning') item.style.color = '#ffe2a3';
             this.list.appendChild(item);
             this.list.scrollTop = this.list.scrollHeight;
-            this.__onLog(String(message));
+            this.__onLog(entry.message, entry);
         }
 
         divider() {
@@ -1395,12 +1566,12 @@
                 },
             };
 
-            const queueRuntimeLog = (message, level = 'info') => {
-                runtime.logs.push({
-                    level,
-                    message: String(message).slice(0, 2000),
-                    loggedAt: new Date().toISOString(),
-                });
+            const queueRuntimeLog = (message, metadata = {}) => {
+                const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : { level: metadata };
+                runtime.logs.push(createRuntimeLogEntry(message, {
+                    ...normalizedMetadata,
+                    loggedAt: normalizedMetadata.loggedAt || new Date().toISOString(),
+                }));
                 if (runtime.logs.length > 200) runtime.logs.splice(0, runtime.logs.length - 200);
             };
 
@@ -1469,7 +1640,7 @@
                 runtime.phase = '继续运行';
                 if (!started) {
                     main().catch((error) => {
-                        if (!isStopError(error)) logger.add(`初始化失败: ${error}`);
+                        if (!isStopError(error)) logger.add(`初始化失败: ${error}`, { sender: 'system', verbosity: 'concise', level: 'error' });
                     });
                     return;
                 }
@@ -1534,7 +1705,7 @@
                 this.broadcast.on(this.bcTypes.STATUS, (from, data) => {
                     if (from === this.targets.chat) {
                         if (data && typeof data === 'object') {
-                            if (data.message) logger.add(data.message);
+                            if (data.message) logger.add(data.message, data);
                             if (data.currentDecision && typeof data.currentDecision === 'object') {
                                 runtime.currentDecision = data.currentDecision;
                                 runtime.currentJob = data.currentJob || data.currentDecision.title || runtime.currentJob;
@@ -1543,7 +1714,7 @@
                                 sendRuntimeHeartbeat().catch(() => null);
                             }
                         } else {
-                            logger.add(data);
+                            logger.add(data, { sender: 'delivery' });
                         }
                     }
                 });
@@ -1577,7 +1748,7 @@
                     tools.inputText(input, kw);
                     btn.click();
                 } catch (e) {
-                    logger.add('搜索出错');
+                    logger.add('搜索出错', { sender: 'system', verbosity: 'concise', level: 'error' });
                     throw new Error('搜索出错');
                 }
             };
@@ -1593,7 +1764,7 @@
                         .filter(href => !processedJobHrefs.has(href));
                     return [hrefs, aList];
                 } catch (e) {
-                    logger.add('获取职位链接出错');
+                    logger.add('获取职位链接出错', { sender: 'delivery', verbosity: 'concise', level: 'error' });
                     throw new Error('获取职位链接出错');
                 }
             };
@@ -1624,11 +1795,11 @@
                     targetCard.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
                     targetCard.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
                     targetCard.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    logger.add(`预加载第 ${round} 轮：已轻点左侧岗位卡片`);
+                    logger.add(`预加载第 ${round} 轮：已轻点左侧岗位卡片`, { sender: 'queue', verbosity: 'detailed' });
                     await tools.asyncSleep(OPTIONS.preloadActivateCardWaitMs);
                 } catch (e) {
                     if (isStopError(e)) throw e;
-                    logger.add('预加载时轻点岗位卡片失败，已继续纯滚动');
+                    logger.add('预加载时轻点岗位卡片失败，已继续纯滚动', { sender: 'queue', verbosity: 'normal', level: 'warning' });
                 }
             };
 
@@ -1638,13 +1809,13 @@
                     let hrefs, els;
                     [hrefs, els] = await getJobHrefs();
                     if (els.length === elsLen) {
-                        logger.add('没有更多职位了');
+                        logger.add('没有更多职位了', { sender: 'queue', verbosity: 'normal' });
                         return false;
                     }
                     elsLen = els.length;
                     els[elsLen - 1].scrollIntoView();
                     page++;
-                    logger.add(`开始浏览第 ${page} 页`);
+                    logger.add(`开始浏览第 ${page} 页`, { sender: 'queue', verbosity: 'detailed' });
                     if (hrefs.length) {
                         // 防检测：打乱本页新增岗位顺序，避免固定的从上到下投递节奏。
                         if (antiDetection.enabled() && OPTIONS.shuffleJobOrder) {
@@ -1652,10 +1823,10 @@
                         }
                         jobHrefs.push(...hrefs);
                         roundQueuedCount += hrefs.length;
-                        logger.add(`本页新增 ${hrefs.length} 个未处理岗位`);
+                        logger.add(`本页新增 ${hrefs.length} 个未处理岗位`, { sender: 'queue', verbosity: 'detailed' });
                         return true;
                     }
-                    logger.add('本页新增岗位都已处理过，继续向下查找');
+                    logger.add('本页新增岗位都已处理过，继续向下查找', { sender: 'queue', verbosity: 'detailed' });
                     await tools.asyncSleep(OPTIONS.preloadScrollWaitMs);
                 }
             };
@@ -1741,7 +1912,7 @@
                     createdAt: Date.now(),
                 }));
                 pendingGreetTimer = setTimeout(async () => {
-                    logger.add(`职位 [${pendingGreetTitle}] 打招呼超时，已跳过`);
+                    logger.add(`职位 [${pendingGreetTitle}] 打招呼超时，已跳过`, { sender: 'queue', verbosity: 'concise', level: 'error' });
                     const timedOutClaimToken = pendingGreetClaimToken;
                     if (timedOutClaimToken) {
                         await api.markDelivery(timedOutClaimToken, 'failed_unknown', 'greet_timeout').catch(() => null);
@@ -1757,20 +1928,20 @@
                 try {
                     if (roundQueuedCount === 0) {
                         emptyRounds += 1;
-                        logger.add(`第 ${currentRound} 轮没有拿到新岗位（连续空轮 ${emptyRounds}/${OPTIONS.maxEmptyRounds}）`);
+                        logger.add(`第 ${currentRound} 轮没有拿到新岗位（连续空轮 ${emptyRounds}/${OPTIONS.maxEmptyRounds}）`, { sender: 'queue', verbosity: 'normal' });
                     } else {
                         emptyRounds = 0;
-                        logger.add(`第 ${currentRound} 轮已处理完当前加载岗位，准备进入下一轮`);
+                        logger.add(`第 ${currentRound} 轮已处理完当前加载岗位，准备进入下一轮`, { sender: 'queue', verbosity: 'normal' });
                     }
                     if (emptyRounds >= OPTIONS.maxEmptyRounds) {
-                        logger.add(`连续 ${OPTIONS.maxEmptyRounds} 轮没有新岗位，自动切换到下一个关键词继续挂机`);
+                        logger.add(`连续 ${OPTIONS.maxEmptyRounds} 轮没有新岗位，自动切换到下一个关键词继续挂机`, { sender: 'queue', verbosity: 'normal' });
                         emptyRounds = 0;
                         return startRound();
                     }
                     await tools.asyncSleep(OPTIONS.roundRestartDelayMs);
                     if (this.pause) {
                         pendingRoundRestart = true;
-                        logger.add('当前已暂停，下一轮等待继续');
+                        logger.add('当前已暂停，下一轮等待继续', { sender: 'queue', verbosity: 'concise' });
                         return;
                     }
                     await startRound();
@@ -1813,14 +1984,14 @@
                         .then(async resp => {
                             if (!(resp.ok && resp.status === 200)) {
                                 const bodyText = await resp.text().catch(() => '');
-                                logger.add(`boss直聘网络连接出错: status=${resp.status}`);
+                                logger.add(`boss直聘网络连接出错: status=${resp.status}`, { sender: 'queue', verbosity: 'concise', level: 'error' });
                                 return reject(new Error(`http_${resp.status}:${bodyText.slice(0, 300)}`));
                             }
                             return resp.json();
                         }).then(resp => {
                             if (resp.code === 0) return resolve(resp);
                             const msg = resp?.zpData?.bizData?.chatRemindDialog?.title || resp?.message || '未知错误';
-                            logger.add(`打招呼失败: ${msg}`);
+                            logger.add(`打招呼失败: ${msg}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                             reject(new Error(`biz_fail:${msg}`));
                         }).catch(err => {
                             if (runtimeLifecycle.isStopping() || err?.name === 'AbortError') {
@@ -1859,7 +2030,7 @@
                             : (pendingGreetDecision?.introduce || this.introduce);
                         logger.add(greetIntroduce
                             ? `打招呼introduce: ${greetIntroduce.substring(0, 40)}...`
-                            : '打招呼introduce: （防检测随机省略，空手打招呼）');
+                            : '打招呼introduce: （防检测随机省略，空手打招呼）', { sender: 'delivery', verbosity: 'detailed' });
                         await this.broadcast.reply(
                             from,
                             this.bcTypes.SAY_HI,
@@ -1875,7 +2046,7 @@
                         return;
                     }
                     if (!sessionMatches) {
-                        logger.add('已忽略过期的打招呼页面回执');
+                        logger.add('已忽略过期的打招呼页面回执', { sender: 'queue', verbosity: 'normal', level: 'warning' });
                         return;
                     }
                     // 告知结果
@@ -1885,7 +2056,7 @@
                     const finalClaimToken = pendingGreetClaimToken;
                     clearPendingGreet();
                     if (data.success) {
-                        logger.add(`打招呼成功`);
+                        logger.add(`打招呼成功`, { sender: 'delivery', verbosity: 'concise' });
                         runtime.counters.sent += 1;
                         runtime.state = 'sent';
                         runtime.phase = '打招呼成功';
@@ -1910,7 +2081,7 @@
                     }
                     // 出错了
                     else {
-                        logger.add(`打招呼失败`);
+                        logger.add(`打招呼失败`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                         runtime.counters.failed += 1;
                         runtime.state = 'error';
                         runtime.phase = '打招呼失败';
@@ -1950,7 +2121,7 @@
                         if (!hasNext) return handleRoundExhausted();
                         loop();
                     } else {
-                        logger.add(`消息处理出错，重试中...`);
+                        logger.add(`消息处理出错，重试中...`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                         tools.openTabNSetTimestamp(this.whiteList.chat, this.targets.chat);
                     }
                 });
@@ -1992,7 +2163,7 @@
                     if (control.stopped) return;
                     // 如果暂停，则跳过
                     if (this.pause) {
-                        logger.add('暂停中...');
+                        logger.add('暂停中...', { sender: 'queue', verbosity: 'concise' });
                         return;
                     }
                     logger.divider();
@@ -2004,7 +2175,7 @@
                             if (!hasNext) return handleRoundExhausted();
                             return loop();
                         }
-                        logger.add('开始处理聊天消息');
+                        logger.add('开始处理聊天消息', { sender: 'delivery', verbosity: 'normal' });
                         tools.openTabNSetTimestamp(this.whiteList.chat, this.targets.chat);
                         return;
                     }
@@ -2015,15 +2186,15 @@
                     runtime.currentDecision = {};
                     const diff = (new Date().getTime() - start) / 1000;
                     // 获取详情
-                    logger.add(`| 浏览: ${++count} | 剩余: ${jobHrefs.length} | 平均: ${(diff / count).toFixed(0)}s | 耗时: ${convertTime(diff)} |`);
-                    logger.add(`正在获取职位详情`);
+                    logger.add(`| 浏览: ${++count} | 剩余: ${jobHrefs.length} | 平均: ${(diff / count).toFixed(0)}s | 耗时: ${convertTime(diff)} |`, { sender: 'delivery', verbosity: 'detailed' });
+                    logger.add(`正在获取职位详情`, { sender: 'delivery', verbosity: 'detailed' });
                     const jobInfo = await getJobInfo(href);
                     processedJobHrefs.add(href);
                     runtime.counters.viewed += 1;
                     runtime.currentJob = jobInfo.title || '';
                     if (control.stopped || this.pause) return;
                     if (jobInfo.skip) {
-                        logger.add(`职位跳过: ${jobInfo.skipReason}`);
+                        logger.add(`职位跳过: ${jobInfo.skipReason}`, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
                         await logAction({
                             action: 'job_skip',
                             scene: 'search',
@@ -2036,7 +2207,7 @@
                     }
                     // 如果聊过，下一个
                     if (jobInfo.talked) {
-                        logger.add(`职位 [${jobInfo.title}] 已经聊过，下一个`);
+                        logger.add(`职位 [${jobInfo.title}] 已经聊过，下一个`, { sender: 'delivery', verbosity: 'normal' });
                         await logAction({
                             action: 'job_already_talked',
                             scene: 'search',
@@ -2046,7 +2217,7 @@
                         return loop();
                     }
                     if (!jobInfo.company) {
-                        logger.add(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`);
+                        logger.add(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
                         await logAction({
                             action: 'job_missing_company',
                             scene: 'search',
@@ -2057,7 +2228,7 @@
                         return loop();
                     }
                     // 否则发送消息计算匹配度
-                    logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`);
+                    logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
                     runtime.state = 'evaluating';
                     runtime.phase = '岗位匹配评分';
                     const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
@@ -2087,8 +2258,8 @@
                         decisionReason: '',
                         greetingMode: '',
                     };
-                    logger.add(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`);
-                    logDecisionDeductions(decision, (message) => logger.add(message));
+                    logger.add(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
+                    logDecisionDeductions(decision, (message) => logger.add(message, { sender: 'delivery', verbosity: 'detailed' }));
                     await logAction({
                         action: 'job_decision_consumed',
                         scene: 'search',
@@ -2147,7 +2318,7 @@
                         if (control.stopped || this.pause) return;
                         // 防检测：达标岗位按概率随机跳过，打散固定的“达标即投”节奏。
                         if (antiDetection.enabled() && antiDetection.shouldSkip()) {
-                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机跳过，本次不投递`);
+                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机跳过，本次不投递`, { sender: 'delivery', verbosity: 'normal' });
                             runtime.currentDecision.decisionState = 'random_skipped';
                             runtime.currentDecision.decisionReason = '命中随机跳过策略';
                             runtime.currentDecision.finalPassed = false;
@@ -2168,12 +2339,12 @@
                         }
                         const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
                         if (duplicateCheck.unavailable) {
-                            logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位');
+                            logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
                             return loop();
                         }
                         if (duplicateCheck.greeted) {
                             const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
-                            logger.add(duplicateMessage);
+                            logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                             console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
                             return loop();
                         }
@@ -2188,7 +2359,7 @@
                         if (control.stopped || this.pause) return;
                         const claim = await deliveryFlow.claim(api, identity, jobInfo, href);
                         if (claim.reason === 'service_unavailable') {
-                            logger.add('投递协调服务不可用，为避免重复投递已跳过');
+                            logger.add('投递协调服务不可用，为避免重复投递已跳过', { sender: 'claim', verbosity: 'concise', level: 'error' });
                             await logAction({
                                 action: 'delivery_claim_failed',
                                 scene: 'search',
@@ -2204,15 +2375,15 @@
                         if (!claim.accepted) {
                             const isDuplicateJob = deliveryFlow.isDuplicate(claim);
                             if (claim.reason === 'daily_limit') {
-                                logger.add(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}），自动暂停`);
+                                logger.add(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}），自动暂停`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
                                 this.pause = true;
                             } else if (isDuplicateJob) {
                                 const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
-                                logger.add(duplicateMessage);
+                                logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                 console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
                                 return loop();
                             } else {
-                                logger.add(`职位 [${jobInfo.title}] 无法领取投递权：${claim.reason}`);
+                                logger.add(`职位 [${jobInfo.title}] 无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
                             }
                             await logAction({
                                 action: 'delivery_claim_rejected',
@@ -2241,8 +2412,8 @@
                             return control.stopped || this.pause ? undefined : loop();
                         }
 
-                        logger.add(`职位 [${jobInfo.title}] 已通过全部筛选条件，准备进入发送队列`);
-                        logger.add(`账号 [${identity.accountId}] 今日占用 ${claim.count}/${claim.limit}，剩余 ${claim.remaining} 次`);
+                        logger.add(`职位 [${jobInfo.title}] 已通过全部筛选条件，准备进入发送队列`, { sender: 'queue', verbosity: 'normal' });
+                        logger.add(`账号 [${identity.accountId}] 今日占用 ${claim.count}/${claim.limit}，剩余 ${claim.remaining} 次`, { sender: 'claim', verbosity: 'normal' });
 
                         // 领取成功后再随机等待一次，避免领取与 BOSS 沟通动作之间形成固定间隔。
                         const beforeQueueReady = await antiDetection.delay(() => control.stopped || this.pause);
@@ -2334,9 +2505,9 @@
                             decision.introduceGenerated = false;
                             decision.omitIntroduce = true;
                             decision.greetingMode = 'none';
-                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机策略，本次不携带招呼语`);
+                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机策略，本次不携带招呼语`, { sender: 'delivery', verbosity: 'normal' });
                         } else {
-                            logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`);
+                            logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`, { sender: 'delivery', verbosity: 'normal' });
                             try {
                                 const generated = await api.generateIntroduce(
                                     claim.claimToken,
@@ -2353,12 +2524,12 @@
                                 decision.introduce = this.introduce;
                                 decision.introduceGenerated = false;
                                 decision.greetingMode = 'fixed';
-                                logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`);
+                                logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                             }
                         }
                         runtime.currentDecision.greetingMode = decision.greetingMode || 'fixed';
                         await sendRuntimeHeartbeat();
-                        logger.add(`最终招呼语: ${(decision.introduce || '（空，直接打招呼）').substring(0, 60)}...`);
+                        logger.add(`最终招呼语: ${(decision.introduce || '（空，直接打招呼）').substring(0, 60)}...`, { sender: 'delivery', verbosity: 'detailed' });
                         try {
                             await logAction({
                                 action: 'chat_open_requested',
@@ -2420,7 +2591,7 @@
                 } catch (e) {
                     if (isStopError(e) || runtimeLifecycle.isStopping()) return;
                     console.log(e);
-                    logger.add(`循环时出错: ${e}`);
+                    logger.add(`循环时出错: ${e}`, { sender: 'system', verbosity: 'concise', level: 'error' });
                     runtime.state = 'error';
                     runtime.phase = '循环异常';
                     runtime.lastError = String(e);
@@ -2437,7 +2608,7 @@
             };
 
             const preloadJobs = async () => {
-                logger.add('开始慢速预加载岗位列表');
+                logger.add('开始慢速预加载岗位列表', { sender: 'queue', verbosity: 'normal' });
                 let stableRounds = 0;
                 let lastCount = 0;
                 let lastScrollY = -1;
@@ -2454,7 +2625,7 @@
                     const afterJobUl = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLIST);
                     const afterCount = afterJobUl ? afterJobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS).length : currentCount;
                     const afterY = window.scrollY;
-                    logger.add(`预加载第 ${round} 轮：岗位 ${currentCount} -> ${afterCount}`);
+                    logger.add(`预加载第 ${round} 轮：岗位 ${currentCount} -> ${afterCount}`, { sender: 'queue', verbosity: 'detailed' });
                     if (afterCount > lastCount || afterY > lastScrollY) {
                         stableRounds = 0;
                     } else {
@@ -2463,13 +2634,13 @@
                     lastCount = Math.max(lastCount, afterCount);
                     lastScrollY = Math.max(lastScrollY, afterY);
                     if (stableRounds >= OPTIONS.preloadStableRoundsLimit) {
-                        logger.add(`预加载结束：连续 ${stableRounds} 轮无新增岗位`);
+                        logger.add(`预加载结束：连续 ${stableRounds} 轮无新增岗位`, { sender: 'queue', verbosity: 'normal' });
                         break;
                     }
                 }
                 const finalJobUl = document.querySelector(SELECTORS.ZHIPIN.SEARCH.JOBLIST);
                 const finalCount = finalJobUl ? finalJobUl.querySelectorAll(SELECTORS.ZHIPIN.SEARCH.JOBHREFS).length : 0;
-                logger.add(`预加载完成，当前已加载岗位数：${finalCount}`);
+                logger.add(`预加载完成，当前已加载岗位数：${finalCount}`, { sender: 'queue', verbosity: 'normal' });
             };
 
             const pickNextKeyword = () => {
@@ -2502,18 +2673,18 @@
                     currentRound += 1;
                     const keyword = pickNextKeyword();
                     logger.divider();
-                    logger.add(`开始第 ${currentRound} 轮`);
-                    logger.add(`本轮搜索关键词：${keyword}`);
+                    logger.add(`开始第 ${currentRound} 轮`, { sender: 'queue', verbosity: 'normal' });
+                    logger.add(`本轮搜索关键词：${keyword}`, { sender: 'queue', verbosity: 'normal' });
                     window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
                     await tools.asyncSleep(600);
                     await search(keyword);
-                    logger.add(`第 ${currentRound} 轮已完成搜索（关键词：${keyword}），请在 ${(OPTIONS.manualFilterWaitMs / 1000).toFixed(0)} 秒内手动选择地区、薪资等筛选条件`);
+                    logger.add(`第 ${currentRound} 轮已完成搜索（关键词：${keyword}），请在 ${(OPTIONS.manualFilterWaitMs / 1000).toFixed(0)} 秒内手动选择地区、薪资等筛选条件`, { sender: 'queue', verbosity: 'concise' });
                     await tools.asyncSleep(OPTIONS.manualFilterWaitMs);
                     await preloadJobs();
                     runtimeLifecycle.guard();
                     // 预加载完成后，先提取一批岗位链接再进入循环
                     const hasNext = await nextPage();
-                    logger.add(`第 ${currentRound} 轮开始按当前筛选条件扫描岗位（关键词：${keyword}）`);
+                    logger.add(`第 ${currentRound} 轮开始按当前筛选条件扫描岗位（关键词：${keyword}）`, { sender: 'queue', verbosity: 'normal' });
                     if (!hasNext) return handleRoundExhausted();
                     loop();
                 } finally {
@@ -2530,51 +2701,51 @@
                 started = true;
                 runtime.state = 'running';
                 runtime.phase = '初始化脚本';
-                logger.add('--程序启动--');
+                logger.add('--程序启动--', { sender: 'system', verbosity: 'concise' });
                 // 开始广播
                 startBroadcast();
                 // 获取统一配置
                 const clientConfig = await api.getClientConfig().catch((e) => {
                     if (isStopError(e)) throw e;
-                    logger.add('获取统一配置失败，将回退旧接口');
+                    logger.add('获取统一配置失败，将回退旧接口', { sender: 'system', verbosity: 'concise', level: 'error' });
                     return null;
                 });
                 if (clientConfig && clientConfig.frontend) {
                     Object.assign(OPTIONS, clientConfig.frontend);
-                    logger.add('获取前端配置成功');
+                    logger.add('获取前端配置成功', { sender: 'system', verbosity: 'detailed' });
                 }
-                logger.add(`浏览器实例: ${identity.workerId}`);
-                logger.add(`当前账号标识: ${identity.accountId}`);
-                logger.add(`脚本版本: ${SCRIPT_VERSION}`);
+                logger.add(`浏览器实例: ${identity.workerId}`, { sender: 'system', verbosity: 'detailed' });
+                logger.add(`当前账号标识: ${identity.accountId}`, { sender: 'system', verbosity: 'detailed' });
+                logger.add(`脚本版本: ${SCRIPT_VERSION}`, { sender: 'system', verbosity: 'detailed' });
                 sendRuntimeHeartbeat();
                 if (clientConfig && Array.isArray(clientConfig.tags) && clientConfig.tags.length) {
                     this.tags = clientConfig.tags;
-                    logger.add('获取标签成功: ' + this.tags.join('、'));
+                    logger.add('获取标签成功: ' + this.tags.join('、'), { sender: 'system', verbosity: 'detailed' });
                 } else {
                     this.tags = await api.getTags();
-                    logger.add('获取标签成功(旧接口): ' + this.tags.join('、'));
+                    logger.add('获取标签成功(旧接口): ' + this.tags.join('、'), { sender: 'system', verbosity: 'detailed' });
                 }
                 if (typeof tagIdx === 'number' && this.tags.length) {
                     currentTagIdx = ((tagIdx % this.tags.length) + this.tags.length) % this.tags.length - 1;
                 }
                 if (clientConfig && typeof clientConfig.introduce === 'string' && clientConfig.introduce) {
                     this.introduce = clientConfig.introduce;
-                    logger.add('获取自我介绍成功');
+                    logger.add('获取自我介绍成功', { sender: 'system', verbosity: 'detailed' });
                 } else {
                     this.introduce = await api.getIntroduce();
-                    logger.add('获取自我介绍成功(旧接口)');
+                    logger.add('获取自我介绍成功(旧接口)', { sender: 'system', verbosity: 'detailed' });
                 }
                 try {
                     const daily = await api.checkDailyLimit(identity.accountId);
-                    logger.add(`今日已打招呼 ${daily.count}/${daily.limit}，剩余 ${daily.remaining} 次`);
+                    logger.add(`今日已打招呼 ${daily.count}/${daily.limit}，剩余 ${daily.remaining} 次`, { sender: 'claim', verbosity: 'normal' });
                     if (daily.reached) {
-                        logger.add('今日打招呼已达上限，暂停运行');
+                        logger.add('今日打招呼已达上限，暂停运行', { sender: 'claim', verbosity: 'concise', level: 'warning' });
                         this.pause = true;
                         return;
                     }
                 } catch (e) {
                     if (isStopError(e)) throw e;
-                    logger.add('每日限制检查失败');
+                    logger.add('每日限制检查失败', { sender: 'claim', verbosity: 'concise', level: 'error' });
                 }
                 await startRound();
             };
@@ -2993,13 +3164,19 @@
                 return null;
             });
             // 给搜索页同步状态
-            const status = (text) => {
+            const status = (text, metadata = {}) => {
                 if (runtimeLifecycle.isStopping()) return;
-                logger && logger.add(text);
+                const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : { level: metadata };
+                const entry = createRuntimeLogEntry(text, {
+                    sender: 'delivery',
+                    ...normalizedMetadata,
+                    loggedAt: normalizedMetadata.loggedAt || new Date().toISOString(),
+                });
+                logger && logger.add(entry.message, entry);
                 this.broadcast && this.broadcast.send(
                     this.targets.search,
                     this.bcTypes.STATUS,
-                    text
+                    entry
                 ).catch(() => null);
             };
             const publishDecision = (currentJob, currentDecision, phase = '聊天岗位匹配评分') => {
@@ -3056,7 +3233,7 @@
                     const ctn = await tools.endlessFind(SELECTORS.ZHIPIN.CHAT.CONTACTLIST).catch(e => {
                         if (isStopError(e)) throw e;
                         if (document.querySelector(SELECTORS.ZHIPIN.CHAT.CONTACTLISTEMPTY)) {
-                            status('当前暂无消息');
+                            status('当前暂无消息', { sender: 'queue', verbosity: 'normal' });
                             empty = true;
                         }
                     });
@@ -3087,14 +3264,14 @@
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 runtimeLifecycle.guard();
                                 chatInfo.jobEl.click();
-                                status(`正在获取职位详情`);
+                                status(`正在获取职位详情`, { sender: 'delivery', verbosity: 'detailed' });
                                 const jobInfo = await this.broadcast.receive(this.targets.detail, this.bcTypes.GET_JOB_INFO);
                                 if (!company) {
                                     status(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`);
                                     continue;
                                 }
                                 // 获取职位匹配度
-                                status(`开始计算职位 [${jobInfo.title}] 的匹配度`);
+                                status(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
                                 const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
                                 const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
@@ -3126,8 +3303,8 @@
                                         : (!aiPassed ? (decision.aiReason || 'AI 判断未通过') : (!rulePassed ? (decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`) : '')),
                                     greetingMode: '',
                                 });
-                                status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`);
-                                logDecisionDeductions(decision, (message) => status(message));
+                                status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
+                                logDecisionDeductions(decision, (message) => status(message, { sender: 'delivery', verbosity: 'detailed' }));
                                 await logAction({
                                     action: 'job_decision_consumed',
                                     scene: 'chat',
@@ -3163,12 +3340,12 @@
                                     }
                                     const duplicateCheck = await deliveryFlow.precheck(api, company, jobInfo.title);
                                     if (duplicateCheck.unavailable) {
-                                        status('重复投递检查服务不可用，为安全起见已跳过本岗位');
+                                        status('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
                                         continue;
                                     }
                                     if (duplicateCheck.greeted) {
                                         const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
-                                        status(duplicateMessage);
+                                        status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                         console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
                                         continue;
                                     }
@@ -3180,18 +3357,18 @@
                                         window.location.href
                                     );
                                     if (claim.reason === 'service_unavailable') {
-                                        status('投递协调服务不可用，为避免重复投递已跳过');
+                                        status('投递协调服务不可用，为避免重复投递已跳过', { sender: 'claim', verbosity: 'concise', level: 'error' });
                                         continue;
                                     }
                                     if (!claim.accepted) {
                                         if (claim.reason === 'daily_limit') {
-                                            status(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}）`);
+                                            status(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}）`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
                                         } else if (deliveryFlow.isDuplicate(claim)) {
                                             const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
-                                            status(duplicateMessage);
+                                            status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                             console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
                                         } else {
-                                            status(`无法领取投递权：${claim.reason}`);
+                                            status(`无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
                                         }
                                         continue;
                                     }
@@ -3201,7 +3378,7 @@
                                     const omitIntroduce = antiDetection.enabled() && antiDetection.shouldSkipIntroduce();
                                     status(omitIntroduce
                                         ? `职位 [${jobInfo.title}] 命中随机省略回复语策略`
-                                        : `职位 [${jobInfo.title}] 已通过全部条件，最后生成招呼语`);
+                                        : `职位 [${jobInfo.title}] 已通过全部条件，最后生成招呼语`, { sender: 'queue', verbosity: 'normal' });
                                     let finalIntroduce = defaultIntroduce;
                                     let greetingMode = omitIntroduce ? 'none' : 'fixed';
                                     try {
@@ -3220,12 +3397,12 @@
                                         }
                                     } catch (e) {
                                         if (isStopError(e)) throw e;
-                                        status(`定制招呼语生成失败，使用固定招呼语: ${e}`);
+                                        status(`定制招呼语生成失败，使用固定招呼语: ${e}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                                     }
                                     try {
                                         if (finalIntroduce) {
                                             activeChatMessageStarted = true;
-                                            await sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`));
+                                            await sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`, { sender: 'delivery', verbosity: 'detailed' }));
                                         }
                                         await api.markDelivery(claim.claimToken, 'sent', '', { allowDuringStop: true });
                                         activeChatClaimToken = '';
@@ -3249,7 +3426,7 @@
                                             hrActive: jobInfo.hrActive,
                                             hrActiveLevel: jobInfo.hrActiveLevel,
                                         });
-                                        status(`打招呼成功`);
+                                        status(`打招呼成功`, { sender: 'delivery', verbosity: 'concise' });
                                         await antiDetection.delay();
                                     } catch (e) {
                                         await api.markDelivery(claim.claimToken, 'failed_unknown', String(e), { allowDuringStop: true }).catch(() => null);
@@ -3266,7 +3443,7 @@
                                             workerId: identity.workerId,
                                             claimToken: claim.claimToken,
                                         });
-                                        status(`打招呼失败: ${e}`);
+                                        status(`打招呼失败: ${e}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
                                     }
                                     continue;
                                 }
@@ -3280,7 +3457,7 @@
                                         threshold: OPTIONS.thread,
                                         resumeIndex: decision.resumeIndex,
                                     });
-                                    await sendMsg('不好意思，不太合适哈，祝早日找到合适的人选。', (msg) => status(`[sendMsg] ${msg}`))
+                                    await sendMsg('不好意思，不太合适哈，祝早日找到合适的人选。', (msg) => status(`[sendMsg] ${msg}`, { sender: 'delivery', verbosity: 'detailed' }))
                                     continue;
                                 }
                             }
@@ -3318,7 +3495,7 @@
                             }
                         } catch (e) {
                             if (isStopError(e) || runtimeLifecycle.isStopping()) throw e;
-                            status('回复某条消息出错');
+                            status('回复某条消息出错', { sender: 'delivery', verbosity: 'concise', level: 'error' });
                         }
                     }
                     // 向下滚动
@@ -3359,7 +3536,7 @@
                         await this.broadcast.send(this.targets.search, this.bcTypes.RUN, true);
                     } catch (error) {
                         if (!isStopError(error) && !runtimeLifecycle.isStopping()) {
-                            status('聊天程序运行出错');
+                            status('聊天程序运行出错', { sender: 'delivery', verbosity: 'concise', level: 'error' });
                             await this.broadcast.send(this.targets.search, this.bcTypes.RUN, false).catch(() => null);
                         }
                     } finally {
@@ -3402,6 +3579,9 @@
             HR_ACTIVE_LEVELS,
             normalizeHrActive,
             hrActivePasses,
+            createRuntimeLogEntry,
+            createRuntimeActionPayload,
+            Logger,
         });
         return;
     }

@@ -43,6 +43,10 @@ DEFAULT_PLAN = {
     'maxDelayMs': 0,
 }
 
+EVENT_SENDERS = frozenset({'system', 'delivery', 'claim', 'queue'})
+EVENT_VERBOSITIES = frozenset({'detailed', 'normal', 'concise'})
+EVENT_LEVELS = frozenset({'debug', 'info', 'warning', 'error', 'fatal', 'action'})
+
 
 class RuntimeMonitor:
     """维护控制中心运行态和长轮询事件流的线程安全存储。
@@ -84,6 +88,43 @@ class RuntimeMonitor:
     def _clean_text(value, limit: int) -> str:
         return str(value or '').strip()[:limit]
 
+    @classmethod
+    def _normalize_choice(cls, value, allowed: frozenset[str], default: str) -> str:
+        candidate = cls._clean_text(value, 40).lower()
+        return candidate if candidate in allowed else default
+
+    @classmethod
+    def _normalize_sender(cls, value, default: str = 'system') -> str:
+        return cls._normalize_choice(value, EVENT_SENDERS, default)
+
+    @classmethod
+    def _normalize_verbosity(cls, value, default: str = 'normal') -> str:
+        return cls._normalize_choice(value, EVENT_VERBOSITIES, default)
+
+    @classmethod
+    def _normalize_level(cls, value, default: str = 'action') -> str:
+        return cls._normalize_choice(value, EVENT_LEVELS, default)
+
+    @classmethod
+    def _payload_sender(cls, payload: dict, default: str = 'system') -> str:
+        sender = payload.get('sender')
+        if not cls._clean_text(sender, 40):
+            sender = payload.get('source')
+        return cls._normalize_sender(sender, default)
+
+    @staticmethod
+    def _infer_action_sender(action_name: str) -> str:
+        action_name = str(action_name or '').strip().lower()
+        if action_name.startswith('delivery_claim_'):
+            return 'claim'
+        if action_name == 'chat_open_requested' or any(
+            marker in action_name for marker in ('queue', 'queued', 'wait')
+        ):
+            return 'queue'
+        if action_name.startswith('job_') or any(marker in action_name for marker in ('sent', 'greet', 'resume')):
+            return 'delivery'
+        return 'system'
+
     def _load_state(self) -> None:
         """从 JSON 恢复允许持久化的字段；文件缺失、损坏时保留默认值。"""
         if not self._state_path or not self._state_path.exists():
@@ -120,15 +161,38 @@ class RuntimeMonitor:
         }
         atomic_write_text(self._state_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
-    def publish(self, event_type: str, payload: dict) -> dict:
-        """在线程锁内追加事件并唤醒长轮询者，返回与内部状态隔离的事件副本。"""
+    def publish(
+        self,
+        event_type: str,
+        payload: dict,
+        *,
+        sender: str | None = None,
+        verbosity: str | None = None,
+        level: str | None = None,
+    ) -> dict:
+        """规范化事件元数据，在线程锁内追加事件并唤醒长轮询者。"""
+        safe_payload = payload if isinstance(payload, dict) else {'value': payload}
+        event_sender = (
+            self._normalize_sender(sender)
+            if self._clean_text(sender, 40)
+            else self._payload_sender(safe_payload)
+        )
+        event_verbosity = self._normalize_verbosity(
+            verbosity if self._clean_text(verbosity, 40) else safe_payload.get('verbosity'),
+        )
+        event_level = self._normalize_level(
+            level if self._clean_text(level, 40) else safe_payload.get('level'),
+        )
         with self._condition:
             self._cursor += 1
             event = {
                 'id': self._cursor,
                 'type': self._clean_text(event_type, 80),
                 'loggedAt': self._now_iso(),
-                'payload': payload if isinstance(payload, dict) else {'value': payload},
+                'sender': event_sender,
+                'verbosity': event_verbosity,
+                'level': event_level,
+                'payload': safe_payload,
             }
             self._events.append(event)
             self._condition.notify_all()
@@ -136,6 +200,10 @@ class RuntimeMonitor:
 
     def record_error(self, payload: dict) -> dict:
         """记录一条经过长度限制的运行错误，同时发布 ``runtime_error`` 事件。"""
+        sender = self._payload_sender(payload)
+        verbosity = self._normalize_verbosity(payload.get('verbosity'))
+        requested_level = self._normalize_level(payload.get('level'), 'error')
+        level = 'fatal' if requested_level == 'fatal' else 'error'
         error = {
             'id': f"err-{secrets.token_hex(6)}",
             'workerId': self._clean_text(payload.get('workerId'), 160),
@@ -144,6 +212,9 @@ class RuntimeMonitor:
             'message': self._clean_text(payload.get('message') or payload.get('error'), 2000),
             'context': payload.get('context') if isinstance(payload.get('context'), dict) else {},
             'loggedAt': self._clean_text(payload.get('loggedAt'), 40) or self._now_iso(),
+            'sender': sender,
+            'verbosity': verbosity,
+            'level': level,
             'resolved': False,
             'resolvedAt': '',
         }
@@ -329,7 +400,9 @@ class RuntimeMonitor:
                 'workerId': worker_id,
                 'accountId': safe_client['accountId'],
                 'role': safe_client['role'],
-                'level': self._clean_text(log.get('level') or 'info', 20),
+                'sender': self._payload_sender(log),
+                'verbosity': self._normalize_verbosity(log.get('verbosity')),
+                'level': self._normalize_level(log.get('level'), 'info'),
                 'message': self._clean_text(log.get('message'), 2000),
                 'loggedAt': self._clean_text(log.get('loggedAt'), 40) or safe_client['lastSeen'],
             }
@@ -360,6 +433,17 @@ class RuntimeMonitor:
 
     def record_action(self, action: dict) -> None:
         """把业务动作投影为监控事件；失败类动作还会生成一条运行错误。"""
+        action_name = str(action.get('action') or '')
+        normalized_action_name = action_name.lower()
+        default_sender = self._infer_action_sender(action_name)
+        sender = self._payload_sender(action, default_sender)
+        verbosity = self._normalize_verbosity(action.get('verbosity'))
+        default_level = (
+            'error'
+            if 'failed' in normalized_action_name or 'error' in normalized_action_name
+            else 'action'
+        )
+        level = self._normalize_level(action.get('level'), default_level)
         payload = {
             key: action.get(key)
             for key in (
@@ -367,12 +451,13 @@ class RuntimeMonitor:
                 'city', 'industry', 'experience', 'education', 'score', 'stars', 'rawStars',
                 'discarded', 'accountId', 'workerId', 'reason', 'hrActive',
                 'hrActiveLevel', 'aiFilterEnabled', 'aiPassed', 'aiReason', 'greetingMode',
+                'sender', 'verbosity', 'level',
             )
             if action.get(key) is not None
         }
+        payload.update({'sender': sender, 'verbosity': verbosity, 'level': level})
         self.publish('job_action', payload)
-        action_name = str(action.get('action') or '')
-        if 'failed' in action_name or 'error' in action_name:
+        if 'failed' in normalized_action_name or 'error' in normalized_action_name:
             self.record_error({
                 'workerId': action.get('workerId'),
                 'accountId': action.get('accountId'),
@@ -380,6 +465,9 @@ class RuntimeMonitor:
                 'message': action.get('reason') or action_name,
                 'context': payload,
                 'loggedAt': action.get('loggedAt'),
+                'sender': sender,
+                'verbosity': verbosity,
+                'level': 'error',
             })
 
     def update_safety(self, patch: dict, *, actor: str = 'dashboard', audit: bool = True) -> dict:

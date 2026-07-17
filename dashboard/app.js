@@ -42,6 +42,8 @@ const state = {
     logsPaused: false,
     logsExpanded: false,
     logAccount: 'all',
+    logSender: 'all',
+    logVerbosity: 'normal',
     logClearedCursor: 0,
     adminConfig: null,
     prompts: [],
@@ -59,6 +61,8 @@ const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待�
 const HR_ACTIVE_LABELS = { online: '当前在线', just_now: '刚刚活跃', today: '今日活跃', within_3_days: '3 日内活跃', this_week: '本周活跃', this_month: '本月活跃', unknown: '未知' };
 const DECISION_STATE_LABELS = { evaluating: '正在评估', hr_filtered: 'HR 活跃未达标', below_threshold: '低于投递阈值', ai_rejected: 'AI 未通过', random_skipped: '随机跳过', claiming: '正在领取投递权', queued: '等待投递', sent: '已投递', failed: '处理失败' };
 const GREETING_MODE_LABELS = { none: '仅立即沟通', fixed: '固定招呼语', llm: 'AI 招呼语' };
+const LOG_SENDER_LABELS = { system: '系统', delivery: '投递', claim: '领取投递', queue: '投递等待' };
+const LOG_VERBOSITY_RANK = { concise: 0, normal: 1, detailed: 2 };
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
@@ -1248,27 +1252,127 @@ function renderRuntime() {
     const ttl = Number(runtime.clientTtlSeconds || 120); $('#heartbeatWindowHint').textContent = ttl >= 60 ? `${Math.round(ttl / 60)} 分钟内有心跳` : `${ttl} 秒内有心跳`;
 }
 
+function eventPayload(event) {
+    return event?.payload && typeof event.payload === 'object' ? event.payload : {};
+}
+
+function eventLogAccount(event) {
+    const payload = eventPayload(event);
+    return String(payload.accountId ?? event?.accountId ?? '').trim();
+}
+
+function eventLogSender(event) {
+    const payload = eventPayload(event);
+    const explicit = String(payload.sender ?? event?.sender ?? '').trim().toLowerCase();
+    if (explicit === 'delivery_wait' || explicit === 'waiting') return 'queue';
+    if (Object.prototype.hasOwnProperty.call(LOG_SENDER_LABELS, explicit)) return explicit;
+
+    const type = String(event?.type || '').toLowerCase();
+    const action = String(payload.action || '').toLowerCase();
+    const runtimeState = String(payload.state || '').toLowerCase();
+    if (action.includes('claim') || type.includes('claim') || runtimeState === 'claiming') return 'claim';
+    if (action.includes('queue') || action.includes('queued') || type.includes('queue') || ['queued', 'reserved', 'pending', 'waiting'].includes(runtimeState)) return 'queue';
+    if (type === 'job_action' || type.includes('delivery') || type.includes('greet') || type.includes('resume') || ['sent', 'delivered'].includes(runtimeState)) return 'delivery';
+    return 'system';
+}
+
+function eventLogVerbosity(event) {
+    const payload = eventPayload(event);
+    const explicit = String(payload.verbosity ?? event?.verbosity ?? '').trim().toLowerCase();
+    if (explicit === 'detail') return 'detailed';
+    if (Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_RANK, explicit)) return explicit;
+
+    const type = String(event?.type || '').toLowerCase();
+    const level = String(payload.level ?? event?.level ?? '').toLowerCase();
+    const action = String(payload.action || '').toLowerCase();
+    if (['error', 'fatal', 'warn', 'warning'].includes(level) || type === 'runtime_error' || ['client_connected', 'client_state_changed'].includes(type) || /(?:_sent|_failed|_error)$/.test(action)) return 'concise';
+    return 'normal';
+}
+
+function eventMatchesLogFilters(event, filters = {}) {
+    const account = filters.account || 'all';
+    const sender = filters.sender || 'all';
+    const verbosity = Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_RANK, filters.verbosity) ? filters.verbosity : 'normal';
+    if (account !== 'all' && eventLogAccount(event) !== account) return false;
+    if (sender !== 'all' && eventLogSender(event) !== sender) return false;
+    return LOG_VERBOSITY_RANK[eventLogVerbosity(event)] <= LOG_VERBOSITY_RANK[verbosity];
+}
+
+function eventLogLevel(event) {
+    const payload = eventPayload(event);
+    const level = String(payload.level ?? event?.level ?? '').toLowerCase();
+    if (level === 'fatal' || level === 'error') return 'error';
+    if (level === 'warn' || level === 'warning') return 'warning';
+    if (event?.type === 'job_action') return String(payload.action || '').includes('fail') ? 'error' : 'action';
+    return level === 'action' ? 'action' : 'info';
+}
+
 function eventMessage(event) {
-    const payload = event.payload || {};
-    if (event.type === 'script_log') return { level: payload.level || 'info', source: payload.accountId || payload.role || '脚本', message: payload.message || '', time: payload.loggedAt || event.loggedAt };
-    if (event.type === 'job_action') return { level: payload.action?.includes('fail') ? 'error' : 'action', source: payload.accountId || '投递动作', message: `${payload.action || 'action'} ${payload.company || ''} ${payload.title || ''}`.trim(), time: payload.loggedAt || event.loggedAt };
-    return { level: 'action', source: '系统', message: `${event.type}${payload.accountId ? ` · ${payload.accountId}` : ''}`, time: event.loggedAt };
+    const payload = eventPayload(event);
+    const account = eventLogAccount(event) || '全局';
+    const sender = eventLogSender(event);
+    const base = {
+        account,
+        level: eventLogLevel(event),
+        sender,
+        senderLabel: LOG_SENDER_LABELS[sender],
+        source: account,
+        time: payload.loggedAt || event?.loggedAt || '',
+        verbosity: eventLogVerbosity(event),
+    };
+    if (event?.type === 'script_log') return { ...base, message: payload.message || '' };
+    if (event?.type === 'job_action') return { ...base, message: `${payload.action || 'action'} ${payload.company || ''} ${payload.title || ''}`.trim() };
+    return { ...base, message: payload.message || payload.phase || String(event?.type || 'system') };
+}
+
+function formatLogTime(value) {
+    if (!value) return '--:--:--';
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    return String(value).match(/(?:T|\s)(\d{2}:\d{2}:\d{2})/)?.[1] || String(value).slice(0, 8);
 }
 
 function renderLiveLogs() {
     const container = $('#liveLogs'); container.replaceChildren();
-    const accounts = [...new Set([...(state.runtime?.clients || []).map((client) => client.accountId), ...state.liveEvents.map((event) => event.payload?.accountId)].filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
-    const filter = $('#liveLogAccountFilter'); const current = state.logAccount;
-    filter.innerHTML = '<option value="all">全部账号</option>' + accounts.map((account) => `<option value="${escapeHtml(account)}">${escapeHtml(account)}</option>`).join('');
-    filter.value = accounts.includes(current) ? current : 'all'; state.logAccount = filter.value;
-    state.liveEvents.filter((event) => (event.id || 0) > state.logClearedCursor && (state.logAccount === 'all' || event.payload?.accountId === state.logAccount)).slice(-160).forEach((event) => {
-        const entry = eventMessage(event), row = document.createElement('div'); row.className = `live-log ${entry.level}`;
-        const time = document.createElement('time'); time.textContent = (entry.time || '').slice(11, 19);
-        const source = document.createElement('b'); source.textContent = entry.source;
-        const message = document.createElement('span'); message.textContent = entry.message;
-        row.append(time, source, message); container.appendChild(row);
+    const accounts = [...new Set([...(state.runtime?.clients || []).map((client) => client.accountId), ...state.liveEvents.map(eventLogAccount)].filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    const accountFilter = $('#liveLogAccountFilter'); const currentAccount = state.logAccount;
+    const accountOptions = [{ value: 'all', label: '全部账号' }, ...accounts.map((account) => ({ value: account, label: account }))].map(({ value, label }) => {
+        const option = document.createElement('option'); option.value = value; option.textContent = label; return option;
+    });
+    accountFilter.replaceChildren(...accountOptions);
+    accountFilter.value = accounts.includes(currentAccount) ? currentAccount : 'all'; state.logAccount = accountFilter.value;
+
+    const availableEvents = state.liveEvents.filter((event) => (event.id || 0) > state.logClearedCursor);
+    const matchedEvents = availableEvents.filter((event) => eventMatchesLogFilters(event, { account: state.logAccount, sender: state.logSender, verbosity: state.logVerbosity }));
+    const visibleEvents = matchedEvents.slice(-160);
+    $('#liveLogCount').textContent = `显示 ${visibleEvents.length} 条 · 匹配 ${matchedEvents.length} 条 · 共 ${availableEvents.length} 条`;
+    if (!visibleEvents.length) {
+        const empty = document.createElement('div'); empty.className = 'live-log-empty'; empty.textContent = availableEvents.length ? '暂无符合筛选条件的日志' : '暂无实时日志'; container.appendChild(empty);
+    }
+    visibleEvents.forEach((event) => {
+        const entry = eventMessage(event), row = document.createElement('div'); row.className = `live-log ${entry.level}`; row.dataset.sender = entry.sender; row.dataset.verbosity = entry.verbosity;
+        const time = document.createElement('time'); time.dateTime = entry.time; time.textContent = formatLogTime(entry.time);
+        const account = document.createElement('b'); account.className = 'live-log-account'; account.textContent = entry.account; account.title = entry.account;
+        const sender = document.createElement('span'); sender.className = `live-log-sender sender-${entry.sender}`; sender.textContent = entry.senderLabel;
+        const message = document.createElement('span'); message.className = 'live-log-message'; message.textContent = entry.message;
+        row.append(time, account, sender, message); container.appendChild(row);
     });
     if (!state.logsPaused) container.scrollTop = container.scrollHeight;
+}
+
+function setLogsPaused(paused) {
+    state.logsPaused = Boolean(paused);
+    const button = $('#pauseLogs');
+    const label = state.logsPaused ? '继续自动滚动' : '暂停自动滚动';
+    button.setAttribute('aria-pressed', String(state.logsPaused)); button.setAttribute('aria-label', label); button.title = label;
+    $('#pauseLogsIcon').textContent = state.logsPaused ? '▶' : 'Ⅱ';
+    if (!state.logsPaused) $('#liveLogs').scrollTop = $('#liveLogs').scrollHeight;
+}
+
+function setLogVerbosity(verbosity, shouldRender = true) {
+    state.logVerbosity = Object.prototype.hasOwnProperty.call(LOG_VERBOSITY_RANK, verbosity) ? verbosity : 'normal';
+    $$('[data-log-verbosity]').forEach((button) => { const active = button.dataset.logVerbosity === state.logVerbosity; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
+    if (shouldRender) renderLiveLogs();
 }
 
 function setLiveLogsExpanded(expanded) {
@@ -2084,7 +2188,7 @@ function bindEvents() {
     $('#prevPage').addEventListener('click', () => { state.page -= 1; renderRecords(getFilteredRecords()); }); $('#nextPage').addEventListener('click', () => { state.page += 1; renderRecords(getFilteredRecords()); });
     $('#drawerClose').addEventListener('click', closeDrawer); $('#drawerBackdrop').addEventListener('click', closeDrawer); $('#mobileMenu').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
     $('#liveLogToggle').addEventListener('click', () => setLiveLogsExpanded(!state.logsExpanded));
-    $('#pauseLogs').addEventListener('click', () => { state.logsPaused = !state.logsPaused; $('#pauseLogs').textContent = state.logsPaused ? '继续滚动' : '暂停滚动'; }); $('#clearLogs').addEventListener('click', () => { state.logClearedCursor = state.runtimeCursor; renderLiveLogs(); });
+    $('#pauseLogs').addEventListener('click', () => setLogsPaused(!state.logsPaused)); $('#clearLogs').addEventListener('click', () => { state.logClearedCursor = state.runtimeCursor; renderLiveLogs(); });
     $('#exportSelected').addEventListener('click', () => exportRecords(state.records.filter((record) => state.selectedIds.has(record.id)), '投递报表_所选'));
     $('#deleteSelected').addEventListener('click', () => deleteDeliveryRecords([...state.selectedIds]));
     $('#clearSelection').addEventListener('click', () => { state.selectedIds.clear(); renderRecords(getFilteredRecords()); });
@@ -2147,6 +2251,8 @@ function bindEvents() {
         if (action === 'refresh_instances') { loadControlState(); return; }
     });
     $('#liveLogAccountFilter').addEventListener('change', (event) => { state.logAccount = event.target.value; renderLiveLogs(); });
+    $('#liveLogSenderFilter').addEventListener('change', (event) => { state.logSender = event.target.value; renderLiveLogs(); });
+    $$('.live-log-segments [data-log-verbosity]').forEach((button) => button.addEventListener('click', () => setLogVerbosity(button.dataset.logVerbosity)));
     document.addEventListener('click', (event) => { if (!event.target.closest('.column-manager')) $('#columnManagerMenu').hidden = true; });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !$('#deleteConfirm').hidden) closeDeleteConfirm(false); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeDrawer(); $('#columnManagerMenu').hidden = true; } });
@@ -2162,6 +2268,8 @@ bindTableInteractions();
 initMapNavigation();
 bindEvents();
 setLiveLogsExpanded(false);
+setLogsPaused(false);
+setLogVerbosity(state.logVerbosity, false);
 loadData({ silent: true });
 loadRuntime().then(connectRuntimeStream);
 loadControlState();
