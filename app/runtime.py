@@ -507,6 +507,13 @@ class RuntimeMonitor:
             'desiredState': worker['desiredState'],
         }
 
+    def _refresh_client_liveness_locked(self, worker_id: str) -> None:
+        """Refresh an existing client's ephemeral liveness while holding the condition lock."""
+        client = self._clients.get(worker_id)
+        if client is not None:
+            client['_seenMonotonic'] = time.monotonic()
+            client['lastSeen'] = self._now_iso()
+
     def desired_control(
         self,
         worker_id: str,
@@ -518,7 +525,7 @@ class RuntimeMonitor:
         after_revision: int | None = None,
         timeout_seconds: float = 0,
     ) -> dict:
-        """Return or briefly wait for one session's control target without mutating state."""
+        """Return or briefly wait for control while refreshing the valid client's liveness."""
         worker_id = self._clean_text(worker_id, 160)
         protocol_version = self._integer_field(protocol_version, 'protocol_version')
         session_id = self._clean_text(session_id, 160)
@@ -544,6 +551,7 @@ class RuntimeMonitor:
                     or session_epoch != int(worker.get('sessionEpoch') or 0)
                 ):
                     raise ValueError('stale_session')
+                self._refresh_client_liveness_locked(worker_id)
                 control = self._control_for_worker_locked(worker_id)
                 unchanged = (
                     after_epoch is not None

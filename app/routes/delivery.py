@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-import random
 import threading
 import uuid
 
@@ -46,16 +45,8 @@ async def get_job_score(job: str = Body(..., description='职位信息')):
     title = result.get('title') or ''
     salary = result.get('salary') or ''
     detail = result.get('detail') or ''
-    delay_ms = max(
-        0,
-        Config.job_score_delay_base_ms
-        + random.randint(-Config.job_score_delay_jitter_ms, Config.job_score_delay_jitter_ms),
-    )
     use_ai_filter = LLM_MANAGER.available() and LLM_MANAGER.job_filter_enabled
-    (ai_pass, ai_reason), _ = await asyncio.gather(
-        llm_job_filter(title, salary, detail),
-        asyncio.sleep(delay_ms / 1000),
-    )
+    ai_pass, ai_reason = await llm_job_filter(title, salary, detail)
     if use_ai_filter:
         STATE.record_ai_filter(title, salary, detail, result['score'], ai_pass, ai_reason)
     if use_ai_filter and not ai_pass:
@@ -66,7 +57,7 @@ async def get_job_score(job: str = Body(..., description='职位信息')):
     print(
         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] /get-job-score | "
         f'title={display_title} | stars={result.get("stars")} | '
-        f'deducted={result.get("deductedStars")} | delay_ms={delay_ms} | '
+        f'deducted={result.get("deductedStars")} | delay_ms=0 | '
         f'score={result["score"]} | reason={result["reason"]}',
         flush=True,
     )
@@ -77,7 +68,7 @@ async def get_job_score(job: str = Body(..., description='职位信息')):
             f'关键词={deduction.get("keyword")} | 扣除={deduction.get("deductStars")}星',
             flush=True,
         )
-    STATE.record_job_decision(result, job, delay_ms)
+    STATE.record_job_decision(result, job, 0)
     return {
         **result,
         'introduce': Config.introduce,

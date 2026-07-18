@@ -54,6 +54,159 @@ def _format_job_info(title: str, salary: str, detail: str) -> str:
     return job_info
 
 
+def _clean_job_filter_reason(value: object) -> str:
+    """清理模型返回的筛选理由，供日志和接口响应使用。"""
+    if not isinstance(value, str):
+        return ''
+    text = value.strip()
+    if not text:
+        return ''
+    text = re.sub(
+        r'(?m)^\s*(?:#{1,6}\s*|>\s*|[-+•]\s*|\(\d{1,3}\)\s*|\d{1,3}[.、)]\s*)',
+        '',
+        text,
+    )
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'~~([^~]+)~~', r'\1', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
+    text = text.replace('`', '').replace('*', '')
+    text = re.sub(r'^(?:理由|原因|说明)\s*[：:]\s*', '', text, flags=re.I)
+    return re.sub(r'\s+', ' ', text).strip()[:200]
+
+
+def _strip_job_filter_markdown(text: str) -> str:
+    """移除包裹结论词的成对 Markdown 标记。"""
+    candidate = text.strip()
+    for marker in ('**', '__', '`', '*', '_'):
+        if (
+            len(candidate) > len(marker) * 2
+            and candidate.startswith(marker)
+            and candidate.endswith(marker)
+        ):
+            candidate = candidate[len(marker) : -len(marker)].strip()
+            break
+    return candidate
+
+
+_JOB_FILTER_LINE_PREFIX_RE = re.compile(
+    r'^(?:>\s*|[-+•]\s*|\(\d{1,3}\)\s*|\d{1,3}[.、)]\s*)'
+)
+_JOB_FILTER_LABEL_RE = re.compile(
+    r'^(?:(?:最终)?(?:结论|判断结果|审批结果|结果|答案|判断|判定|是否通过)'
+    r'|(?:final\s+)?(?:verdict|result|answer|decision))\s*[：:=]\s*',
+    flags=re.I,
+)
+
+
+def _job_filter_line_verdict(line: str, *, labeled_only: bool = False) -> bool | None:
+    """仅在一行包含独立明确结论时返回判定值。"""
+    candidate = line.lstrip('\ufeff').strip()
+    candidate = re.sub(r'^#{1,6}\s*', '', candidate)
+    candidate = re.sub(r'[*_`]+', '', candidate)
+    candidate = _strip_job_filter_markdown(candidate)
+    candidate = _JOB_FILTER_LINE_PREFIX_RE.sub('', candidate, count=1).strip()
+    candidate = re.sub(r'[*_`]+', '', candidate)
+    candidate = _strip_job_filter_markdown(candidate)
+    label_match = _JOB_FILTER_LABEL_RE.match(candidate)
+    if label_match:
+        candidate = candidate[label_match.end() :].strip()
+    elif labeled_only:
+        return None
+    candidate = _strip_job_filter_markdown(candidate)
+    candidate = candidate.rstrip('。.!！；;').strip(' \t\"\'“”‘’').strip()
+    normalized = candidate.lower()
+    if normalized in {'false', '不通过'}:
+        return False
+    if normalized in {'true', '通过'}:
+        return True
+    return None
+
+
+def _job_filter_line_is_quoted(line: str) -> bool:
+    """判断裸结论是否只是被引号包裹的示例。"""
+    candidate = line.strip()
+    candidate = re.sub(r'^#{1,6}\s*', '', candidate)
+    candidate = re.sub(r'[*_`]+', '', candidate)
+    candidate = _JOB_FILTER_LINE_PREFIX_RE.sub('', candidate, count=1).strip()
+    candidate = _strip_job_filter_markdown(candidate)
+    return len(candidate) >= 2 and candidate[0] in '\"\'“”‘’' and candidate[-1] in '\"\'“”‘’'
+
+
+def _parse_job_filter_response(content: str) -> tuple[bool | None, str]:
+    """解析明确的最终筛选结论，不从理由正文推断判定。"""
+    text = (content or '').lstrip('\ufeff').strip()
+    if not text:
+        return None, ''
+
+    fence_match = re.fullmatch(
+        r'```(?:json|text|markdown)?\s*(.*?)\s*```',
+        text,
+        flags=re.I | re.S,
+    )
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    if text.startswith('{') and text.endswith('}'):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None, ''
+        if not isinstance(parsed, dict):
+            return None, ''
+        passed = parsed.get('passed')
+        if type(passed) is not bool:
+            return None, ''
+        reason = _clean_job_filter_reason(parsed.get('reason')) or 'AI未提供理由'
+        return passed, reason
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    first_verdict = _job_filter_line_verdict(lines[0]) if lines else None
+    verdict_lines = []
+    if first_verdict is not None:
+        verdict_lines.append((0, first_verdict))
+    last_index = len(lines) - 1
+    for index, line in enumerate(lines[1:], start=1):
+        labeled_verdict = _job_filter_line_verdict(line, labeled_only=True)
+        if labeled_verdict is not None:
+            verdict_lines.append((index, labeled_verdict))
+            continue
+        if _job_filter_line_is_quoted(line):
+            continue
+        if first_verdict is not None and index in {1, last_index}:
+            immediate_verdict = _job_filter_line_verdict(line)
+            if immediate_verdict is not None:
+                verdict_lines.append((index, immediate_verdict))
+        elif first_verdict is None and index == last_index:
+            final_verdict = _job_filter_line_verdict(line)
+            if final_verdict is not None:
+                verdict_lines.append((index, final_verdict))
+    verdicts = {verdict for _, verdict in verdict_lines}
+    if len(verdicts) != 1:
+        return None, ''
+
+    if first_verdict is None and not verdict_lines:
+        return None, ''
+
+    verdict = verdict_lines[0][1]
+    verdict_index = 0 if first_verdict is not None else verdict_lines[0][0]
+    reason_lines = [
+        line
+        for line in lines[verdict_index + 1 :]
+        if _job_filter_line_verdict(line) is None
+    ]
+    reason = _clean_job_filter_reason('\n'.join(reason_lines)) or 'AI未提供理由'
+    return verdict, reason
+
+
+def _is_empty_llm_response_error(error: Exception) -> bool:
+    """识别最终内容和推理内容均为空时网关抛出的错误。"""
+    return (
+        isinstance(error, LLMGatewayError)
+        and 'llm response content is empty' in str(error).lower()
+    )
+
+
 async def generate_custom_introduce(
     title: str,
     salary: str,
@@ -215,36 +368,82 @@ async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, st
             {'role': 'user', 'content': prompt},
         ],
         'temperature': 0.1,
-        'max_tokens': 128,
+        'max_tokens': 512,
     }
 
-    try:
-        data = await LLM_MANAGER.chat_completions(payload, 'job_filter')
-        message = data['choices'][0]['message']
+    def extract_filter_response(data: dict) -> tuple[str, str, str]:
+        choice = data['choices'][0]
+        message = choice['message']
         content = response_text(message.get('content'))
         reasoning = response_text(message.get('reasoning_content')) or response_text(
             message.get('reasoning')
         )
-        if not content and reasoning:
-            reasoning_lines = [line.strip() for line in reasoning.split('\n') if line.strip()]
-            content = '\n'.join(reasoning_lines[-3:]) if reasoning_lines else ''
-        if not content:
-            print(f'[LLM] 岗位筛选: {title} → AI返回空内容，默认通过', flush=True)
-            return True, 'AI返回空内容'
-        clean = re.sub(r'\*+', '', content)
-        clean = re.sub(r'^#+\s*', '', clean, flags=re.MULTILINE)
-        clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', clean)
-        lines = [line.strip() for line in clean.split('\n') if line.strip()]
-        first_line = lines[0].lower().strip()
-        passed = first_line.startswith('true')
-        reason = lines[1].strip() if len(lines) > 1 else ''
-        if not reason:
-            for keyword in ['因为', '原因', '：', ':', '。']:
-                if keyword in lines[0]:
-                    reason = lines[0].split(keyword, 1)[-1].strip()
-                    break
-        if not reason:
-            reason = lines[0][:30]
+        finish_reason = str(choice.get('finish_reason') or '')
+        return content, reasoning, finish_reason
+
+    log_title = re.sub(r'\s+', ' ', str(title or '')).strip()[:80] or '未命名岗位'
+
+    try:
+        content = ''
+        reasoning = ''
+        finish_reason = ''
+        try:
+            data = await LLM_MANAGER.chat_completions(payload, 'job_filter')
+        except LLMGatewayError as error:
+            if not _is_empty_llm_response_error(error):
+                raise
+            data = None
+        if data is None:
+            passed, reason = None, ''
+        else:
+            content, reasoning, finish_reason = extract_filter_response(data)
+            passed, reason = _parse_job_filter_response(content)
+
+        if passed is None:
+            print(
+                f'[LLM] 岗位筛选响应格式不明确，准备重试: title={log_title} | '
+                f'finish_reason={finish_reason or "unknown"} | '
+                f'content={"有" if content else "无"} | reasoning={"有" if reasoning else "无"}',
+                flush=True,
+            )
+            retry_payload = {
+                'messages': [
+                    {
+                        'role': 'system',
+                        'content': (
+                            '你是一个求职筛选助手。只输出两行纯文本，不得输出分析、编号、'
+                            'Markdown、JSON或其他内容。第一行必须且只能是true或false，'
+                            '第二行给出200字以内的一句话原因。'
+                        ),
+                    },
+                    {'role': 'user', 'content': prompt},
+                ],
+                'temperature': 0,
+                'max_tokens': 1024,
+            }
+            try:
+                data = await LLM_MANAGER.chat_completions(retry_payload, 'job_filter_retry')
+            except LLMGatewayError as error:
+                if not _is_empty_llm_response_error(error):
+                    raise
+                print(
+                    f'[LLM] 岗位筛选重试仍为空，默认通过: title={log_title} | '
+                    'finish_reason=unknown | content=无 | reasoning=无',
+                    flush=True,
+                )
+                return True, 'AI响应格式不明确，默认通过'
+            content, reasoning, finish_reason = extract_filter_response(data)
+            passed, reason = _parse_job_filter_response(content)
+
+        if passed is None:
+            print(
+                f'[LLM] 岗位筛选响应仍不明确，默认通过: title={log_title} | '
+                f'finish_reason={finish_reason or "unknown"} | '
+                f'content={"有" if content else "无"} | reasoning={"有" if reasoning else "无"}',
+                flush=True,
+            )
+            return True, 'AI响应格式不明确，默认通过'
+
         print(
             f'[LLM] 岗位筛选: {title} → {"通过" if passed else "不通过"} | 原因: {reason}',
             flush=True,

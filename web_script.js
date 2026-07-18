@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-18-remote-control.6
+// @version      2026-07-19-remote-control.8
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-18-remote-control.6';
+    const SCRIPT_VERSION = '2026-07-19-remote-control.8';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
@@ -217,7 +217,7 @@
         greetTimeout: 12000, // 打招呼页回执超时时间
         preloadScrollPixels: 180, // 岗位预加载：每轮下滑像素
         preloadScrollWaitMs: 450, // 岗位预加载：每轮等待毫秒数
-        preloadStableRoundsLimit: 24, // 岗位预加载：连续多少轮无增长后结束
+        preloadStableRoundsLimit: 3, // 岗位预加载：连续多少轮无增长后结束
         preloadMaxRounds: 30, // 岗位预加载：最多滑动多少轮
         preloadActivateCardEvery: 0, // 预加载时每隔多少轮尝试轻点一次左侧岗位卡片，0 表示关闭
         preloadActivateCardWaitMs: 250, // 轻点岗位卡片后的额外等待时间
@@ -533,6 +533,15 @@
             verbosity: RUNTIME_LOG_VERBOSITIES.has(actionPayload.verbosity) ? actionPayload.verbosity : verbosity,
             level: RUNTIME_LOG_LEVELS.has(actionPayload.level) ? actionPayload.level : level,
         };
+    }
+
+    function queueRuntimeHeartbeat(controlAgent) {
+        controlAgent?.requestHeartbeat();
+    }
+
+    function searchRejectionAction(rulePassed, aiPassed) {
+        if (!aiPassed) return 'job_ai_rejected';
+        return rulePassed ? '' : 'job_below_threshold';
     }
 
     const deliveryFlow = {
@@ -1366,7 +1375,7 @@
         }
     }
 
-    // 无 DOM 日志器：运行日志只上报到 Dashboard，不在 BOSS 页面展示或控制。
+    // Logger 保持 headless，只规范化并转发日志；StatusIndicator 负责页面本地显示。
     class Logger {
         constructor(startFn, pauseFn, onLog) {
             this.__startFn = typeof startFn === 'function' ? startFn : (() => void 0);
@@ -1391,7 +1400,7 @@
             this.add('----------------', { sender: 'system', verbosity: 'detailed' });
         }
 
-        clear() { /* Dashboard owns log display state. */ }
+        clear() { /* Logger remains headless; StatusIndicator owns local display state. */ }
 
         remove() { /* No page-owned DOM to remove. */ }
     }
@@ -1412,8 +1421,15 @@
             this.executionState = 'stopped';
             this.commandBusy = false;
             this.commandMessage = '';
+            this.logEntries = [];
+            this.logsExpanded = false;
+            this.logsDirty = false;
+            this.renderedLogEntries = [];
             this.onDesiredState = typeof onDesiredState === 'function' ? onDesiredState : (() => Promise.resolve());
             this.root = null;
+            this.logPanel = null;
+            this.logList = null;
+            this.logToggleButton = null;
             this.settingsPanel = null;
             this.settingsInputs = null;
             this.settingsError = null;
@@ -1459,6 +1475,12 @@
                 const actions = document.createElement('div');
                 const startButton = this.createButton('▶ 开始', '开始自动化', 'color:#8df0b8;border-color:rgba(83,227,148,.28);background:rgba(83,227,148,.09);');
                 const pauseButton = this.createButton('Ⅱ 暂停', '暂停自动化', 'color:#ffd09b;border-color:rgba(255,173,91,.26);background:rgba(255,173,91,.08);');
+                const logToggleButton = this.createButton('日志', '展开或收起本地日志');
+                const logPanel = document.createElement('div');
+                const logHead = document.createElement('div');
+                const logTitle = document.createElement('strong');
+                const clearLogsButton = this.createButton('清空', '清空本地日志', 'height:28px;padding:0 8px;color:#aebfc3;background:transparent;');
+                const logList = document.createElement('div');
                 const settings = document.createElement('div');
                 const settingsHead = document.createElement('div');
                 const settingsTitle = document.createElement('strong');
@@ -1474,7 +1496,7 @@
                 root.id = 'goodjobs-runtime-status';
                 root.setAttribute('role', 'group');
                 root.setAttribute('aria-label', 'goodJobs 脚本状态与控制');
-                root.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;width:min(292px,calc(100vw - 24px));box-sizing:border-box;display:grid;gap:8px;padding:9px 10px;border:1px solid rgba(111,226,232,.28);border-radius:8px;background:rgba(10,24,29,.96);box-shadow:0 8px 24px rgba(0,0,0,.3);color:#f4fbfc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none;letter-spacing:0;';
+                root.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;width:min(292px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;overscroll-behavior:contain;box-sizing:border-box;display:grid;gap:8px;padding:9px 10px;border:1px solid rgba(111,226,232,.28);border-radius:8px;background:rgba(10,24,29,.96);box-shadow:0 8px 24px rgba(0,0,0,.3);color:#f4fbfc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none;letter-spacing:0;';
                 statusRow.dataset.goodjobsStatusRow = '1';
                 statusRow.setAttribute('role', 'status');
                 statusRow.setAttribute('aria-live', 'polite');
@@ -1492,7 +1514,30 @@
                 execution.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;';
                 startButton.dataset.goodjobsStart = '1';
                 pauseButton.dataset.goodjobsPause = '1';
-                actions.style.cssText = 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;';
+                logToggleButton.dataset.goodjobsLogToggle = '1';
+                logToggleButton.setAttribute('aria-expanded', 'false');
+                logToggleButton.setAttribute('aria-controls', 'goodjobs-runtime-log-panel');
+                actions.style.cssText = 'display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;';
+
+                logPanel.id = 'goodjobs-runtime-log-panel';
+                logPanel.dataset.goodjobsLogPanel = '1';
+                logPanel.hidden = true;
+                logPanel.setAttribute('role', 'region');
+                logPanel.setAttribute('aria-labelledby', 'goodjobs-runtime-log-title');
+                logPanel.setAttribute('aria-label', '本地运行日志');
+                logPanel.style.cssText = 'display:none;gap:7px;padding-top:8px;border-top:1px solid rgba(111,226,232,.13);min-height:0;';
+                logHead.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
+                logTitle.id = 'goodjobs-runtime-log-title';
+                logTitle.textContent = '本地日志';
+                logTitle.style.cssText = 'font-size:12px;color:#dcebed;letter-spacing:0;';
+                clearLogsButton.dataset.goodjobsLogClear = '1';
+                logList.dataset.goodjobsLogList = '1';
+                logList.setAttribute('role', 'log');
+                logList.setAttribute('aria-live', 'polite');
+                logList.setAttribute('aria-relevant', 'additions text');
+                logList.setAttribute('aria-label', '本地运行日志列表');
+                logList.tabIndex = 0;
+                logList.style.cssText = 'display:grid;gap:4px;max-height:min(220px,35vh);overflow:auto;overscroll-behavior:contain;min-height:0;padding-right:2px;user-select:text;';
 
                 settings.dataset.goodjobsSettings = '1';
                 settings.hidden = true;
@@ -1511,6 +1556,11 @@
                 statusRow.appendChild(copy);
                 actions.appendChild(startButton);
                 actions.appendChild(pauseButton);
+                actions.appendChild(logToggleButton);
+                logHead.appendChild(logTitle);
+                logHead.appendChild(clearLogsButton);
+                logPanel.appendChild(logHead);
+                logPanel.appendChild(logList);
                 settingsHead.appendChild(settingsTitle);
                 settingsHead.appendChild(closeSettings);
                 settingsActions.appendChild(cancelSettings);
@@ -1523,10 +1573,14 @@
                 settings.appendChild(settingsActions);
                 root.appendChild(statusRow);
                 root.appendChild(actions);
+                root.appendChild(logPanel);
                 root.appendChild(settings);
                 document.body.appendChild(root);
 
                 this.root = root;
+                this.logPanel = logPanel;
+                this.logList = logList;
+                this.logToggleButton = logToggleButton;
                 this.settingsPanel = settings;
                 this.settingsInputs = {
                     account: accountField.input,
@@ -1542,6 +1596,8 @@
                 });
                 startButton.addEventListener('click', () => this.onDesiredState('running'));
                 pauseButton.addEventListener('click', () => this.onDesiredState('paused'));
+                logToggleButton.addEventListener('click', () => this.toggleLogs());
+                clearLogsButton.addEventListener('click', () => this.clearLogs());
                 closeSettings.addEventListener('click', () => this.closeSettings());
                 cancelSettings.addEventListener('click', () => this.closeSettings());
                 saveSettings.addEventListener('click', () => this.saveSettings());
@@ -1602,6 +1658,112 @@
 
         closeSettings() {
             this.toggleSettings(false);
+        }
+
+        addLog(entry) {
+            if (!entry || typeof entry !== 'object') return;
+            this.logEntries.push(entry);
+            if (this.logEntries.length > 100) {
+                this.logEntries.splice(0, this.logEntries.length - 100);
+            }
+            this.logsDirty = true;
+            this.mount();
+            if (this.logsExpanded) this.renderLogs(true);
+        }
+
+        clearLogs() {
+            this.logEntries.length = 0;
+            this.logsDirty = false;
+            this.renderedLogEntries = [];
+            this.mount();
+            if (this.logList) {
+                while (this.logList.firstChild) this.logList.removeChild(this.logList.firstChild);
+            }
+        }
+
+        toggleLogs(forceOpen = null) {
+            this.mount();
+            if (!this.logPanel || !this.logList || !this.logToggleButton) return;
+            const wasExpanded = this.logsExpanded;
+            this.logsExpanded = forceOpen == null ? !this.logsExpanded : Boolean(forceOpen);
+            this.renderLogs(this.logsExpanded && !wasExpanded);
+        }
+
+        createLogRow(entry) {
+            const row = document.createElement('div');
+            const time = document.createElement('time');
+            const message = document.createElement('span');
+            const level = String(entry.level || 'info').toLowerCase();
+            const date = new Date(entry.loggedAt || Date.now());
+            const timeParts = Number.isNaN(date.getTime())
+                ? ['--', '--', '--']
+                : [date.getHours(), date.getMinutes(), date.getSeconds()]
+                    .map((part) => String(part).padStart(2, '0'));
+            const warning = level === 'warning';
+            const failure = level === 'error' || level === 'fatal';
+            const color = failure ? '#efaaaa' : (warning ? '#e6c68b' : '#c8d8dc');
+            const background = failure
+                ? 'rgba(255,107,107,.07)'
+                : (warning ? 'rgba(255,190,92,.06)' : 'transparent');
+            const levelLabel = level === 'warning' ? '警告'
+                : level === 'error' ? '错误'
+                    : level === 'fatal' ? '致命错误' : '信息';
+
+            row.dataset.level = level;
+            row.setAttribute('aria-label', `${levelLabel}：${String(entry.message ?? '')}`);
+            row.style.cssText = `display:grid;grid-template-columns:58px minmax(0,1fr);gap:6px;align-items:start;padding:4px 5px;border-radius:4px;color:${color};background:${background};font:11px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0;`;
+            time.dateTime = entry.loggedAt || '';
+            time.textContent = timeParts.join(':');
+            time.style.cssText = 'color:#789298;font-variant-numeric:tabular-nums;letter-spacing:0;';
+            message.textContent = String(entry.message ?? '');
+            message.style.cssText = 'min-width:0;overflow-wrap:anywhere;white-space:pre-wrap;letter-spacing:0;';
+            row.appendChild(time);
+            row.appendChild(message);
+            return row;
+        }
+
+        appendLogRow(entry) {
+            this.logList.appendChild(this.createLogRow(entry));
+            this.renderedLogEntries.push(entry);
+        }
+
+        syncLogDom() {
+            if (!this.logList || !this.logsDirty) return false;
+            const entries = this.logEntries;
+            const rendered = this.renderedLogEntries;
+            let changed = false;
+
+            if (rendered.length === entries.length
+                && rendered.length > 0
+                && entries.slice(0, -1).every((entry, index) => entry === rendered[index + 1])) {
+                this.logList.removeChild(this.logList.firstChild);
+                rendered.shift();
+                this.appendLogRow(entries.at(-1));
+                changed = true;
+            } else if (rendered.every((entry, index) => entry === entries[index])
+                && entries.length >= rendered.length) {
+                for (let index = rendered.length; index < entries.length; index += 1) {
+                    this.appendLogRow(entries[index]);
+                }
+                changed = entries.length > rendered.length;
+            } else {
+                while (this.logList.firstChild) this.logList.removeChild(this.logList.firstChild);
+                this.renderedLogEntries = [];
+                for (const entry of entries) this.appendLogRow(entry);
+                changed = true;
+            }
+            this.logsDirty = false;
+            return changed;
+        }
+
+        renderLogs(forceScroll = false) {
+            if (!this.logPanel || !this.logList || !this.logToggleButton) return;
+            this.logPanel.hidden = !this.logsExpanded;
+            this.logPanel.style.display = this.logsExpanded ? 'grid' : 'none';
+            this.logToggleButton.setAttribute('aria-expanded', String(this.logsExpanded));
+            if (!this.logsExpanded) return;
+            const changed = this.syncLogDom();
+            if (forceScroll || changed) this.logList.scrollTop = this.logList.scrollHeight;
         }
 
         saveSettings() {
@@ -1671,6 +1833,7 @@
             this.root.dataset.connectionState = this.connectionState;
             this.root.dataset.executionState = this.executionState;
             this.root.title = `${connectionLabel} · ${executionLabel}`;
+            this.renderLogs();
         }
     }
 
@@ -1719,9 +1882,14 @@
         }
 
         queueLog(message, metadata = {}) {
-            const entry = createRuntimeLogEntry(message, metadata);
+            const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : { level: metadata };
+            const entry = createRuntimeLogEntry(message, {
+                ...normalizedMetadata,
+                loggedAt: normalizedMetadata.loggedAt || new Date().toISOString(),
+            });
             this.logs.push(entry);
             if (this.logs.length > 200) this.logs.splice(0, this.logs.length - 200);
+            this.statusIndicator.addLog(entry);
         }
 
         isTransitionCurrent(generation) {
@@ -2277,11 +2445,11 @@
                 consecutiveFailures: runtime.consecutiveFailures,
             }));
 
-            const sendRuntimeHeartbeat = async (statePatch = null, transition = null) => {
+            const sendRuntimeHeartbeat = (statePatch = null, transition = null) => {
                 if (statePatch) Object.assign(runtime, statePatch);
                 const mapped = runtime.state === 'idle' ? 'stopped' : runtime.state;
                 if (EXECUTION_LABELS[mapped]) this.controlAgent?.setExecutionState(mapped, transition?.generation);
-                return this.controlAgent?.pulse();
+                queueRuntimeHeartbeat(this.controlAgent);
             };
 
             const transitionIsCurrent = (transition = {}) => (
@@ -2382,7 +2550,7 @@
                 return 'stopped';
             };
 
-            // 日志仅上报，运行控制只接受 ControlAgent 下发的 desired-state。
+            // Logger 只负责规范化并上报，StatusIndicator 负责页面本地显示；运行控制只接受 ControlAgent 下发的 desired-state。
             const logger = new Logger(startAutomation, () => pauseAutomation(false), queueRuntimeLog);
             this.automationControl = {
                 start: startAutomation,
@@ -2404,7 +2572,7 @@
                                 runtime.currentJob = data.currentJob || data.currentDecision.title || runtime.currentJob;
                                 runtime.state = data.state || runtime.state;
                                 runtime.phase = data.phase || runtime.phase;
-                                sendRuntimeHeartbeat().catch(() => null);
+                                sendRuntimeHeartbeat();
                             }
                         } else {
                             logger.add(data, { sender: 'delivery' });
@@ -2972,15 +3140,24 @@
                         aiPassed: decision.aiPassed ?? null,
                         aiReason: decision.aiReason || '',
                     });
-                    await sendRuntimeHeartbeat();
-
                     if (!hrActivePassed) {
                         runtime.state = 'running';
                         runtime.phase = 'HR 活跃筛选未通过';
                         runtime.currentDecision.decisionState = 'hr_filtered';
                         runtime.currentDecision.decisionReason = `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`;
                         runtime.currentDecision.finalPassed = false;
-                        await sendRuntimeHeartbeat();
+                    } else if (!aiPassed) {
+                        runtime.currentDecision.decisionState = 'ai_rejected';
+                        runtime.currentDecision.decisionReason = decision.aiReason || 'AI 判断未通过';
+                        runtime.currentDecision.finalPassed = false;
+                    } else if (!rulePassed) {
+                        runtime.currentDecision.decisionState = 'below_threshold';
+                        runtime.currentDecision.decisionReason = decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`;
+                        runtime.currentDecision.finalPassed = false;
+                    }
+                    sendRuntimeHeartbeat();
+
+                    if (!hrActivePassed) {
                         await logAction({
                             action: 'job_hr_filtered',
                             scene: 'search',
@@ -2994,18 +3171,6 @@
                         });
                         return loop();
                     }
-
-                    if (!aiPassed) {
-                        runtime.currentDecision.decisionState = 'ai_rejected';
-                        runtime.currentDecision.decisionReason = decision.aiReason || 'AI 判断未通过';
-                        runtime.currentDecision.finalPassed = false;
-                    } else if (!rulePassed) {
-                        runtime.currentDecision.decisionState = 'below_threshold';
-                        runtime.currentDecision.decisionReason = decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`;
-                        runtime.currentDecision.finalPassed = false;
-                    }
-                    if (!runtime.currentDecision.finalPassed) await sendRuntimeHeartbeat();
-
                     // 如果分数达到阈值，打个招呼
                     if (rulePassed && aiPassed) {
                         if (control.stopped || this.pause) return;
@@ -3269,7 +3434,7 @@
                         runtime.state = 'running';
                         runtime.phase = '继续扫描';
                         await logAction({
-                            action: 'job_below_threshold',
+                            action: searchRejectionAction(rulePassed, aiPassed),
                             scene: 'search',
                             title: jobInfo.title,
                             salary: jobInfo.salary,
@@ -3278,6 +3443,7 @@
                             resumeIndex: decision.resumeIndex,
                             hrActive: jobInfo.hrActive,
                             hrActiveLevel: jobInfo.hrActiveLevel,
+                            ...(aiPassed ? {} : { aiReason: decision.aiReason || 'AI 判断未通过' }),
                         });
                         loop();
                     }
@@ -4299,6 +4465,8 @@
             hrActivePasses,
             createRuntimeLogEntry,
             createRuntimeActionPayload,
+            queueRuntimeHeartbeat,
+            searchRejectionAction,
             normalizeServerOrigin,
             applyFrontendConfig,
             connectionSettings,

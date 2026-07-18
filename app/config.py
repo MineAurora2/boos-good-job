@@ -69,6 +69,9 @@ def _load_env_file(path: Path) -> None:
 _load_env_file(ROOT / '.env')
 
 
+_REMOVED_SCORE_DELAY_FIELDS = ('job_score_delay_base_ms', 'job_score_delay_jitter_ms')
+
+
 DEFAULT_USER_CONFIG = {
     'resume_name': 'resume.md',
     # 开启时按岗位调用 LLM 生成招呼语；关闭时直接使用 introduce 固定文本。
@@ -79,8 +82,6 @@ DEFAULT_USER_CONFIG = {
     'character': '简洁 直接 礼貌',
     'tags': ['运维开发', 'SRE', 'DevOps', '运维工程师', '平台工程师', 'AI应用', 'AI应用工程师', 'AI开发', 'AI产品经理'],
     'backend': {
-        'job_score_delay_base_ms': 4000,
-        'job_score_delay_jitter_ms': 500,
         'daily_greet_limit': 90,
         'delivery_db_path': 'delivery_state.db',
     },
@@ -96,7 +97,7 @@ DEFAULT_USER_CONFIG = {
         'greetTimeout': 12000,
         'preloadScrollPixels': 180,
         'preloadScrollWaitMs': 450,
-        'preloadStableRoundsLimit': 24,
+        'preloadStableRoundsLimit': 3,
         'preloadMaxRounds': 300,
         'preloadActivateCardEvery': 0,
         'preloadActivateCardWaitMs': 250,
@@ -238,11 +239,21 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _normalize_preload_rounds(frontend: dict) -> None:
+    for key in ('preloadStableRoundsLimit', 'preloadMaxRounds'):
+        value = frontend.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 10000:
+            frontend[key] = DEFAULT_USER_CONFIG['frontend'][key]
+    if frontend['preloadStableRoundsLimit'] > frontend['preloadMaxRounds']:
+        frontend['preloadStableRoundsLimit'] = min(
+            DEFAULT_USER_CONFIG['frontend']['preloadStableRoundsLimit'],
+            frontend['preloadMaxRounds'],
+        )
+
+
 def _apply_legacy_compat(config: dict, user_config: dict) -> dict:
     """Move still-supported legacy top-level settings into their current groups."""
     legacy_fields = {
-        'job_score_delay_base_ms': ('backend', 'job_score_delay_base_ms'),
-        'job_score_delay_jitter_ms': ('backend', 'job_score_delay_jitter_ms'),
         'thread': ('frontend', 'thread'),
     }
     for old_key, (group, new_key) in legacy_fields.items():
@@ -274,12 +285,18 @@ def load_user_config() -> dict:
         # Removed in remote-control.3: searching now enters preload immediately.
         user_config['frontend'].pop('manualFilterWaitMs', None)
         migrate_hr_active_settings(user_config['frontend'])
+    for key in _REMOVED_SCORE_DELAY_FIELDS:
+        user_config.pop(key, None)
+    if isinstance(user_config.get('backend'), dict):
+        for key in _REMOVED_SCORE_DELAY_FIELDS:
+            user_config['backend'].pop(key, None)
     if isinstance(user_config.get('scoring'), dict):
         user_config['scoring'] = _unify_scoring_rules(
             user_config['scoring'],
             user_config.pop('scoring_policy', None),
         )
     config = _deep_merge(config, user_config)
+    _normalize_preload_rounds(config['frontend'])
     # Scoring dictionaries are complete user-managed sets. Restoring deleted defaults here
     # would make removed dashboard cards reappear after a reload.
     if isinstance(user_config.get('scoring'), dict):
@@ -287,6 +304,9 @@ def load_user_config() -> dict:
             if isinstance(keyword_scores, dict):
                 config['scoring'][group_name] = copy.deepcopy(keyword_scores)
     migrate_hr_active_settings(config['frontend'])
+    for key in _REMOVED_SCORE_DELAY_FIELDS:
+        config.pop(key, None)
+        config['backend'].pop(key, None)
     return _apply_legacy_compat(config, user_config)
 
 
@@ -302,8 +322,6 @@ class Config:
     introduce = USER_CONFIG['introduce']
     character = USER_CONFIG['character']
     tags = USER_CONFIG['tags']
-    job_score_delay_base_ms = USER_CONFIG['backend']['job_score_delay_base_ms']
-    job_score_delay_jitter_ms = USER_CONFIG['backend']['job_score_delay_jitter_ms']
     title_deduction_keywords = USER_CONFIG['scoring']['title_deduction_keywords']
     detail_deduction_keywords = USER_CONFIG['scoring']['detail_deduction_keywords']
     frontend = USER_CONFIG['frontend']
@@ -338,8 +356,6 @@ class Config:
         cls.introduce = USER_CONFIG['introduce']
         cls.character = USER_CONFIG['character']
         cls.tags = USER_CONFIG['tags']
-        cls.job_score_delay_base_ms = USER_CONFIG['backend']['job_score_delay_base_ms']
-        cls.job_score_delay_jitter_ms = USER_CONFIG['backend']['job_score_delay_jitter_ms']
         cls.title_deduction_keywords = USER_CONFIG['scoring']['title_deduction_keywords']
         cls.detail_deduction_keywords = USER_CONFIG['scoring']['detail_deduction_keywords']
         cls.frontend = USER_CONFIG['frontend']

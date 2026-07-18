@@ -1641,10 +1641,10 @@ function decisionMarkup(decision) {
 
 function renderControlInstances(instances, accounts) {
     const container = $('#controlInstanceList'); container.replaceChildren();
-    const online = instances.filter((item) => item.online !== false).length;
-    $('#controlInstanceSummary').textContent = instances.length ? `${online} 个在线 / ${instances.length} 个实例` : '等待脚本接入';
-    if (!instances.length) { container.innerHTML = '<div class="control-empty">尚未收到浏览器实例心跳</div>'; return; }
-    instances.forEach((item) => {
+    const onlineInstances = instances.filter((item) => item.online !== false);
+    $('#controlInstanceSummary').textContent = onlineInstances.length ? `${onlineInstances.length} 个在线实例` : '暂无在线浏览器实例';
+    if (!onlineInstances.length) { container.innerHTML = '<div class="control-empty">暂无在线浏览器实例</div>'; return; }
+    onlineInstances.forEach((item) => {
         const workerId = item.workerId || item.id || '';
         const desiredState = desiredStateOf(item);
         const executionState = executionStateOf(item);
@@ -1957,7 +1957,7 @@ async function apiJson(url, options = {}) {
 
 const CONFIG_LABELS = {
     llm_greeting_enabled: '使用 LLM 生成打招呼语', scoring_enabled: '启用岗位扣星规则', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
-    backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
+    backend: '后端参数', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
     hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveLevels: 'HR 活跃状态',

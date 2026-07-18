@@ -31,6 +31,12 @@ def _validate_number(container: dict, key: str, minimum: float, maximum: float) 
         raise ValueError(f'{key} 必须在 {minimum} 到 {maximum} 之间')
 
 
+def _validate_positive_integer(container: dict, key: str, maximum: int) -> None:
+    value = container.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+        raise ValueError(f'{key} 必须是 1 到 {maximum} 之间的整数')
+
+
 def validate_config(config: dict) -> None:
     """校验一份完整的用户配置，不修改传入对象或磁盘内容。
 
@@ -71,8 +77,10 @@ def validate_config(config: dict) -> None:
         'greetTimeout', 'preloadScrollWaitMs', 'preloadActivateCardWaitMs',
     ):
         _validate_number(frontend, key, 0, 600000)
-    for key in ('maxEmptyRounds', 'preloadStableRoundsLimit', 'preloadMaxRounds', 'preloadActivateCardEvery'):
+    for key in ('maxEmptyRounds', 'preloadActivateCardEvery'):
         _validate_number(frontend, key, 0, 10000)
+    for key in ('preloadStableRoundsLimit', 'preloadMaxRounds'):
+        _validate_positive_integer(frontend, key, 10000)
     _validate_number(frontend, 'preloadScrollPixels', 0, 5000)
 
     # 防检测随机化字段：总开关与打乱开关为布尔，比率 0～100，延时 0～600000 且上限不小于下限。
@@ -85,6 +93,8 @@ def validate_config(config: dict) -> None:
         _validate_number(frontend, key, 0, 600000)
     if frontend['randomDelayMaxMs'] < frontend['randomDelayMinMs']:
         raise ValueError('randomDelayMaxMs 不能小于 randomDelayMinMs')
+    if frontend['preloadStableRoundsLimit'] > frontend['preloadMaxRounds']:
+        raise ValueError('preloadStableRoundsLimit 不能大于 preloadMaxRounds')
     if not isinstance(frontend.get('hrActiveFilterEnabled'), bool):
         raise ValueError('hrActiveFilterEnabled 必须是开关值')
     if (
@@ -108,8 +118,6 @@ def validate_config(config: dict) -> None:
         raise ValueError('hrActiveLevels 不能包含重复档位')
 
     backend = config['backend']
-    _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)
-    _validate_number(backend, 'job_score_delay_jitter_ms', 0, 600000)
     _validate_number(backend, 'daily_greet_limit', 1, 150)
     database_name = backend.get('delivery_db_path')
     if (
@@ -158,6 +166,11 @@ def save_config(payload: dict) -> dict:
     # 管理页提交完整表单，因此直接替换；若递归合并，已删除的扣星关键词会被旧值恢复。
     merged = copy.deepcopy(incoming)
     merged.pop('resume_content', None)
+    for key in config._REMOVED_SCORE_DELAY_FIELDS:
+        merged.pop(key, None)
+    if isinstance(merged.get('backend'), dict):
+        for key in config._REMOVED_SCORE_DELAY_FIELDS:
+            merged['backend'].pop(key, None)
     # 兼容尚未提交新开关字段的旧版管理页面，升级后默认维持原有行为。
     merged.setdefault('llm_greeting_enabled', config.DEFAULT_USER_CONFIG['llm_greeting_enabled'])
     merged.setdefault('scoring_enabled', config.DEFAULT_USER_CONFIG['scoring_enabled'])
