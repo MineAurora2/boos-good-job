@@ -1849,7 +1849,6 @@
             this.heartbeatStopped = false;
             this.lastHeartbeatStartedAt = Number.NEGATIVE_INFINITY;
             this.heartbeatDelayTimer = null;
-            this.lastHeartbeatOkAt = Date.now();
             this.timer = null;
             this.boundHeartbeatTrigger = () => this.requestHeartbeat();
             this.boundVisibilityHeartbeat = () => {
@@ -2016,11 +2015,9 @@
                     this.logs.unshift(...logs);
                     const authFailure = [401, 426, 503].includes(Number(result?.httpStatus));
                     this.connectionState = authFailure ? 'auth' : 'disconnected';
-                    if (Date.now() - this.lastHeartbeatOkAt >= 30000) this.requestSafetyPause('backend_disconnected');
                     this.statusIndicator.update(this.connectionState, this.executionState);
                     return;
                 }
-                this.lastHeartbeatOkAt = Date.now();
                 if (result.heartbeatAccepted === false) {
                     this.connectionState = 'standby';
                     this.controlPolling = false;
@@ -2034,7 +2031,6 @@
             } catch (error) {
                 this.logs.unshift(...logs);
                 this.connectionState = 'disconnected';
-                if (Date.now() - this.lastHeartbeatOkAt >= 30000) this.requestSafetyPause('backend_disconnected');
                 this.statusIndicator.update(this.connectionState, this.executionState);
             } finally {
                 if (this.logs.length > 200) this.logs.splice(200);
@@ -2090,7 +2086,6 @@
                     sessionId: this.sessionId,
                     sessionEpoch: this.sessionEpoch,
                 }, this.controlPollCursor);
-                this.lastHeartbeatOkAt = Date.now();
                 this.connectionState = 'connected';
                 this.statusIndicator.update(this.connectionState, this.executionState);
                 if (result?.control) this.receiveControl(result.control);
@@ -2098,19 +2093,14 @@
             } catch (error) {
                 const status = Number(error?.status || 0);
                 if (status === 404) {
-                    this.lastHeartbeatOkAt = Date.now();
                     this.connectionState = 'connecting';
                     this.controlPollCursor = null;
                 } else if (status === 409) {
-                    this.lastHeartbeatOkAt = Date.now();
                     this.connectionState = 'standby';
                     this.controlPolling = false;
                     this.requestSafetyPause('stale_session');
                 } else {
                     this.connectionState = [401, 426, 503].includes(status) ? 'auth' : 'disconnected';
-                    if (Date.now() - this.lastHeartbeatOkAt >= 30000) {
-                        this.requestSafetyPause('backend_disconnected');
-                    }
                 }
                 this.statusIndicator.update(this.connectionState, this.executionState);
                 if (status === 409) return 0;
@@ -2259,7 +2249,7 @@
                 if (this.controlAck?.status === 'failed') return;
                 if (this.controlAck?.status === 'applied' && this.executionState === stableState) return;
             }
-            if (this.executionState === stableState && this.currentControl) {
+            if (this.executionState === stableState) {
                 this.currentControl = control;
                 this.controlAck = {
                     epoch: control.epoch,
