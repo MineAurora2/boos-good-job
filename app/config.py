@@ -13,6 +13,35 @@ from app import paths
 ROOT = paths.PROJECT_ROOT
 CONFIG_PATH = paths.CONFIG_PATH
 
+HR_ACTIVE_LEVELS = (
+    'online',
+    'just_now',
+    'today',
+    'within_3_days',
+    'this_week',
+    'this_month',
+)
+
+
+def hr_active_levels_from_minimum(value: object) -> list[str] | None:
+    """Convert the legacy minimum threshold into an equivalent allow-list."""
+    if value not in HR_ACTIVE_LEVELS:
+        return None
+    return list(HR_ACTIVE_LEVELS[:HR_ACTIVE_LEVELS.index(value) + 1])
+
+
+def migrate_hr_active_settings(frontend: dict) -> dict:
+    """Migrate the legacy scalar HR threshold without overriding a new allow-list."""
+    if (
+        ('hrActiveLevels' not in frontend or frontend.get('hrActiveLevels') is None)
+        and 'hrActiveMinLevel' in frontend
+    ):
+        migrated = hr_active_levels_from_minimum(frontend.get('hrActiveMinLevel'))
+        if migrated is not None:
+            frontend['hrActiveLevels'] = migrated
+    frontend.pop('hrActiveMinLevel', None)
+    return frontend
+
 
 def _load_env_file(path: Path) -> None:
     """Load a local ``.env`` without overriding explicit process variables."""
@@ -82,9 +111,9 @@ DEFAULT_USER_CONFIG = {
         # 投递前后附加的随机延时区间（毫秒）。
         'randomDelayMinMs': 0,
         'randomDelayMaxMs': 0,
-        # HR 活跃筛选。
+        # HR 活跃筛选：岗位状态命中任一所选档位时放行。
         'hrActiveFilterEnabled': False,
-        'hrActiveMinLevel': 'this_month',
+        'hrActiveLevels': list(HR_ACTIVE_LEVELS),
     },
     'scoring': {
         'title_deduction_keywords': {
@@ -244,6 +273,7 @@ def load_user_config() -> dict:
     if isinstance(user_config.get('frontend'), dict):
         # Removed in remote-control.3: searching now enters preload immediately.
         user_config['frontend'].pop('manualFilterWaitMs', None)
+        migrate_hr_active_settings(user_config['frontend'])
     if isinstance(user_config.get('scoring'), dict):
         user_config['scoring'] = _unify_scoring_rules(
             user_config['scoring'],
@@ -256,6 +286,7 @@ def load_user_config() -> dict:
         for group_name, keyword_scores in user_config['scoring'].items():
             if isinstance(keyword_scores, dict):
                 config['scoring'][group_name] = copy.deepcopy(keyword_scores)
+    migrate_hr_active_settings(config['frontend'])
     return _apply_legacy_compat(config, user_config)
 
 

@@ -1960,15 +1960,16 @@ const CONFIG_LABELS = {
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
-    hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveMinLevel: 'HR 最低活跃档位',
+    hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveLevels: 'HR 活跃状态',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
 };
 
 const CONFIG_TAG_LIMIT = 80;
 const CONFIG_TAG_MAX_LENGTH = 80;
 const HIDDEN_CONFIG_PATHS = new Set(['frontend.serverHost']);
-const CONFIG_ENUM_OPTIONS = {
-    hrActiveMinLevel: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['this_month', '本月活跃']],
+const CONFIG_ENUM_OPTIONS = {};
+const CONFIG_MULTI_OPTIONS = {
+    hrActiveLevels: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['this_month', '本月活跃']],
 };
 
 function configLabel(key) { return CONFIG_LABELS[key] || key; }
@@ -2060,8 +2061,32 @@ function renderTagEditor(path, values) {
     editor.append(heading, grid, addButton); return editor;
 }
 
+function renderConfigMultiOptions(path, key, values) {
+    const selected = new Set(Array.isArray(values) ? values : []);
+    const field = document.createElement('div'); field.className = 'config-field config-multi-field'; field.dataset.configPath = path; field.dataset.valueType = 'enum-multi';
+    const heading = document.createElement('div'); heading.className = 'config-multi-heading';
+    const caption = document.createElement('span'); caption.textContent = configLabel(key);
+    const status = document.createElement('small'); status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+    const group = document.createElement('div'); group.className = 'config-multi-options'; group.setAttribute('role', 'group'); group.setAttribute('aria-label', configLabel(key));
+    const refresh = () => {
+        const count = group.querySelectorAll('input:checked').length;
+        status.textContent = count ? `已选择 ${count} 项 · 命中任一项即可` : '至少选择 1 项';
+        status.classList.toggle('bad', count === 0);
+        field.classList.toggle('invalid', count === 0);
+    };
+    CONFIG_MULTI_OPTIONS[key].forEach(([optionValue, labelText]) => {
+        const option = document.createElement('label'); option.className = 'config-multi-option';
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = optionValue; checkbox.checked = selected.has(optionValue);
+        const copy = document.createElement('span'); copy.textContent = labelText;
+        checkbox.addEventListener('change', refresh);
+        option.append(checkbox, copy); group.appendChild(option);
+    });
+    heading.append(caption, status); field.append(heading, group); refresh(); return field;
+}
+
 function makeConfigControl(path, key, value) {
     if (key === 'tags' && Array.isArray(value)) return renderTagEditor(path, value);
+    if (CONFIG_MULTI_OPTIONS[key]) return renderConfigMultiOptions(path, key, value);
     const label = document.createElement('label'); label.className = 'config-field';
     const caption = document.createElement('span'); caption.textContent = configLabel(key); label.appendChild(caption);
     let input;
@@ -2424,7 +2449,11 @@ async function saveAdminConfig() {
         const config = structuredClone(state.adminConfig);
         $$('[data-config-path]').forEach((input) => {
             let value;
-            if (input.type === 'checkbox') value = input.checked;
+            if (input.dataset.valueType === 'enum-multi') {
+                value = [...input.querySelectorAll('input[type="checkbox"]:checked')].map((item) => item.value);
+                if (!value.length) { input.querySelector('input')?.focus(); throw new Error(`${configLabel(input.dataset.configPath.split('.').at(-1))}至少选择 1 项`); }
+            }
+            else if (input.type === 'checkbox') value = input.checked;
             else if (input.dataset.valueType === 'number') value = Number(input.value);
             else if (input.dataset.valueType === 'tag-cards') {
                 const tagInputs = [...input.querySelectorAll('.config-tag-input')]; const values = tagInputs.map((item) => item.value.trim());

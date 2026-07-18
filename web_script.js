@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-17-remote-control.4
+// @version      2026-07-18-remote-control.6
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-17-remote-control.4';
+    const SCRIPT_VERSION = '2026-07-18-remote-control.6';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
@@ -229,7 +229,8 @@
         randomDelayMinMs: 0, // 投递前后随机延时下限
         randomDelayMaxMs: 0, // 投递前后随机延时上限
         hrActiveFilterEnabled: false, // 是否按 HR 活跃状态过滤
-        hrActiveMinLevel: 'this_month', // 最低 HR 活跃档位
+        hrActiveLevels: null, // 允许的 HR 活跃档位；null 时兼容旧版最低档位配置
+        hrActiveMinLevel: 'this_month', // 旧版后端兼容字段
     };
 
     // 元素选择器
@@ -665,6 +666,13 @@
         just_now: 5,
         online: 6,
     });
+    const HR_ACTIVE_LEVEL_ORDER = Object.freeze([
+        'online', 'just_now', 'today', 'within_3_days', 'this_week', 'this_month',
+    ]);
+    const HR_ACTIVE_LABELS = Object.freeze({
+        online: '当前在线', just_now: '刚刚活跃', today: '今日活跃',
+        within_3_days: '3 日内活跃', this_week: '本周活跃', this_month: '本月活跃',
+    });
 
     function normalizeHrActive(value) {
         const text = String(value || '').replace(/\s+/g, '').trim();
@@ -678,11 +686,24 @@
         return 'unknown';
     }
 
+    function configuredHrActiveLevels() {
+        if (Array.isArray(OPTIONS.hrActiveLevels)) {
+            return [...new Set(OPTIONS.hrActiveLevels.filter((level) => HR_ACTIVE_LEVEL_ORDER.includes(level)))];
+        }
+        const minimum = HR_ACTIVE_LEVELS[OPTIONS.hrActiveMinLevel];
+        if (!minimum) return [];
+        return HR_ACTIVE_LEVEL_ORDER.filter((level) => HR_ACTIVE_LEVELS[level] >= minimum);
+    }
+
+    function hrActiveSelectionLabel() {
+        return configuredHrActiveLevels().map((level) => HR_ACTIVE_LABELS[level] || level).join('、') || '未配置';
+    }
+
     function hrActivePasses(level) {
         if (!OPTIONS.hrActiveFilterEnabled || level === 'unknown') return true;
-        const actual = HR_ACTIVE_LEVELS[level] ?? 0;
-        const minimum = HR_ACTIVE_LEVELS[OPTIONS.hrActiveMinLevel] ?? HR_ACTIVE_LEVELS.this_month;
-        return actual >= minimum;
+        const selected = configuredHrActiveLevels();
+        if (!selected.length) return true;
+        return selected.includes(level);
     }
 
     const CONNECTION_SETTINGS_KEY = '__goodjobs_backend_connection';
@@ -1085,7 +1106,10 @@
                     finish(reject, new ScriptStoppedError('request_aborted'));
                 };
                 const onLoad = (resp) => {
-                    if (Number(resp?.status) !== 200) {
+                    const expectedStatuses = Array.isArray(requestOptions.expectedStatuses)
+                        ? requestOptions.expectedStatuses.map(Number)
+                        : [200];
+                    if (!expectedStatuses.includes(Number(resp?.status))) {
                         let detail = '';
                         try {
                             const raw = resp.response ?? resp.responseText;
@@ -1257,6 +1281,15 @@
             return this.__http('/check-greet', 'POST', JSON.stringify({ company, title }));
         }
 
+        setDesiredState(workerId, desiredState) {
+            return this.__http(
+                `/api/control/desired-state/workers/${encodeURIComponent(workerId)}`,
+                'PUT',
+                JSON.stringify({ desiredState }),
+                { allowDuringStop: true, timeout: 5000, expectedStatuses: [202] }
+            );
+        }
+
         pollDesiredControl(identity, cursor = null) {
             const query = [
                 `protocolVersion=${encodeURIComponent(CONTROL_PROTOCOL_VERSION)}`,
@@ -1374,50 +1407,170 @@
     };
 
     class StatusIndicator {
-        constructor() {
+        constructor({ onDesiredState = null } = {}) {
             this.connectionState = 'connecting';
             this.executionState = 'stopped';
+            this.commandBusy = false;
+            this.commandMessage = '';
+            this.onDesiredState = typeof onDesiredState === 'function' ? onDesiredState : (() => Promise.resolve());
             this.root = null;
+            this.settingsPanel = null;
+            this.settingsInputs = null;
+            this.settingsError = null;
+            this.initialSettings = null;
+        }
+
+        createButton(label, title, styles = '') {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.title = title;
+            button.style.cssText = `height:32px;min-width:0;padding:0 10px;border:1px solid rgba(111,226,232,.2);border-radius:7px;color:#dcebed;background:rgba(111,226,232,.07);font:600 12px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0;cursor:pointer;${styles}`;
+            return button;
+        }
+
+        createSettingField(labelText, type = 'text') {
+            const label = document.createElement('label');
+            const text = document.createElement('span');
+            const input = document.createElement('input');
+            text.textContent = labelText;
+            text.style.cssText = 'color:#8fa8ae;font-size:11px;line-height:1.2;letter-spacing:0;';
+            input.type = type;
+            input.autocomplete = 'off';
+            input.style.cssText = 'width:100%;height:32px;box-sizing:border-box;padding:0 9px;border:1px solid rgba(111,226,232,.18);border-radius:6px;outline:0;color:#edf8fa;background:rgba(3,15,19,.78);font:12px/1 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0;user-select:text;';
+            label.style.cssText = 'display:grid;gap:5px;min-width:0;';
+            label.appendChild(text);
+            label.appendChild(input);
+            return { label, input };
         }
 
         mount() {
             if (this.root || !document?.createElement) return;
             const attach = () => {
                 if (this.root || !document.body) return;
-                const existing = document.getElementById?.('goodjobs-runtime-status');
-                if (existing) {
-                    this.root = existing;
-                    return this.render();
-                }
+                document.getElementById?.('goodjobs-runtime-status')?.remove?.();
+
                 const root = document.createElement('div');
+                const statusRow = document.createElement('div');
                 const image = document.createElement('img');
                 const copy = document.createElement('div');
                 const connection = document.createElement('strong');
                 const execution = document.createElement('span');
+                const actions = document.createElement('div');
+                const startButton = this.createButton('▶ 开始', '开始自动化', 'color:#8df0b8;border-color:rgba(83,227,148,.28);background:rgba(83,227,148,.09);');
+                const pauseButton = this.createButton('Ⅱ 暂停', '暂停自动化', 'color:#ffd09b;border-color:rgba(255,173,91,.26);background:rgba(255,173,91,.08);');
+                const settings = document.createElement('div');
+                const settingsHead = document.createElement('div');
+                const settingsTitle = document.createElement('strong');
+                const closeSettings = this.createButton('×', '关闭设置', 'width:28px;height:28px;padding:0;font-size:17px;color:#aebfc3;background:transparent;');
+                const accountField = this.createSettingField('账号标识');
+                const backendField = this.createSettingField('后端地址');
+                const tokenField = this.createSettingField('共享令牌（可选）', 'password');
+                const settingsError = document.createElement('span');
+                const settingsActions = document.createElement('div');
+                const cancelSettings = this.createButton('取消', '取消设置', 'color:#aebfc3;background:transparent;');
+                const saveSettings = this.createButton('保存并重连', '保存设置并重新连接', 'color:#8df0b8;border-color:rgba(83,227,148,.28);background:rgba(83,227,148,.09);');
+
                 root.id = 'goodjobs-runtime-status';
-                root.setAttribute('role', 'status');
-                root.setAttribute('aria-live', 'polite');
-                root.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;width:min(218px,calc(100vw - 24px));height:58px;box-sizing:border-box;display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:10px;padding:8px 11px;border:1px solid rgba(111,226,232,.28);border-radius:8px;background:rgba(10,24,29,.94);box-shadow:0 8px 24px rgba(0,0,0,.26);color:#f4fbfc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;pointer-events:none;user-select:none;letter-spacing:0;';
+                root.setAttribute('role', 'group');
+                root.setAttribute('aria-label', 'goodJobs 脚本状态与控制');
+                root.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;width:min(292px,calc(100vw - 24px));box-sizing:border-box;display:grid;gap:8px;padding:9px 10px;border:1px solid rgba(111,226,232,.28);border-radius:8px;background:rgba(10,24,29,.96);box-shadow:0 8px 24px rgba(0,0,0,.3);color:#f4fbfc;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none;letter-spacing:0;';
+                statusRow.dataset.goodjobsStatusRow = '1';
+                statusRow.setAttribute('role', 'status');
+                statusRow.setAttribute('aria-live', 'polite');
+                statusRow.title = '右键打开脚本设置';
+                statusRow.style.cssText = 'display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:10px;min-width:0;cursor:context-menu;';
                 image.src = STATUS_ICON_DATA_URL;
                 image.alt = '';
                 image.width = 40;
                 image.height = 40;
-                image.style.cssText = 'display:block;width:40px;height:40px;object-fit:contain;';
-                copy.style.cssText = 'min-width:0;display:grid;gap:3px;line-height:1.2;letter-spacing:0;';
+                image.style.cssText = 'display:block;width:40px;height:40px;object-fit:contain;pointer-events:none;';
+                copy.style.cssText = 'min-width:0;display:grid;gap:3px;line-height:1.2;letter-spacing:0;pointer-events:none;';
                 connection.dataset.goodjobsConnection = '1';
                 connection.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650;letter-spacing:0;';
                 execution.dataset.goodjobsExecution = '1';
                 execution.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;';
+                startButton.dataset.goodjobsStart = '1';
+                pauseButton.dataset.goodjobsPause = '1';
+                actions.style.cssText = 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;';
+
+                settings.dataset.goodjobsSettings = '1';
+                settings.hidden = true;
+                settings.style.cssText = 'display:none;gap:9px;padding-top:9px;border-top:1px solid rgba(111,226,232,.13);';
+                settingsHead.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
+                settingsTitle.textContent = '脚本设置';
+                settingsTitle.style.cssText = 'font-size:12px;color:#dcebed;letter-spacing:0;';
+                settingsError.dataset.goodjobsSettingsError = '1';
+                settingsError.hidden = true;
+                settingsError.style.cssText = 'color:#ff9a9a;font-size:11px;line-height:1.4;letter-spacing:0;';
+                settingsActions.style.cssText = 'display:grid;grid-template-columns:1fr 1.35fr;gap:7px;';
+
                 copy.appendChild(connection);
                 copy.appendChild(execution);
-                root.appendChild(image);
-                root.appendChild(copy);
+                statusRow.appendChild(image);
+                statusRow.appendChild(copy);
+                actions.appendChild(startButton);
+                actions.appendChild(pauseButton);
+                settingsHead.appendChild(settingsTitle);
+                settingsHead.appendChild(closeSettings);
+                settingsActions.appendChild(cancelSettings);
+                settingsActions.appendChild(saveSettings);
+                settings.appendChild(settingsHead);
+                settings.appendChild(accountField.label);
+                settings.appendChild(backendField.label);
+                settings.appendChild(tokenField.label);
+                settings.appendChild(settingsError);
+                settings.appendChild(settingsActions);
+                root.appendChild(statusRow);
+                root.appendChild(actions);
+                root.appendChild(settings);
                 document.body.appendChild(root);
+
                 this.root = root;
+                this.settingsPanel = settings;
+                this.settingsInputs = {
+                    account: accountField.input,
+                    backend: backendField.input,
+                    token: tokenField.input,
+                };
+                this.settingsError = settingsError;
+
+                statusRow.addEventListener('contextmenu', (event) => {
+                    event.preventDefault?.();
+                    event.stopPropagation?.();
+                    this.toggleSettings();
+                });
+                startButton.addEventListener('click', () => this.onDesiredState('running'));
+                pauseButton.addEventListener('click', () => this.onDesiredState('paused'));
+                closeSettings.addEventListener('click', () => this.closeSettings());
+                cancelSettings.addEventListener('click', () => this.closeSettings());
+                saveSettings.addEventListener('click', () => this.saveSettings());
+                tokenField.input.addEventListener('input', () => { tokenField.input.dataset.userEdited = '1'; });
+                backendField.input.addEventListener('input', () => {
+                    let hostChanged = false;
+                    try {
+                        hostChanged = normalizeServerOrigin(backendField.input.value) !== this.initialSettings?.baseUrl;
+                    } catch (_) {
+                        return;
+                    }
+                    if (hostChanged && tokenField.input.dataset.userEdited !== '1') {
+                        tokenField.input.value = '';
+                    }
+                });
+                root.addEventListener('keydown', (event) => {
+                    if (event.key === 'Escape' && !settings.hidden) this.closeSettings();
+                });
                 this.render();
             };
             if (document.body) attach();
             else window.addEventListener('DOMContentLoaded', attach, { once: true });
+        }
+
+        setCommandState(busy, message = '') {
+            this.commandBusy = Boolean(busy);
+            this.commandMessage = String(message || '');
+            this.mount();
+            this.render();
         }
 
         update(connectionState, executionState) {
@@ -1427,17 +1580,97 @@
             this.render();
         }
 
+        toggleSettings(forceOpen = null) {
+            this.mount();
+            if (!this.settingsPanel || !this.settingsInputs) return;
+            const open = forceOpen == null ? this.settingsPanel.hidden : Boolean(forceOpen);
+            if (open) {
+                const identity = deliveryIdentity.get();
+                const connection = connectionSettings.read();
+                this.initialSettings = { accountId: identity.accountId, ...connection };
+                this.settingsInputs.account.value = identity.accountId;
+                this.settingsInputs.backend.value = connection.baseUrl;
+                this.settingsInputs.token.value = connection.token;
+                this.settingsInputs.token.dataset.userEdited = '';
+                this.settingsError.hidden = true;
+                this.settingsError.textContent = '';
+            }
+            this.settingsPanel.hidden = !open;
+            this.settingsPanel.style.display = open ? 'grid' : 'none';
+            this.root.dataset.settingsOpen = String(open);
+        }
+
+        closeSettings() {
+            this.toggleSettings(false);
+        }
+
+        saveSettings() {
+            if (!this.settingsInputs) return false;
+            try {
+                if (!['paused', 'stopped', 'error'].includes(this.executionState)) {
+                    throw new Error('请先暂停脚本，再修改连接设置');
+                }
+                const accountId = String(this.settingsInputs.account.value || '').trim();
+                if (!accountId || accountId.length > 120) throw new Error('账号标识不能为空且不能超过 120 个字符');
+                const baseUrl = normalizeServerOrigin(this.settingsInputs.backend.value);
+                let token = String(this.settingsInputs.token.value || '').trim();
+                if (baseUrl === this.initialSettings?.baseUrl
+                    && !token
+                    && this.settingsInputs.token.dataset.userEdited !== '1') {
+                    token = String(this.initialSettings?.token || '');
+                }
+                if (baseUrl !== this.initialSettings?.baseUrl
+                    && token === this.initialSettings?.token
+                    && this.settingsInputs.token.dataset.userEdited !== '1') {
+                    token = '';
+                }
+                if (token && (token.length < 32 || token.length > 256)) {
+                    throw new Error('共享令牌需为 32 到 256 个字符');
+                }
+                localStorage.setItem(deliveryIdentity.accountKey, accountId);
+                connectionSettings.write({ baseUrl, token });
+                this.settingsError.hidden = false;
+                this.settingsError.style.color = '#8df0b8';
+                this.settingsError.textContent = '设置已保存，正在重新连接…';
+                window.setTimeout(() => window.location.reload(), 120);
+                return true;
+            } catch (error) {
+                this.settingsError.hidden = false;
+                this.settingsError.style.color = '#ff9a9a';
+                this.settingsError.textContent = error?.message || String(error);
+                return false;
+            }
+        }
+
         render() {
             if (!this.root) return;
             const connection = this.root.querySelector?.('[data-goodjobs-connection]');
             const execution = this.root.querySelector?.('[data-goodjobs-execution]');
-            if (connection) connection.textContent = CONNECTION_LABELS[this.connectionState] || '后端状态未知';
-            if (execution) execution.textContent = `脚本：${EXECUTION_LABELS[this.executionState] || this.executionState}`;
-            const color = this.connectionState === 'connected' ? '#53e394' : (this.connectionState === 'connecting' ? '#68dce7' : '#ff8d8d');
+            const startButton = this.root.querySelector?.('[data-goodjobs-start]');
+            const pauseButton = this.root.querySelector?.('[data-goodjobs-pause]');
+            const connectionLabel = CONNECTION_LABELS[this.connectionState] || '后端状态未知';
+            const executionLabel = EXECUTION_LABELS[this.executionState] || this.executionState;
+            if (connection) connection.textContent = connectionLabel;
+            if (execution) execution.textContent = `脚本：${executionLabel}${this.commandMessage ? ` · ${this.commandMessage}` : ''}`;
+            const connected = this.connectionState === 'connected';
+            const startable = ['paused', 'stopped', 'error'].includes(this.executionState);
+            const pausable = ['starting', 'running'].includes(this.executionState);
+            if (startButton) {
+                startButton.textContent = this.executionState === 'paused' ? '▶ 继续' : (startable ? '▶ 开始' : '▶ 运行中');
+                startButton.disabled = this.commandBusy || !connected || !startable;
+                startButton.style.opacity = startButton.disabled ? '.48' : '1';
+                startButton.style.cursor = startButton.disabled ? 'not-allowed' : 'pointer';
+            }
+            if (pauseButton) {
+                pauseButton.disabled = this.commandBusy || !connected || !pausable;
+                pauseButton.style.opacity = pauseButton.disabled ? '.48' : '1';
+                pauseButton.style.cursor = pauseButton.disabled ? 'not-allowed' : 'pointer';
+            }
+            const color = connected ? '#53e394' : (this.connectionState === 'connecting' ? '#68dce7' : '#ff8d8d');
             this.root.style.borderColor = `${color}55`;
             this.root.dataset.connectionState = this.connectionState;
             this.root.dataset.executionState = this.executionState;
-            this.root.title = `${CONNECTION_LABELS[this.connectionState] || '后端状态未知'} · ${EXECUTION_LABELS[this.executionState] || this.executionState} · ${OPTIONS.serverHost}`;
+            this.root.title = `${connectionLabel} · ${executionLabel}`;
         }
     }
 
@@ -1450,7 +1683,11 @@
             this.logs = [];
             this.executionState = 'stopped';
             this.connectionState = 'connecting';
-            this.statusIndicator = new StatusIndicator();
+            this.controlRequestBusy = false;
+            this.commandMessageTimer = null;
+            this.statusIndicator = new StatusIndicator({
+                onDesiredState: (desiredState) => this.requestDesiredState(desiredState),
+            });
             this.sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
                 ? crypto.randomUUID()
                 : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1513,6 +1750,47 @@
             }
             this.requestHeartbeat();
             return true;
+        }
+
+        showCommandMessage(message, duration = 2400) {
+            if (this.commandMessageTimer !== null) window.clearTimeout(this.commandMessageTimer);
+            this.commandMessageTimer = null;
+            this.statusIndicator.setCommandState(this.controlRequestBusy, message);
+            if (duration > 0) {
+                this.commandMessageTimer = window.setTimeout(() => {
+                    this.commandMessageTimer = null;
+                    if (!this.controlRequestBusy) this.statusIndicator.setCommandState(false, '');
+                }, duration);
+            }
+        }
+
+        async requestDesiredState(desiredState) {
+            if (!['running', 'paused'].includes(desiredState) || this.controlRequestBusy) return null;
+            if (this.connectionState !== 'connected') {
+                this.showCommandMessage('后端未连接');
+                return null;
+            }
+            this.controlRequestBusy = true;
+            this.showCommandMessage(desiredState === 'running' ? '正在发送开始指令…' : '正在发送暂停指令…', 0);
+            try {
+                const result = await this.api.setDesiredState(this.identity.workerId, desiredState);
+                this.controlRequestBusy = false;
+                this.showCommandMessage('指令已发送');
+                return result;
+            } catch (error) {
+                this.controlRequestBusy = false;
+                const status = Number(error?.status || 0);
+                const message = status === 401 ? '鉴权失败'
+                    : status === 404 ? '实例尚未登记'
+                        : status === 426 ? '公网连接需要 HTTPS'
+                            : status === 503 ? '后端未配置共享令牌'
+                                : `发送失败：${error?.detail || error?.message || error}`;
+                this.showCommandMessage(message, 3200);
+                this.queueLog(`悬浮窗控制失败：${message}`, {
+                    sender: 'system', verbosity: 'concise', level: 'error',
+                });
+                return null;
+            }
         }
 
         start() {
@@ -2700,7 +2978,7 @@
                         runtime.state = 'running';
                         runtime.phase = 'HR 活跃筛选未通过';
                         runtime.currentDecision.decisionState = 'hr_filtered';
-                        runtime.currentDecision.decisionReason = `HR 活跃档位低于 ${OPTIONS.hrActiveMinLevel}`;
+                        runtime.currentDecision.decisionReason = `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`;
                         runtime.currentDecision.finalPassed = false;
                         await sendRuntimeHeartbeat();
                         await logAction({
@@ -2710,7 +2988,7 @@
                             company: jobInfo.company,
                             hrActive: jobInfo.hrActive,
                             hrActiveLevel: jobInfo.hrActiveLevel,
-                            hrActiveMinLevel: OPTIONS.hrActiveMinLevel,
+                            hrActiveLevels: configuredHrActiveLevels(),
                             accountId: identity.accountId,
                             workerId: identity.workerId,
                         });
@@ -3740,7 +4018,7 @@
                                         ? 'hr_filtered'
                                         : (!aiPassed ? 'ai_rejected' : (!rulePassed ? 'below_threshold' : 'evaluating')),
                                     decisionReason: !hrActivePassed
-                                        ? `HR 活跃档位低于 ${OPTIONS.hrActiveMinLevel}`
+                                        ? `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`
                                         : (!aiPassed ? (decision.aiReason || 'AI 判断未通过') : (!rulePassed ? (decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`) : '')),
                                     greetingMode: '',
                                 });
@@ -3765,7 +4043,7 @@
                                     aiReason: decision.aiReason || '',
                                 });
                                 if (!hrActivePassed) {
-                                    status(`HR 活跃档位 [${jobInfo.hrActive || '未知'}] 未达到投递阈值`);
+                                    status(`HR 活跃状态 [${jobInfo.hrActive || '未知'}] 未匹配所选项`);
                                     continue;
                                 }
                                 // 如果分数达到阈值并且未聊过天，打个招呼
@@ -4015,13 +4293,17 @@
         window.__GOODJOBS_TEST_HOOKS__ = Object.freeze({
             OPTIONS,
             HR_ACTIVE_LEVELS,
+            HR_ACTIVE_LEVEL_ORDER,
             normalizeHrActive,
+            configuredHrActiveLevels,
             hrActivePasses,
             createRuntimeLogEntry,
             createRuntimeActionPayload,
             normalizeServerOrigin,
             applyFrontendConfig,
             connectionSettings,
+            deliveryIdentity,
+            Api,
             Logger,
             StatusIndicator,
             ControlAgent,

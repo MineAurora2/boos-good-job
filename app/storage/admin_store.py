@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from app import config
-from app.config import Config
+from app.config import Config, HR_ACTIVE_LEVELS, hr_active_levels_from_minimum
 from app.llm import prompts
 from app.storage.resume_store import (
     list_resume_files,
@@ -87,8 +87,25 @@ def validate_config(config: dict) -> None:
         raise ValueError('randomDelayMaxMs 不能小于 randomDelayMinMs')
     if not isinstance(frontend.get('hrActiveFilterEnabled'), bool):
         raise ValueError('hrActiveFilterEnabled 必须是开关值')
-    if frontend.get('hrActiveMinLevel') not in {'online', 'just_now', 'today', 'within_3_days', 'this_week', 'this_month'}:
+    if (
+        'hrActiveMinLevel' in frontend
+        and frontend.get('hrActiveMinLevel') not in HR_ACTIVE_LEVELS
+    ):
         raise ValueError('hrActiveMinLevel 不是有效的活跃档位')
+    hr_active_levels = frontend.get('hrActiveLevels')
+    if (
+        ('hrActiveLevels' not in frontend or frontend.get('hrActiveLevels') is None)
+        and 'hrActiveMinLevel' in frontend
+    ):
+        hr_active_levels = hr_active_levels_from_minimum(frontend.get('hrActiveMinLevel'))
+        if hr_active_levels is None:
+            raise ValueError('hrActiveMinLevel 不是有效的活跃档位')
+    if not isinstance(hr_active_levels, list) or not hr_active_levels:
+        raise ValueError('hrActiveLevels 必须是至少包含一个活跃档位的数组')
+    if any(not isinstance(level, str) or level not in HR_ACTIVE_LEVELS for level in hr_active_levels):
+        raise ValueError('hrActiveLevels 包含无效的活跃档位')
+    if len(set(hr_active_levels)) != len(hr_active_levels):
+        raise ValueError('hrActiveLevels 不能包含重复档位')
 
     backend = config['backend']
     _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)
@@ -147,6 +164,16 @@ def save_config(payload: dict) -> dict:
     # 旧版前端可能不提交新增的防检测字段，用默认值补齐后再校验，避免误判为缺字段。
     if isinstance(merged.get('frontend'), dict):
         merged['frontend'].pop('manualFilterWaitMs', None)
+        legacy_hr_level = merged['frontend'].get('hrActiveMinLevel')
+        if (
+            ('hrActiveLevels' not in merged['frontend'] or merged['frontend'].get('hrActiveLevels') is None)
+            and legacy_hr_level is not None
+        ):
+            migrated_levels = hr_active_levels_from_minimum(legacy_hr_level)
+            if migrated_levels is None:
+                raise ValueError('hrActiveMinLevel 不是有效的活跃档位')
+            merged['frontend']['hrActiveLevels'] = migrated_levels
+        merged['frontend'].pop('hrActiveMinLevel', None)
         for key, default in config.DEFAULT_USER_CONFIG['frontend'].items():
             merged['frontend'].setdefault(key, default)
     if isinstance(merged.get('tags'), list):

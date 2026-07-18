@@ -43,7 +43,14 @@
     "randomDelayMinMs": 0,
     "randomDelayMaxMs": 0,
     "hrActiveFilterEnabled": false,
-    "hrActiveMinLevel": "this_month"
+    "hrActiveLevels": [
+      "online",
+      "just_now",
+      "today",
+      "within_3_days",
+      "this_week",
+      "this_month"
+    ]
   },
   "scoring": {
     "title_deduction_keywords": {
