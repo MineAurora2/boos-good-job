@@ -609,6 +609,40 @@ class RuntimeMonitor:
             return False, 'stale_sequence'
         return True, 'accepted'
 
+    @staticmethod
+    def _valid_running_handoff(
+        previous: dict | None,
+        worker: dict,
+        handoff: dict | None,
+        control_epoch: str,
+    ) -> bool:
+        """Accept an explicit handoff from the currently registered session."""
+        if not isinstance(previous, dict) or not isinstance(handoff, dict):
+            return False
+        if handoff.get('desiredState') != 'running' or worker.get('desiredState') != 'running':
+            return False
+        if ('workerId' in handoff and handoff.get('workerId') != worker.get('workerId')):
+            return False
+        if ('accountId' in handoff and handoff.get('accountId') != worker.get('accountId')):
+            return False
+        if handoff.get('controlEpoch') != control_epoch:
+            return False
+        if not handoff.get('operationId') or handoff.get('operationId') != worker.get('operationId'):
+            return False
+        if isinstance(worker.get('controlAck'), dict) and worker['controlAck'].get('status') == 'failed':
+            return False
+        try:
+            if int(handoff.get('revision')) != int(worker.get('revision') or 0):
+                return False
+            if int(handoff.get('sessionEpoch')) != int(
+                previous.get('_sessionEpoch', previous.get('sessionEpoch')) or 0,
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+        previous_session_id = previous.get('_sessionId', previous.get('sessionId'))
+        return bool(handoff.get('sessionId')) and handoff.get('sessionId') == previous_session_id
+
     def _heartbeat_response(self, worker_id: str, accepted: bool, reason: str) -> dict:
         with self._condition:
             control = (
@@ -634,6 +668,7 @@ class RuntimeMonitor:
         if not worker_id:
             raise ValueError('missing_worker_id')
         raw_ack = payload.get('controlAck') if isinstance(payload.get('controlAck'), dict) else None
+        control_handoff = payload.get('controlHandoff') if isinstance(payload.get('controlHandoff'), dict) else None
         try:
             protocol_version = int(payload.get('protocolVersion') or 0)
         except (TypeError, ValueError) as error:
@@ -725,18 +760,29 @@ class RuntimeMonitor:
                 worker.get('sessionId') != session_id
                 or int(worker.get('sessionEpoch') or 0) != session_epoch
             ):
-                control_revision += 1
-                worker.update({
-                    'desiredState': 'stopped',
-                    'revision': control_revision,
-                    'operationId': self._new_control_operation(control_revision),
-                    'controlAck': None,
-                    'protocolVersion': protocol_version,
-                    'sessionId': session_id,
-                    'sessionEpoch': session_epoch,
-                    'sequence': sequence,
-                    'updatedAt': safe_client['lastSeen'],
-                })
+                if self._valid_running_handoff(
+                    previous,
+                    worker,
+                    control_handoff,
+                    self._control_epoch,
+                ):
+                    worker.update({
+                        'controlAck': None,
+                        'updatedAt': safe_client['lastSeen'],
+                    })
+                else:
+                    control_revision += 1
+                    worker.update({
+                        'desiredState': 'stopped',
+                        'revision': control_revision,
+                        'operationId': self._new_control_operation(control_revision),
+                        'controlAck': None,
+                        'protocolVersion': protocol_version,
+                        'sessionId': session_id,
+                        'sessionEpoch': session_epoch,
+                        'sequence': sequence,
+                        'updatedAt': safe_client['lastSeen'],
+                    })
                 workers_changed = True
             for field in ('accountId', 'alias', 'role', 'scriptVersion'):
                 if worker.get(field) != safe_client[field]:

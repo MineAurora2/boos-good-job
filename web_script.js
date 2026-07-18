@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-19-remote-control.9
+// @version      2026-07-19-remote-control.10
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,13 +16,15 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-19-remote-control.9';
+    const SCRIPT_VERSION = '2026-07-19-remote-control.10';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
     const CHILD_EXECUTION_PERMISSION_KEY = '__goodjobs_child_execution_permission';
     const CHILD_EXECUTION_PERMISSION_TTL_MS = 15000;
+    const SESSION_HANDOFF_KEY = '__goodjobs_session_handoff';
+    const SESSION_HANDOFF_TTL_MS = 10000;
     const GREET_SESSION_KEY = '__goodjobs_pending_greet_session';
     const MANAGED_CHILD_NAMES = ['__zhipin_detail', '__zhipin_chat', '__zhipin_chat_greet'];
 
@@ -45,6 +47,81 @@
         } catch (_) {
             return false;
         }
+    }
+
+    function sessionHandoffStorage() {
+        try {
+            if (typeof sessionStorage !== 'undefined' && sessionStorage) return sessionStorage;
+        } catch (_) { /* fall back to localStorage for restricted contexts */ }
+        return localStorage;
+    }
+
+    function normalizeSessionHandoff(value) {
+        if (!value || value.desiredState !== 'running') return null;
+        const createdAt = Number(value.createdAt);
+        const revision = Number(value.revision);
+        const sessionEpoch = Number(value.sessionEpoch);
+        const handoff = {
+            desiredState: 'running',
+            workerId: String(value.workerId || '').trim(),
+            accountId: String(value.accountId || '').trim(),
+            controlEpoch: String(value.controlEpoch || '').trim(),
+            revision,
+            operationId: String(value.operationId || '').trim(),
+            sessionId: String(value.sessionId || '').trim(),
+            sessionEpoch,
+            createdAt,
+        };
+        if (!handoff.workerId || !handoff.accountId || !handoff.controlEpoch
+            || !handoff.operationId || !handoff.sessionId
+            || !Number.isInteger(handoff.revision) || handoff.revision < 0
+            || !Number.isInteger(handoff.sessionEpoch) || handoff.sessionEpoch < 0
+            || !Number.isFinite(createdAt)) return null;
+        return handoff;
+    }
+
+    function readSessionHandoff(identity = null, now = Date.now()) {
+        const storage = sessionHandoffStorage();
+        let parsed;
+        try {
+            parsed = JSON.parse(storage.getItem(SESSION_HANDOFF_KEY) || 'null');
+        } catch (_) {
+            return null;
+        }
+        const handoff = normalizeSessionHandoff(parsed);
+        if (!handoff) {
+            try { storage.removeItem(SESSION_HANDOFF_KEY); } catch (_) { /* ignore storage errors */ }
+            return null;
+        }
+        if (identity && (handoff.workerId !== String(identity.workerId || '')
+            || handoff.accountId !== String(identity.accountId || ''))) return null;
+        if (now < handoff.createdAt || now - handoff.createdAt > SESSION_HANDOFF_TTL_MS) {
+            try { storage.removeItem(SESSION_HANDOFF_KEY); } catch (_) { /* ignore storage errors */ }
+            return null;
+        }
+        return handoff;
+    }
+
+    function writeSessionHandoff(handoff) {
+        const normalized = normalizeSessionHandoff(handoff);
+        if (!normalized) return false;
+        try {
+            sessionHandoffStorage().setItem(SESSION_HANDOFF_KEY, JSON.stringify(normalized));
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function clearSessionHandoff(expected = null) {
+        const storage = sessionHandoffStorage();
+        const current = readSessionHandoff();
+        if (expected && current && (
+            current.operationId !== expected.operationId
+            || current.sessionId !== expected.sessionId
+        )) return false;
+        try { storage.removeItem(SESSION_HANDOFF_KEY); } catch (_) { return false; }
+        return true;
     }
 
     class ScriptStoppedError extends Error {
@@ -1822,6 +1899,8 @@
         constructor() {
             this.api = new Api();
             this.identity = deliveryIdentity.get();
+            this.sessionHandoff = readSessionHandoff(this.identity);
+            this.sessionHandoffConsumer = Boolean(this.sessionHandoff);
             this.runner = null;
             this.telemetryProvider = () => ({});
             this.logs = [];
@@ -1863,6 +1942,25 @@
 
         attachRunner(runner) {
             this.runner = runner;
+        }
+
+        prepareSessionHandoff(control) {
+            if (!control || control.desiredState !== 'running') return false;
+            const handoff = {
+                desiredState: 'running',
+                workerId: this.identity.workerId,
+                accountId: this.identity.accountId,
+                controlEpoch: control.epoch,
+                revision: Number(control.revision || 0),
+                operationId: control.operationId || '',
+                sessionId: this.sessionId,
+                sessionEpoch: this.sessionEpoch,
+                createdAt: Date.now(),
+            };
+            if (!writeSessionHandoff(handoff)) return false;
+            this.sessionHandoff = handoff;
+            this.sessionHandoffConsumer = false;
+            return true;
         }
 
         setTelemetryProvider(provider) {
@@ -1984,6 +2082,20 @@
             this.heartbeatBusy = true;
             const logs = this.logs.splice(0, 50);
             try {
+                const handoffAge = this.sessionHandoff
+                    ? Date.now() - Number(this.sessionHandoff.createdAt)
+                    : 0;
+                const handoffValid = this.sessionHandoffConsumer
+                    && this.sessionHandoff
+                    && Number.isFinite(handoffAge)
+                    && handoffAge >= 0
+                    && handoffAge <= SESSION_HANDOFF_TTL_MS;
+                if (this.sessionHandoffConsumer && this.sessionHandoff && !handoffValid) {
+                    clearSessionHandoff(this.sessionHandoff);
+                    this.sessionHandoff = null;
+                    this.sessionHandoffConsumer = false;
+                }
+                const controlHandoff = handoffValid ? this.sessionHandoff : undefined;
                 const telemetry = this.telemetryProvider() || {};
                 const result = await this.api.heartbeat({
                     workerId: this.identity.workerId,
@@ -2009,6 +2121,7 @@
                     lastError: telemetry.lastError || '',
                     consecutiveFailures: telemetry.consecutiveFailures || 0,
                     controlAck: this.controlAck,
+                    controlHandoff,
                     logs,
                 });
                 if (!result?.ok) {
@@ -2024,6 +2137,12 @@
                     this.requestSafetyPause('stale_session');
                     this.statusIndicator.update(this.connectionState, this.executionState);
                     return;
+                }
+                if (this.sessionHandoffConsumer && this.sessionHandoff
+                    && this.sessionHandoff.sessionId !== this.sessionId
+                    && clearSessionHandoff(this.sessionHandoff)) {
+                    this.sessionHandoff = null;
+                    this.sessionHandoffConsumer = false;
                 }
                 this.connectionState = 'connected';
                 this.statusIndicator.update(this.connectionState, this.executionState);
@@ -2178,6 +2297,12 @@
                     preempt,
                     safety,
                     reason: control.reason || '',
+                    control: {
+                        epoch: control.epoch,
+                        revision: Number(control.revision || 0),
+                        operationId: control.operationId || '',
+                        desiredState,
+                    },
                 });
             })
                 .then((result) => {
@@ -2338,6 +2463,7 @@
                     const navigate = () => {
                         if (transition.signal?.aborted
                             || (this.controlAgent && !this.controlAgent.isTransitionCurrent(transition.generation))) return;
+                        this.controlAgent?.prepareSessionHandoff(transition.control);
                         localStorage.setItem(this.targets.search, String(Date.now()));
                         try { window.name = this.targets.search; } catch (_) { /* ignore */ }
                         window.location.replace(`${window.location.origin}${SEARCHPATH.zhipin}`);
