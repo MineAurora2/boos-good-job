@@ -53,6 +53,7 @@ const state = {
     controlOnline: false,
     lifecycleRequests: {},
     accountLimitDrafts: new Map(),
+    accountLimitPending: new Map(),
     expandedDecisions: new Set(),
     llm: null,
     llmDirty: false,
@@ -1566,6 +1567,16 @@ function accountQuotaForInstance(item, accounts) {
     return controlArray(accounts).find((account) => String(account?.accountId || '') === accountId) || { accountId };
 }
 
+function settleAccountLimitSave(accountId, submittedValue, succeeded) {
+    const pending = state.accountLimitPending;
+    if (!pending || pending.get(accountId) !== submittedValue) return false;
+    pending.delete(accountId);
+    if (succeeded && state.accountLimitDrafts?.get(accountId) === submittedValue) {
+        state.accountLimitDrafts.delete(accountId);
+    }
+    return true;
+}
+
 function instanceQuotaMarkup(item, accounts) {
     const accountId = String(item?.accountId || '');
     if (!accountId) {
@@ -1580,9 +1591,13 @@ function instanceQuotaMarkup(item, accounts) {
     const remaining = Math.max(0, limit - used);
     const reached = used >= limit;
     const draft = state.accountLimitDrafts?.get(accountId);
-    const editing = draft !== undefined;
-    const inputValue = editing ? draft : String(limit);
-    return `<div class="control-instance-quota${reached ? ' reached' : ''}" data-account-quota="${escapeHtml(accountId)}"><div class="control-instance-quota-summary"><span>账号配额</span><strong>${used}<small> / ${limit}</small></strong><em>${reached ? '今日已达上限' : `今日剩余 ${remaining}`}</em></div><div class="control-instance-quota-controls"><button type="button" class="control-quota-edit" data-control-action="edit_account_limit" data-command-value="${escapeHtml(accountId)}"${editing ? ' hidden' : ''}>修改</button><div class="control-instance-quota-editor"${editing ? '' : ' hidden'}><label><span>今日上限</span><input type="number" min="${ACCOUNT_DAILY_LIMIT_MIN}" max="${ACCOUNT_DAILY_LIMIT_MAX}" step="1" inputmode="numeric" value="${escapeHtml(inputValue)}" data-account-limit="${escapeHtml(accountId)}" aria-label="${escapeHtml(accountId)} 今日投递上限"></label><button type="button" data-control-action="save_account_limit" data-command-value="${escapeHtml(accountId)}">保存</button><button type="button" class="control-quota-cancel" data-control-action="cancel_account_limit">取消</button></div></div></div>`;
+    const pending = state.accountLimitPending?.get(accountId);
+    const saving = pending !== undefined;
+    const editing = draft !== undefined || saving;
+    const inputValue = draft !== undefined ? draft : String(limit);
+    const disabled = saving ? ' disabled' : '';
+    const saveDisabled = saving ? ' disabled aria-busy="true"' : '';
+    return `<div class="control-instance-quota${reached ? ' reached' : ''}" data-account-quota="${escapeHtml(accountId)}"><div class="control-instance-quota-summary"><span>账号配额</span><strong>${used}<small> / ${limit}</small></strong><em>${reached ? '今日已达上限' : `今日剩余 ${remaining}`}</em></div><div class="control-instance-quota-controls"><button type="button" class="control-quota-edit" data-control-action="edit_account_limit" data-command-value="${escapeHtml(accountId)}"${editing ? ' hidden' : ''}>修改</button><div class="control-instance-quota-editor"${editing ? '' : ' hidden'}><label><span>今日上限</span><input type="number" min="${ACCOUNT_DAILY_LIMIT_MIN}" max="${ACCOUNT_DAILY_LIMIT_MAX}" step="1" inputmode="numeric" value="${escapeHtml(inputValue)}" data-account-limit="${escapeHtml(accountId)}" aria-label="${escapeHtml(accountId)} 今日投递上限"${disabled}></label><button type="button" data-control-action="save_account_limit" data-command-value="${escapeHtml(accountId)}"${saveDisabled}>保存</button><button type="button" class="control-quota-cancel" data-control-action="cancel_account_limit"${disabled}>取消</button></div></div></div>`;
 }
 
 function normalizedControlState() {
@@ -2668,16 +2683,12 @@ function bindEvents() {
                 return;
             }
             input.setCustomValidity('');
+            if (state.accountLimitPending.has(accountId)) return;
             state.accountLimitDrafts.set(accountId, rawLimit);
-            button.disabled = true;
-            button.setAttribute('aria-busy', 'true');
+            state.accountLimitPending.set(accountId, rawLimit);
+            renderControlCenter();
             const result = await updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit }, '账号配额已保存');
-            if (button.isConnected) {
-                button.disabled = false;
-                button.removeAttribute('aria-busy');
-            }
-            if (result) {
-                state.accountLimitDrafts.delete(accountId);
+            if (settleAccountLimitSave(accountId, rawLimit, Boolean(result))) {
                 renderControlCenter();
             }
             return;
