@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-19-remote-control.8
+// @version      2026-07-19-remote-control.9
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-19-remote-control.8';
+    const SCRIPT_VERSION = '2026-07-19-remote-control.9';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
@@ -1865,8 +1865,16 @@
             this.transitionController = null;
             this.heartbeatBusy = false;
             this.heartbeatRequested = false;
+            this.heartbeatStopped = false;
+            this.lastHeartbeatStartedAt = Number.NEGATIVE_INFINITY;
+            this.heartbeatDelayTimer = null;
             this.lastHeartbeatOkAt = Date.now();
             this.timer = null;
+            this.boundHeartbeatTrigger = () => this.requestHeartbeat();
+            this.boundVisibilityHeartbeat = () => {
+                if (document.visibilityState === 'visible') this.requestHeartbeat();
+            };
+            this.boundStop = () => this.stop();
             this.controlPollBusy = false;
             this.controlPolling = false;
             this.controlPollCursor = null;
@@ -1962,17 +1970,33 @@
         }
 
         start() {
+            this.heartbeatStopped = false;
             this.statusIndicator.update('connecting', this.executionState);
-            this.pulse();
-            this.timer = window.setInterval(() => this.pulse(), 5000);
-            this.startControlPolling();
-            const pulse = () => this.pulse();
-            window.addEventListener('focus', pulse);
-            window.addEventListener('online', pulse);
-            window.addEventListener('pageshow', pulse);
-            document.addEventListener?.('visibilitychange', () => {
-                if (document.visibilityState === 'visible') pulse();
+            const initialHeartbeat = this.requestHeartbeat();
+            this.timer = window.setInterval(this.boundHeartbeatTrigger, 15000);
+            window.addEventListener('focus', this.boundHeartbeatTrigger);
+            window.addEventListener('online', this.boundHeartbeatTrigger);
+            window.addEventListener('pageshow', this.boundHeartbeatTrigger);
+            window.addEventListener('beforeunload', this.boundStop);
+            document.addEventListener?.('visibilitychange', this.boundVisibilityHeartbeat);
+            Promise.resolve(initialHeartbeat).then(() => {
+                if (!this.heartbeatStopped) this.startControlPolling();
             });
+        }
+
+        stop() {
+            this.heartbeatStopped = true;
+            if (this.timer !== null) window.clearInterval(this.timer);
+            if (this.heartbeatDelayTimer !== null) window.clearTimeout(this.heartbeatDelayTimer);
+            this.timer = null;
+            this.heartbeatDelayTimer = null;
+            this.heartbeatRequested = false;
+            this.controlPolling = false;
+            window.removeEventListener('focus', this.boundHeartbeatTrigger);
+            window.removeEventListener('online', this.boundHeartbeatTrigger);
+            window.removeEventListener('pageshow', this.boundHeartbeatTrigger);
+            window.removeEventListener('beforeunload', this.boundStop);
+            document.removeEventListener?.('visibilitychange', this.boundVisibilityHeartbeat);
         }
 
         async pulse() {
@@ -2035,18 +2059,29 @@
                 if (this.logs.length > 200) this.logs.splice(200);
                 this.heartbeatBusy = false;
                 if (this.heartbeatRequested) {
-                    this.heartbeatRequested = false;
-                    queueMicrotask(() => this.pulse());
+                    this.requestHeartbeat();
                 }
             }
         }
 
         requestHeartbeat() {
+            if (this.heartbeatStopped) return null;
+            this.heartbeatRequested = true;
             if (this.heartbeatBusy) {
-                this.heartbeatRequested = true;
-                return;
+                return null;
             }
-            this.pulse();
+            if (this.heartbeatDelayTimer !== null) return null;
+            const remaining = Math.max(0, 2000 - (Date.now() - this.lastHeartbeatStartedAt));
+            if (remaining > 0) {
+                this.heartbeatDelayTimer = window.setTimeout(() => {
+                    this.heartbeatDelayTimer = null;
+                    this.requestHeartbeat();
+                }, remaining);
+                return null;
+            }
+            this.heartbeatRequested = false;
+            this.lastHeartbeatStartedAt = Date.now();
+            return this.pulse();
         }
 
         startControlPolling() {

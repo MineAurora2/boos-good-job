@@ -672,6 +672,7 @@ class RuntimeMonitor:
             workers = deepcopy(self._workers)
             worker = workers.get(worker_id)
             workers_changed = worker is None
+            control_revision = self._control_revision
             if worker is None:
                 worker = {
                     'workerId': worker_id,
@@ -691,6 +692,23 @@ class RuntimeMonitor:
                     'sequence': sequence,
                 }
                 workers[worker_id] = worker
+            elif protocol_version >= CONTROL_PROTOCOL_VERSION and (
+                worker.get('sessionId') != session_id
+                or int(worker.get('sessionEpoch') or 0) != session_epoch
+            ):
+                control_revision += 1
+                worker.update({
+                    'desiredState': 'stopped',
+                    'revision': control_revision,
+                    'operationId': self._new_control_operation(control_revision),
+                    'controlAck': None,
+                    'protocolVersion': protocol_version,
+                    'sessionId': session_id,
+                    'sessionEpoch': session_epoch,
+                    'sequence': sequence,
+                    'updatedAt': safe_client['lastSeen'],
+                })
+                workers_changed = True
             for field in ('accountId', 'alias', 'role', 'scriptVersion'):
                 if worker.get(field) != safe_client[field]:
                     worker[field] = safe_client[field]
@@ -750,7 +768,11 @@ class RuntimeMonitor:
                             workers_changed = True
 
             if workers_changed:
-                self._persist_state_locked(workers=workers)
+                self._persist_state_locked(
+                    control_revision=control_revision,
+                    workers=workers,
+                )
+                self._control_revision = control_revision
                 self._workers = workers
                 self._condition.notify_all()
             self._clients[worker_id] = safe_client
