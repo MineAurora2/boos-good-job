@@ -847,3 +847,18 @@ html[data-theme="light"] .toast { box-shadow: 0 12px 30px rgba(40,70,84,.16); }
     .llm-provider-top { grid-template-columns: 34px minmax(0,1fr); grid-template-areas: "order identity" "status status" "toggle tools"; }.llm-card-toggle { justify-self: start; }.llm-provider-tools { justify-self: end; }.llm-provider-tools .llm-test-action { width: 29px; padding: 0; }.llm-provider-tools .llm-test-action b { display: none; }.llm-field-label { flex-wrap: wrap; }.llm-inline-toggle { width: 100%; margin-left: 0; }.llm-input-shell button { min-width: 38px; padding-inline: 6px; }
     th:nth-child(3), td:nth-child(3) { display: none; }
 }
+
+/* Instance controls use one lifecycle toggle and keep quota editing collapsed. */
+.control-instance-actions { grid-template-columns: minmax(0, 1fr); }
+.control-instance-quota { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.control-instance-quota-controls { display: flex; justify-content: flex-end; min-width: 0; }
+.control-quota-edit { height: 29px; padding: 0 9px; border: 1px solid rgba(57,215,242,.17); border-radius: 6px; color: var(--cyan); background: rgba(57,215,242,.055); font-size: 8px; }
+.control-quota-edit:hover { border-color: rgba(57,215,242,.34); background: rgba(57,215,242,.1); }
+.control-instance-quota-editor { grid-template-columns: minmax(92px, 1fr) 52px 52px; }
+.control-quota-cancel { color: var(--muted-2) !important; border-color: var(--line) !important; background: transparent !important; }
+@media (max-width: 680px) {
+    .control-instance-quota { grid-template-columns: 1fr; align-items: stretch; }
+    .control-instance-quota-controls { justify-content: stretch; }
+    .control-quota-edit { width: 100%; }
+    .control-instance-quota-editor { grid-template-columns: minmax(0, 1fr) 58px 58px; }
+}

@@ -103,6 +103,9 @@ def run_server() -> None:
     opener_thread = start_dashboard_opener(server, stop_event)
     try:
         server.run()
+    except KeyboardInterrupt:
+        # Ctrl+C is the expected way to stop a foreground Uvicorn server.
+        pass
     finally:
         stop_event.set()
         opener_thread.join(timeout=1)

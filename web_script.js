@@ -1474,8 +1474,6 @@
                 const connection = document.createElement('strong');
                 const execution = document.createElement('span');
                 const actions = document.createElement('div');
-                const startButton = this.createButton('▶ 开始', '开始自动化', 'color:#8df0b8;border-color:rgba(83,227,148,.28);background:rgba(83,227,148,.09);');
-                const pauseButton = this.createButton('Ⅱ 暂停', '暂停自动化', 'color:#ffd09b;border-color:rgba(255,173,91,.26);background:rgba(255,173,91,.08);');
                 const logToggleButton = this.createButton('日志', '展开或收起本地日志');
                 const settingsToggleButton = this.createButton('设置', '展开或收起脚本设置');
                 const logPanel = document.createElement('div');
@@ -1513,15 +1511,13 @@
                 connection.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650;letter-spacing:0;';
                 execution.dataset.goodjobsExecution = '1';
                 execution.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;';
-                startButton.dataset.goodjobsStart = '1';
-                pauseButton.dataset.goodjobsPause = '1';
                 logToggleButton.dataset.goodjobsLogToggle = '1';
                 logToggleButton.setAttribute('aria-expanded', 'false');
                 logToggleButton.setAttribute('aria-controls', 'goodjobs-runtime-log-panel');
                 settingsToggleButton.dataset.goodjobsSettingsToggle = '1';
                 settingsToggleButton.setAttribute('aria-expanded', 'false');
                 settingsToggleButton.setAttribute('aria-controls', 'goodjobs-runtime-settings-panel');
-                actions.style.cssText = 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;';
+                actions.style.cssText = 'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;';
 
                 logPanel.id = 'goodjobs-runtime-log-panel';
                 logPanel.dataset.goodjobsLogPanel = '1';
@@ -1559,8 +1555,6 @@
                 copy.appendChild(execution);
                 statusRow.appendChild(image);
                 statusRow.appendChild(copy);
-                actions.appendChild(startButton);
-                actions.appendChild(pauseButton);
                 actions.appendChild(logToggleButton);
                 actions.appendChild(settingsToggleButton);
                 logHead.appendChild(logTitle);
@@ -1596,8 +1590,6 @@
                 };
                 this.settingsError = settingsError;
 
-                startButton.addEventListener('click', () => this.onDesiredState('running'));
-                pauseButton.addEventListener('click', () => this.onDesiredState('paused'));
                 logToggleButton.addEventListener('click', () => this.toggleLogs());
                 settingsToggleButton.addEventListener('click', () => this.toggleSettings());
                 clearLogsButton.addEventListener('click', () => this.clearLogs());
@@ -1812,26 +1804,11 @@
             if (!this.root) return;
             const connection = this.root.querySelector?.('[data-goodjobs-connection]');
             const execution = this.root.querySelector?.('[data-goodjobs-execution]');
-            const startButton = this.root.querySelector?.('[data-goodjobs-start]');
-            const pauseButton = this.root.querySelector?.('[data-goodjobs-pause]');
             const connectionLabel = CONNECTION_LABELS[this.connectionState] || '后端状态未知';
             const executionLabel = EXECUTION_LABELS[this.executionState] || this.executionState;
             if (connection) connection.textContent = connectionLabel;
             if (execution) execution.textContent = `脚本：${executionLabel}${this.commandMessage ? ` · ${this.commandMessage}` : ''}`;
             const connected = this.connectionState === 'connected';
-            const startable = ['paused', 'stopped', 'error'].includes(this.executionState);
-            const pausable = ['starting', 'running'].includes(this.executionState);
-            if (startButton) {
-                startButton.textContent = this.executionState === 'paused' ? '▶ 继续' : (startable ? '▶ 开始' : '▶ 运行中');
-                startButton.disabled = this.commandBusy || !connected || !startable;
-                startButton.style.opacity = startButton.disabled ? '.48' : '1';
-                startButton.style.cursor = startButton.disabled ? 'not-allowed' : 'pointer';
-            }
-            if (pauseButton) {
-                pauseButton.disabled = this.commandBusy || !connected || !pausable;
-                pauseButton.style.opacity = pauseButton.disabled ? '.48' : '1';
-                pauseButton.style.cursor = pauseButton.disabled ? 'not-allowed' : 'pointer';
-            }
             const color = connected ? '#53e394' : (this.connectionState === 'connecting' ? '#68dce7' : '#ff8d8d');
             this.root.style.borderColor = `${color}55`;
             this.root.dataset.connectionState = this.connectionState;

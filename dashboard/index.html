@@ -111,21 +111,8 @@
                     <div class="control-sync"><span id="controlSyncDot"></span><div><strong id="controlSyncText">正在连接控制服务</strong><small id="controlUpdatedAt">尚未同步</small></div><button id="refreshControl" type="button">刷新</button></div>
                 </div>
 
-                <div class="control-global-bar panel" aria-label="全部浏览器实例控制">
-                    <div class="control-global-status" id="globalControlStatus">
-                        <span class="control-power" aria-hidden="true">●</span>
-                        <div><strong id="globalDesiredState">全局状态：等待实例接入</strong><small id="globalControlFeedback" aria-live="polite">操作会应用到当前已登记的全部实例</small></div>
-                    </div>
-                    <div class="control-primary-actions" role="group" aria-label="全部实例生命周期">
-                        <button type="button" class="control-command start" data-control-scope="global" data-desired-state="running"><span aria-hidden="true">▶</span> 开启全部</button>
-                        <button type="button" class="control-command pause" data-control-scope="global" data-desired-state="paused"><span aria-hidden="true">Ⅱ</span> 暂停全部</button>
-                        <button type="button" class="control-command danger" data-control-scope="global" data-desired-state="stopped"><span aria-hidden="true">■</span> 结束全部</button>
-                    </div>
-                </div>
-
                 <div class="monitor-metrics panel">
                     <div><span>已连接实例</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">30 秒内有心跳</small></div>
-                    <div><span>已登记实例</span><strong id="connectedClients">0</strong><small>仅统计在线实例</small></div>
                     <div><span>正在运行</span><strong id="runningClients">0</strong><small>执行状态为运行中</small></div>
                     <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
                     <div><span>筛选投递率</span><strong id="filterDeliveryRate">—</strong><small id="filterDeliveryRateHint">已投递 0 / 已评估 0</small></div>
@@ -186,8 +173,8 @@
                         </div>
                         <div class="funnel-list">
                             <div><span><i class="dot violet"></i>已评估岗位</span><strong id="evaluatedJobs">0</strong></div>
-                            <div><span><i class="dot cyan"></i>进入投递</span><strong id="funnelDelivered">0</strong></div>
                             <div><span><i class="dot orange"></i>低于阈值</span><strong id="belowThreshold">0</strong></div>
+                            <div><span><i class="dot cyan"></i>进入投递</span><strong id="funnelDelivered">0</strong></div>
                             <div><span><i class="dot red"></i>队列异常</span><strong id="queueFailures">0</strong></div>
                         </div>
                     </div>
@@ -289,9 +276,6 @@
                         <button id="clearSelection" disabled>取消选择</button>
                     </div>
                     <div class="table-view-tools">
-                        <div class="density-switch" id="densitySwitch">
-                            <button class="active" data-density="default" title="默认">默认</button>
-                        </div>
                         <div class="column-manager">
                             <button id="columnManagerButton">列设置 ▾</button>
                             <div id="columnManagerMenu" class="column-manager-menu" hidden></div>

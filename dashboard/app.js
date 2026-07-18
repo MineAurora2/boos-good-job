@@ -1331,11 +1331,9 @@ function renderControlMonitorCounts() {
     const control = state.control || {};
     const clients = controlArray(control.clients || control.instances).length ? controlArray(control.clients || control.instances) : controlArray(runtime.clients);
     const count = (value, fallback = 0) => { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; };
-    const registered = count(control.registeredWorkerCount ?? control.registeredClientCount, count(runtime.connectedClientCount, clients.length));
     const connected = count(control.connectedClientCount ?? control.activeClientCount, count(runtime.activeClientCount, clients.filter((item) => item.online !== false).length));
     const running = count(control.runningClientCount, clients.filter((item) => item.online !== false && item.executionState === 'running').length);
     $('#activeClients').textContent = connected;
-    $('#connectedClients').textContent = registered;
     $('#runningClients').textContent = running;
     $('#navControlAlerts').textContent = connected;
 }
@@ -1545,11 +1543,12 @@ function lifecycleControlsLocked(scope, workerId = '') {
 function lifecycleButtonsMarkup(scope, workerId, desiredState) {
     const pending = lifecycleControlsLocked(scope, workerId);
     const workerAttribute = scope === 'worker' ? ` data-worker-id="${escapeHtml(workerId)}"` : '';
-    return [
-        ['running', '▶', '开启', 'start'],
-        ['paused', 'Ⅱ', '暂停', 'pause'],
-        ['stopped', '■', '结束', 'danger'],
-    ].map(([value, icon, label, className]) => `<button type="button" class="control-command ${className}${desiredState === value ? ' active' : ''}" data-control-scope="${scope}"${workerAttribute} data-desired-state="${value}" aria-pressed="${desiredState === value}"${pending ? ' disabled aria-busy="true"' : ''}><span aria-hidden="true">${icon}</span> ${label}</button>`).join('');
+    const isRunning = ['running', 'starting', 'applying'].includes(desiredState);
+    const value = isRunning ? 'stopped' : 'running';
+    const icon = isRunning ? '■' : '▶';
+    const label = isRunning ? '结束' : '开启';
+    const className = isRunning ? 'danger' : 'start';
+    return `<button type="button" class="control-command ${className} active" data-control-scope="${scope}"${workerAttribute} data-desired-state="${value}" aria-pressed="true"${pending ? ' disabled aria-busy="true"' : ''}><span aria-hidden="true">${icon}</span> ${label}</button>`;
 }
 
 function controlAxesMarkup(item) {
@@ -1579,7 +1578,7 @@ function instanceQuotaMarkup(item, accounts) {
         : 90;
     const remaining = Math.max(0, limit - used);
     const reached = used >= limit;
-    return `<div class="control-instance-quota${reached ? ' reached' : ''}" data-account-quota="${escapeHtml(accountId)}"><div class="control-instance-quota-summary"><span>账号配额</span><strong>${used}<small> / ${limit}</small></strong><em>${reached ? '今日已达上限' : `今日剩余 ${remaining}`}</em></div><div class="control-instance-quota-editor"><label><span>今日上限</span><input type="number" min="${ACCOUNT_DAILY_LIMIT_MIN}" max="${ACCOUNT_DAILY_LIMIT_MAX}" step="1" inputmode="numeric" value="${limit}" data-account-limit="${escapeHtml(accountId)}" aria-label="${escapeHtml(accountId)} 今日投递上限"></label><button type="button" data-control-action="save_account_limit" data-command-value="${escapeHtml(accountId)}">保存</button></div></div>`;
+    return `<div class="control-instance-quota${reached ? ' reached' : ''}" data-account-quota="${escapeHtml(accountId)}"><div class="control-instance-quota-summary"><span>账号配额</span><strong>${used}<small> / ${limit}</small></strong><em>${reached ? '今日已达上限' : `今日剩余 ${remaining}`}</em></div><div class="control-instance-quota-controls"><button type="button" class="control-quota-edit" data-control-action="edit_account_limit" data-command-value="${escapeHtml(accountId)}">修改</button><div class="control-instance-quota-editor" hidden><label><span>今日上限</span><input type="number" min="${ACCOUNT_DAILY_LIMIT_MIN}" max="${ACCOUNT_DAILY_LIMIT_MAX}" step="1" inputmode="numeric" value="${limit}" data-account-limit="${escapeHtml(accountId)}" aria-label="${escapeHtml(accountId)} 今日投递上限"></label><button type="button" data-control-action="save_account_limit" data-command-value="${escapeHtml(accountId)}">保存</button><button type="button" class="control-quota-cancel" data-control-action="cancel_account_limit">取消</button></div></div></div>`;
 }
 
 function normalizedControlState() {
@@ -1672,44 +1671,9 @@ function renderControlInstances(instances, accounts) {
     });
 }
 
-function renderGlobalLifecycle(instances) {
-    const request = state.lifecycleRequests.global;
-    const controlsLocked = lifecycleControlsLocked('global');
-    const desiredStates = [...new Set(instances.map(desiredStateOf))];
-    const desiredState = desiredStates.length === 1 ? desiredStates[0] : '';
-    const syncStates = instances.map(syncStateOf);
-    const aggregateSync = syncStates.includes('failed') ? 'failed' : syncStates.includes('applying') ? 'applying' : syncStates.includes('pending') ? 'pending' : 'synced';
-    const status = $('#globalControlStatus');
-    status.className = `control-global-status ${desiredState ? `desired-${desiredState}` : 'desired-mixed'} sync-${aggregateSync}${request?.pending ? ' pending' : ''}${request?.failed ? ' failed' : ''}`;
-    $('#globalDesiredState').textContent = !instances.length
-        ? '全局状态：等待实例接入'
-        : desiredState
-            ? `全局期望：${DESIRED_STATE_LABELS[desiredState]}`
-            : '全局期望：实例状态不一致';
-    const syncedCount = syncStates.filter((value) => value === 'synced').length;
-    $('#globalControlFeedback').textContent = request?.pending
-        ? request.submitted
-            ? `“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令已提交，等待浏览器接收…`
-            : `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令…`
-        : request?.failed
-            ? `操作失败：${request.message || '请求未完成'}，可直接重试`
-            : request?.timedOut
-                ? '指令已保存，部分浏览器暂未回执'
-            : instances.length
-                ? `${syncedCount} / ${instances.length} 个实例已同步${aggregateSync === 'failed' ? '，存在失败实例' : ''}`
-                : '操作会应用到当前已登记的全部实例';
-    $$('.control-global-bar [data-desired-state]').forEach((button) => {
-        button.disabled = controlsLocked;
-        button.setAttribute('aria-busy', String(controlsLocked));
-        const active = Boolean(desiredState && button.dataset.desiredState === desiredState);
-        button.classList.toggle('active', active);
-        button.setAttribute('aria-pressed', String(active));
-    });
-}
-
 function renderControlCenter() {
     const data = normalizedControlState();
-    renderGlobalLifecycle(data.instances); renderControlInstances(data.instances, data.accounts); renderControlMonitorCounts();
+    renderControlInstances(data.instances, data.accounts); renderControlMonitorCounts();
     renderDailyGoal();
 }
 
@@ -2661,6 +2625,25 @@ function bindEvents() {
         const action = button.dataset.controlAction; let payload = {};
         if (button.dataset.commandValue !== undefined) payload.value = button.dataset.commandValue;
         if (action === 'refresh_instances' || action === 'test_database') { loadControlState(); return; }
+        if (action === 'edit_account_limit') {
+            const quota = button.closest('.control-instance-quota');
+            const editor = quota?.querySelector('.control-instance-quota-editor');
+            const input = editor?.querySelector('[data-account-limit]');
+            if (!editor || !input) return;
+            editor.hidden = false;
+            button.hidden = true;
+            input.focus();
+            input.select();
+            return;
+        }
+        if (action === 'cancel_account_limit') {
+            const quota = button.closest('.control-instance-quota');
+            const editor = quota?.querySelector('.control-instance-quota-editor');
+            const editButton = quota?.querySelector('.control-quota-edit');
+            if (editor) editor.hidden = true;
+            if (editButton) editButton.hidden = false;
+            return;
+        }
         if (action === 'save_account_limit') {
             const accountId = button.dataset.commandValue || '';
             const input = button.closest('.control-instance-card')?.querySelector('[data-account-limit]');
@@ -2675,10 +2658,17 @@ function bindEvents() {
             input.setCustomValidity('');
             button.disabled = true;
             button.setAttribute('aria-busy', 'true');
-            await updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit }, '账号配额已保存');
+            const result = await updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit }, '账号配额已保存');
             if (button.isConnected) {
                 button.disabled = false;
                 button.removeAttribute('aria-busy');
+            }
+            if (result && button.isConnected) {
+                const quota = button.closest('.control-instance-quota');
+                const editor = quota?.querySelector('.control-instance-quota-editor');
+                const editButton = quota?.querySelector('.control-quota-edit');
+                if (editor) editor.hidden = true;
+                if (editButton) editButton.hidden = false;
             }
             return;
         }
