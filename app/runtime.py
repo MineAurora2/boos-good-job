@@ -514,6 +514,30 @@ class RuntimeMonitor:
             client['_seenMonotonic'] = time.monotonic()
             client['lastSeen'] = self._now_iso()
 
+    def _prune_offline_workers_locked(self, now_monotonic: float) -> None:
+        """Remove registrations whose browser connection is no longer live."""
+        offline_worker_ids = [
+            worker_id
+            for worker_id in self._workers
+            if (
+                (client := self._clients.get(worker_id)) is None
+                or now_monotonic - client['_seenMonotonic'] > self.client_ttl_seconds
+                or client.get('state') in {'closed', 'exited'}
+            )
+        ]
+        if not offline_worker_ids:
+            return
+        workers = {
+            worker_id: worker
+            for worker_id, worker in self._workers.items()
+            if worker_id not in offline_worker_ids
+        }
+        self._persist_state_locked(workers=workers)
+        self._workers = workers
+        for worker_id in offline_worker_ids:
+            self._clients.pop(worker_id, None)
+        self._condition.notify_all()
+
     def desired_control(
         self,
         worker_id: str,
@@ -540,6 +564,7 @@ class RuntimeMonitor:
         deadline = time.monotonic() + timeout_seconds
         with self._condition:
             while True:
+                self._prune_offline_workers_locked(time.monotonic())
                 if not worker_id or worker_id not in self._workers:
                     raise KeyError('worker_not_found')
                 worker = self._workers[worker_id]
@@ -585,9 +610,13 @@ class RuntimeMonitor:
         return True, 'accepted'
 
     def _heartbeat_response(self, worker_id: str, accepted: bool, reason: str) -> dict:
-        snapshot = self.snapshot()
         with self._condition:
-            control = self._control_for_worker_locked(worker_id)
+            control = (
+                self._control_for_worker_locked(worker_id)
+                if worker_id in self._workers
+                else None
+            )
+        snapshot = self.snapshot()
         snapshot['commands'] = []
         snapshot['control'] = control
         snapshot['heartbeatAccepted'] = accepted
@@ -970,6 +999,7 @@ class RuntimeMonitor:
         desired_state = self._desired_state(desired_state)
         updated_at = self._now_iso()
         with self._condition:
+            self._prune_offline_workers_locked(time.monotonic())
             revision = self._control_revision + 1
             operation_id = self._new_control_operation(revision)
             workers = deepcopy(self._workers)
@@ -1001,6 +1031,7 @@ class RuntimeMonitor:
         desired_state = self._desired_state(desired_state)
         updated_at = self._now_iso()
         with self._condition:
+            self._prune_offline_workers_locked(time.monotonic())
             if worker_id not in self._workers:
                 raise KeyError('worker_not_found')
             revision = self._control_revision + 1
@@ -1043,6 +1074,7 @@ class RuntimeMonitor:
         now = time.monotonic()
         clients = []
         with self._condition:
+            self._prune_offline_workers_locked(now)
             for worker_id, worker in self._workers.items():
                 client = self._clients.get(worker_id)
                 item = deepcopy(worker)
