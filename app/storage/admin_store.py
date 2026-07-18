@@ -67,7 +67,7 @@ def validate_config(config: dict) -> None:
     _validate_number(frontend, 'thread', 0, 100)
     _validate_number(frontend, 'resumeIndex', 0, 50)
     for key in (
-        'timestampTimeout', 'manualFilterWaitMs', 'roundRestartDelayMs', 'detailTimeout',
+        'timestampTimeout', 'roundRestartDelayMs', 'detailTimeout',
         'greetTimeout', 'preloadScrollWaitMs', 'preloadActivateCardWaitMs',
     ):
         _validate_number(frontend, key, 0, 600000)
@@ -93,7 +93,7 @@ def validate_config(config: dict) -> None:
     backend = config['backend']
     _validate_number(backend, 'job_score_delay_base_ms', 0, 600000)
     _validate_number(backend, 'job_score_delay_jitter_ms', 0, 600000)
-    _validate_number(backend, 'daily_greet_limit', 1, 10000)
+    _validate_number(backend, 'daily_greet_limit', 1, 150)
     database_name = backend.get('delivery_db_path')
     if (
         not isinstance(database_name, str)
@@ -146,6 +146,7 @@ def save_config(payload: dict) -> dict:
     merged.setdefault('scoring_enabled', config.DEFAULT_USER_CONFIG['scoring_enabled'])
     # 旧版前端可能不提交新增的防检测字段，用默认值补齐后再校验，避免误判为缺字段。
     if isinstance(merged.get('frontend'), dict):
+        merged['frontend'].pop('manualFilterWaitMs', None)
         for key, default in config.DEFAULT_USER_CONFIG['frontend'].items():
             merged['frontend'].setdefault(key, default)
     if isinstance(merged.get('tags'), list):

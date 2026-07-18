@@ -67,6 +67,10 @@ const LOG_VERBOSITY_RANK = { concise: 0, normal: 1, detailed: 2 };
 const DESIRED_STATE_LABELS = { running: '运行', paused: '暂停', stopped: '结束' };
 const EXECUTION_STATE_LABELS = { starting: '启动中', running: '运行中', pausing: '暂停中', paused: '已暂停', stopping: '结束中', stopped: '已结束', error: '异常' };
 const SYNC_STATE_LABELS = { pending: '等待同步', applying: '正在应用', synced: '已同步', failed: '同步失败' };
+const ACCOUNT_DAILY_LIMIT_MIN = 0;
+const ACCOUNT_DAILY_LIMIT_MAX = 150;
+const CONTROL_DELIVERY_POLL_INTERVAL_MS = 150;
+const CONTROL_DELIVERY_TIMEOUT_MS = 6000;
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
@@ -102,6 +106,7 @@ const numberFormat = new Intl.NumberFormat('zh-CN');
 let pendingDeleteConfirmation = null;
 let pendingStopAllConfirmation = null;
 let pendingAuthPrompt = null;
+let controlStateLoadPromise = null;
 let authPromptResolver = null;
 let authPromptDismissed = false;
 let authPromptCloseTimer = null;
@@ -1555,6 +1560,28 @@ function controlAxesMarkup(item) {
     return `<div class="control-state-axes" aria-label="实例状态"><span class="axis connection ${online ? 'connected' : 'offline'}"><i></i><small>连接</small><b>${online ? '已连接' : '离线'}</b></span><span class="axis execution ${executionState}"><i></i><small>执行</small><b>${EXECUTION_STATE_LABELS[executionState]}</b></span><span class="axis sync ${syncState}"><i></i><small>同步</small><b>${syncLabel}</b></span></div>`;
 }
 
+function accountQuotaForInstance(item, accounts) {
+    const accountId = String(item?.accountId || '');
+    if (!accountId) return null;
+    return controlArray(accounts).find((account) => String(account?.accountId || '') === accountId) || { accountId };
+}
+
+function instanceQuotaMarkup(item, accounts) {
+    const accountId = String(item?.accountId || '');
+    if (!accountId) {
+        return '<div class="control-instance-quota unavailable"><div><span>账号配额</span><small>设置账号标识后可配置今日上限</small></div></div>';
+    }
+    const quota = accountQuotaForInstance(item, accounts) || {};
+    const used = Math.max(0, Number(quota.used ?? quota.count ?? 0) || 0);
+    const rawLimit = Number(quota.limit ?? quota.dailyLimit ?? 90);
+    const limit = Number.isInteger(rawLimit)
+        ? Math.min(ACCOUNT_DAILY_LIMIT_MAX, Math.max(ACCOUNT_DAILY_LIMIT_MIN, rawLimit))
+        : 90;
+    const remaining = Math.max(0, limit - used);
+    const reached = used >= limit;
+    return `<div class="control-instance-quota${reached ? ' reached' : ''}" data-account-quota="${escapeHtml(accountId)}"><div class="control-instance-quota-summary"><span>账号配额</span><strong>${used}<small> / ${limit}</small></strong><em>${reached ? '今日已达上限' : `今日剩余 ${remaining}`}</em></div><div class="control-instance-quota-editor"><label><span>今日上限</span><input type="number" min="${ACCOUNT_DAILY_LIMIT_MIN}" max="${ACCOUNT_DAILY_LIMIT_MAX}" step="1" inputmode="numeric" value="${limit}" data-account-limit="${escapeHtml(accountId)}" aria-label="${escapeHtml(accountId)} 今日投递上限"></label><button type="button" data-control-action="save_account_limit" data-command-value="${escapeHtml(accountId)}">保存</button></div></div>`;
+}
+
 function normalizedControlState() {
     const data = state.control || {};
     const runtime = state.runtime || {};
@@ -1612,7 +1639,7 @@ function decisionMarkup(decision) {
     return `<div class="instance-decision"><div class="instance-decision-head"><span class="decision-company">${escapeHtml(decision.company || '公司未识别')}</span><span class="decision-verdict">${escapeHtml(verdict)}</span></div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div>`;
 }
 
-function renderControlInstances(instances) {
+function renderControlInstances(instances, accounts) {
     const container = $('#controlInstanceList'); container.replaceChildren();
     const online = instances.filter((item) => item.online !== false).length;
     $('#controlInstanceSummary').textContent = instances.length ? `${online} 个在线 / ${instances.length} 个实例` : '等待脚本接入';
@@ -1624,13 +1651,19 @@ function renderControlInstances(instances) {
         const syncState = syncStateOf(item);
         const request = state.lifecycleRequests[lifecycleRequestKey('worker', workerId)];
         const feedback = request?.pending
-            ? `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}”指令…`
+            ? request.submitted
+                ? `“${DESIRED_STATE_LABELS[request.desiredState]}”指令已提交，等待浏览器接收…`
+                : `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}”指令…`
             : request?.failed
                 ? `操作失败：${escapeHtml(request.message || '请求未完成')}，可直接重试`
+                : request?.timedOut
+                    ? '指令已保存，浏览器暂未回执'
+                    : request?.delivered && syncState === 'applying'
+                        ? `浏览器已接收“${DESIRED_STATE_LABELS[request.desiredState]}”指令，正在应用…`
                 : `期望状态：${DESIRED_STATE_LABELS[desiredState]} · ${SYNC_STATE_LABELS[syncState]}${item.revision ? ` · r${Number(item.revision)}` : ''}`;
         const card = document.createElement('div');
         card.className = `control-instance-card ${item.online !== false ? 'online' : 'offline'} sync-${syncState}`;
-        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span><span>操作编号<b>${escapeHtml(item.operationId || '—')}</b></span></div><div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
+        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span><span>操作编号<b>${escapeHtml(item.operationId || '—')}</b></span></div>${instanceQuotaMarkup(item, accounts)}<div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
         container.appendChild(card);
     });
 }
@@ -1651,9 +1684,13 @@ function renderGlobalLifecycle(instances) {
             : '全局期望：实例状态不一致';
     const syncedCount = syncStates.filter((value) => value === 'synced').length;
     $('#globalControlFeedback').textContent = request?.pending
-        ? `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令…`
+        ? request.submitted
+            ? `“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令已提交，等待浏览器接收…`
+            : `正在提交“${DESIRED_STATE_LABELS[request.desiredState]}全部”指令…`
         : request?.failed
             ? `操作失败：${request.message || '请求未完成'}，可直接重试`
+            : request?.timedOut
+                ? '指令已保存，部分浏览器暂未回执'
             : instances.length
                 ? `${syncedCount} / ${instances.length} 个实例已同步${aggregateSync === 'failed' ? '，存在失败实例' : ''}`
                 : '操作会应用到当前已登记的全部实例';
@@ -1666,29 +1703,68 @@ function renderGlobalLifecycle(instances) {
     });
 }
 
-function renderAccountQuotas(accounts) {
-    $('#accountQuotaBody').innerHTML = accounts.length ? accounts.map((item) => { const used = Number(item.used ?? item.count ?? 0), limit = Number(item.limit ?? item.dailyLimit ?? 0); return `<tr><td><strong>${escapeHtml(item.alias || item.accountId || '未命名账号')}</strong><small>${escapeHtml(item.workerId || '')}</small></td><td>${used} / ${limit || '∞'}</td><td><input type="number" min="0" value="${limit}" data-account-limit="${escapeHtml(item.accountId || '')}"></td><td><span class="control-status ok">监控中</span></td><td><button data-control-action="save_account_limit" data-command-value="${escapeHtml(item.accountId || '')}">保存上限</button></td></tr>`; }).join('') : '<tr><td colspan="5"><div class="control-empty">暂无账号配额数据</div></td></tr>';
-}
-
 function renderControlCenter() {
     const data = normalizedControlState();
-    renderGlobalLifecycle(data.instances); renderControlInstances(data.instances); renderAccountQuotas(data.accounts); renderControlMonitorCounts();
+    renderGlobalLifecycle(data.instances); renderControlInstances(data.instances, data.accounts); renderControlMonitorCounts();
     renderDailyGoal();
 }
 
 async function loadControlState() {
+    if (controlStateLoadPromise) return controlStateLoadPromise;
+    controlStateLoadPromise = (async () => {
+        try {
+            const data = await apiJson('/api/control/state'); state.control = data; state.controlOnline = true;
+            $('.control-sync').className = 'control-sync connected'; $('#controlSyncText').textContent = '控制服务已连接'; $('#controlUpdatedAt').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+        } catch (_) {
+            state.controlOnline = false; $('.control-sync').className = 'control-sync disconnected'; $('#controlSyncText').textContent = '控制接口暂不可用'; $('#controlUpdatedAt').textContent = '监控数据仍会继续显示';
+        }
+        renderControlCenter();
+        return state.control;
+    })();
     try {
-        const data = await apiJson('/api/control/state'); state.control = data; state.controlOnline = true;
-        $('.control-sync').className = 'control-sync connected'; $('#controlSyncText').textContent = '控制服务已连接'; $('#controlUpdatedAt').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
-    } catch (_) {
-        state.controlOnline = false; $('.control-sync').className = 'control-sync disconnected'; $('#controlSyncText').textContent = '控制接口暂不可用'; $('#controlUpdatedAt').textContent = '监控数据仍会继续显示';
+        return await controlStateLoadPromise;
+    } finally {
+        controlStateLoadPromise = null;
     }
-    renderControlCenter();
 }
 
 async function updateControlResource(url, payload, successMessage) {
     try { const result = await apiJson(url, { method: 'PUT', body: JSON.stringify(payload) }); showToast(successMessage); await loadControlState(); return result; }
     catch (error) { showToast(`保存失败：${error.message}`); return null; }
+}
+
+function lifecycleDeliveryObservation(scope, workerId, operation) {
+    const targetCount = Math.max(0, Number(operation?.targetCount || 0));
+    if (targetCount === 0) return { status: 'delivered', offline: true };
+    const operationId = String(operation?.operationId || '');
+    const revision = Number(operation?.revision || 0);
+    const instances = normalizedControlState().instances;
+    const targets = scope === 'global'
+        ? instances.filter((item) => item.operationId === operationId && Number(item.revision || 0) === revision)
+        : instances.filter((item) => (item.workerId || item.id || '') === workerId
+            && item.operationId === operationId
+            && Number(item.revision || 0) === revision);
+    if (targets.length < targetCount) return { status: 'waiting' };
+    if (targets.some((item) => syncStateOf(item) === 'failed')) {
+        return { status: 'failed', message: '浏览器应用指令失败' };
+    }
+    const waitingOnline = targets.some((item) => item.online !== false && syncStateOf(item) === 'pending');
+    if (waitingOnline) return { status: 'waiting' };
+    return {
+        status: 'delivered',
+        offline: targets.every((item) => item.online === false),
+    };
+}
+
+async function reconcileLifecycleDelivery(scope, workerId, operation) {
+    const deadline = Date.now() + CONTROL_DELIVERY_TIMEOUT_MS;
+    do {
+        await loadControlState();
+        const observation = lifecycleDeliveryObservation(scope, workerId, operation);
+        if (observation.status !== 'waiting') return observation;
+        await new Promise((resolve) => setTimeout(resolve, CONTROL_DELIVERY_POLL_INTERVAL_MS));
+    } while (Date.now() < deadline);
+    return { status: 'timeout' };
 }
 
 async function setDesiredLifecycleState(scope, workerId, desiredState) {
@@ -1705,10 +1781,38 @@ async function setDesiredLifecycleState(scope, workerId, desiredState) {
         : `/api/control/desired-state/workers/${encodeURIComponent(workerId)}`;
     try {
         const result = await apiJson(url, { method: 'PUT', body: JSON.stringify({ desiredState }) });
-        state.lifecycleRequests[key] = { pending: false, failed: false, desiredState, operationId: result.operationId || '', revision: Number(result.revision || 0) };
+        state.lifecycleRequests[key] = {
+            pending: true,
+            submitted: true,
+            failed: false,
+            desiredState,
+            operationId: result.operationId || '',
+            revision: Number(result.revision || 0),
+        };
         renderControlCenter();
-        showToast(`${scope === 'global' ? '全部实例' : '实例'}“${DESIRED_STATE_LABELS[desiredState]}”指令已提交`);
-        await loadControlState();
+        showToast(`${scope === 'global' ? '全部实例' : '实例'}指令已提交，等待浏览器接收`);
+        const delivery = await reconcileLifecycleDelivery(scope, workerId, result);
+        const current = state.lifecycleRequests[key];
+        if (!current || current.operationId !== result.operationId) return result;
+        if (delivery.status === 'failed') {
+            state.lifecycleRequests[key] = { ...current, pending: false, failed: true, message: delivery.message };
+            showToast(`控制失败：${delivery.message}`);
+        } else {
+            state.lifecycleRequests[key] = {
+                ...current,
+                pending: false,
+                failed: false,
+                delivered: delivery.status === 'delivered',
+                timedOut: delivery.status === 'timeout',
+            };
+            const message = delivery.status === 'timeout'
+                ? '指令已保存，浏览器暂未回执'
+                : delivery.offline
+                    ? '离线实例期望状态已保存'
+                    : `${scope === 'global' ? '浏览器实例' : '浏览器'}已接收“${DESIRED_STATE_LABELS[desiredState]}”指令`;
+            showToast(message);
+        }
+        renderControlCenter();
         return result;
     } catch (error) {
         state.lifecycleRequests[key] = { pending: false, failed: true, desiredState, message: error.message };
@@ -1854,7 +1958,7 @@ async function apiJson(url, options = {}) {
 const CONFIG_LABELS = {
     llm_greeting_enabled: '使用 LLM 生成打招呼语', scoring_enabled: '启用岗位扣星规则', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', job_score_delay_base_ms: '评分基础延迟（ms）', job_score_delay_jitter_ms: '评分随机延迟（ms）', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
-    frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', manualFilterWaitMs: '手动筛选等待（ms）', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
+    frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
     antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）',
     hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveMinLevel: 'HR 最低活跃档位',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
@@ -2513,8 +2617,37 @@ function bindEvents() {
         const action = button.dataset.controlAction; let payload = {};
         if (button.dataset.commandValue !== undefined) payload.value = button.dataset.commandValue;
         if (action === 'refresh_instances' || action === 'test_database') { loadControlState(); return; }
-        if (action === 'save_account_limit') { const accountId = button.dataset.commandValue || ''; const input = $(`[data-account-limit="${CSS.escape(accountId)}"]`); updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit: Number(input?.value || 0) }, '账号配额已保存'); return; }
+        if (action === 'save_account_limit') {
+            const accountId = button.dataset.commandValue || '';
+            const input = button.closest('.control-instance-card')?.querySelector('[data-account-limit]');
+            const rawLimit = String(input?.value ?? '').trim();
+            const dailyLimit = Number(rawLimit);
+            if (!accountId || !rawLimit || !Number.isInteger(dailyLimit) || dailyLimit < ACCOUNT_DAILY_LIMIT_MIN || dailyLimit > ACCOUNT_DAILY_LIMIT_MAX) {
+                input?.setCustomValidity(`请输入 ${ACCOUNT_DAILY_LIMIT_MIN} 到 ${ACCOUNT_DAILY_LIMIT_MAX} 之间的整数`);
+                input?.reportValidity();
+                showToast(`账号上限必须是 ${ACCOUNT_DAILY_LIMIT_MIN} 到 ${ACCOUNT_DAILY_LIMIT_MAX} 之间的整数`);
+                return;
+            }
+            input.setCustomValidity('');
+            button.disabled = true;
+            button.setAttribute('aria-busy', 'true');
+            await updateControlResource(`/api/control/accounts/${encodeURIComponent(accountId)}`, { dailyLimit }, '账号配额已保存');
+            if (button.isConnected) {
+                button.disabled = false;
+                button.removeAttribute('aria-busy');
+            }
+            return;
+        }
         if (action === 'refresh_instances') { loadControlState(); return; }
+    });
+    $('#controlSection').addEventListener('input', (event) => {
+        const input = event.target.closest('[data-account-limit]');
+        if (!input) return;
+        input.setCustomValidity('');
+        const accountId = input.dataset.accountLimit || '';
+        $$('[data-account-limit]').forEach((peer) => {
+            if (peer !== input && peer.dataset.accountLimit === accountId) peer.value = input.value;
+        });
     });
     $('#liveLogAccountFilter').addEventListener('change', (event) => { state.logAccount = event.target.value; renderLiveLogs(); });
     $('#liveLogSenderFilter').addEventListener('change', (event) => { state.logSender = event.target.value; renderLiveLogs(); });

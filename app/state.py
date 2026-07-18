@@ -12,7 +12,7 @@ from starlette.requests import Request
 
 from app import paths
 from app.config import Config
-from app.runtime import RUNTIME_MONITOR
+from app.runtime import ACCOUNT_DAILY_LIMIT_MAX, ACCOUNT_DAILY_LIMIT_MIN, RUNTIME_MONITOR
 from app.security import is_lan_client_host
 from app.storage.delivery_store import DeliveryStore
 from app.storage.io import append_jsonl
@@ -40,11 +40,14 @@ class ApplicationState:
         with self._startup_lock:
             Config.reload()
             database_path = self.root / Config.backend.get('delivery_db_path', 'delivery_state.db')
-            daily_limit = Config.backend.get('daily_greet_limit', 90)
+            daily_limit = min(
+                ACCOUNT_DAILY_LIMIT_MAX,
+                max(1, int(Config.backend.get('daily_greet_limit', 90))),
+            )
             if self._delivery_store is None or self._delivery_store.db_path != database_path:
                 self._delivery_store = DeliveryStore(database_path, daily_limit=daily_limit)
             else:
-                self._delivery_store.daily_limit = max(1, int(daily_limit))
+                self._delivery_store.daily_limit = daily_limit
 
             imported = self._delivery_store.import_legacy_once(
                 self.greeted_log_path,
@@ -121,9 +124,12 @@ class ApplicationState:
         """Combine persisted usage with the control center's account override."""
         quota = self.delivery_store.quota_status(account_id)
         policy = RUNTIME_MONITOR.effective_control('', account_id).get('account') or {}
-        # 显式区分“未配置”（用默认上限）与“配置为 0”（冻结该账号），避免 0 被 or 当作缺省丢弃。
         raw_limit = policy.get('dailyLimit')
         configured_limit = int(raw_limit) if raw_limit is not None else quota['limit']
+        configured_limit = min(
+            ACCOUNT_DAILY_LIMIT_MAX,
+            max(ACCOUNT_DAILY_LIMIT_MIN, configured_limit),
+        )
         quota['limit'] = configured_limit
         quota['remaining'] = max(0, configured_limit - quota['count'])
         quota['reached'] = quota['count'] >= configured_limit

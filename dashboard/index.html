@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260717-control-center">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260718-fast-control-1">
 </head>
 <body>
     <div class="app-shell">
@@ -154,10 +154,6 @@
                         </div>
                     </article>
 
-                    <article class="control-card control-span-12">
-                        <div class="control-card-head"><div><span>账号配额</span><small>按账号查看使用量并设置今日上限</small></div></div>
-                        <div class="control-table-wrap"><table class="control-table"><thead><tr><th>账号</th><th>使用量</th><th>今日上限</th><th>状态</th><th>操作</th></tr></thead><tbody id="accountQuotaBody"></tbody></table></div>
-                    </article>
                 </div>
             </section>
 
@@ -429,6 +425,6 @@
     </div>
 
     <div class="toast" id="toast" role="status"></div>
-    <script src="/dashboard/app.js?v=20260717-control-center" defer></script>
+    <script src="/dashboard/app.js?v=20260718-fast-control-1" defer></script>
 </body>
 </html>

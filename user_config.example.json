@@ -26,7 +26,6 @@
     "thread": 50,
     "timestampTimeout": 3000,
     "onlyGreet": false,
-    "manualFilterWaitMs": 10000,
     "roundRestartDelayMs": 2000,
     "maxEmptyRounds": 3,
     "detailTimeout": 10000,

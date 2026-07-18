@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-17-remote-control.2
+// @version      2026-07-17-remote-control.4
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-17-remote-control.2';
+    const SCRIPT_VERSION = '2026-07-17-remote-control.4';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
@@ -211,7 +211,6 @@
         thread: 50, // 分数阈值，低于这个就不发消息了
         timestampTimeout: 3000, // 时间戳过期时间，单位毫秒，根据当前网络设定，建议不要太大。
         onlyGreet: true, // 是否只打招呼，默认为false，即打招呼和代聊天
-        manualFilterWaitMs: 10000, // 每轮搜索后留给用户手动筛选的时间
         roundRestartDelayMs: 2000, // 本轮结束后，启动下一轮前的缓冲时间
         maxEmptyRounds: 3, // 连续多少轮没有拿到新岗位后停止，避免空转
         detailTimeout: 10000, // 获取职位详情超时时间
@@ -1258,6 +1257,25 @@
             return this.__http('/check-greet', 'POST', JSON.stringify({ company, title }));
         }
 
+        pollDesiredControl(identity, cursor = null) {
+            const query = [
+                `protocolVersion=${encodeURIComponent(CONTROL_PROTOCOL_VERSION)}`,
+                `sessionId=${encodeURIComponent(identity.sessionId)}`,
+                `sessionEpoch=${encodeURIComponent(identity.sessionEpoch)}`,
+                'timeoutMs=20000',
+            ];
+            if (cursor?.epoch != null && cursor?.revision != null) {
+                query.push(`afterEpoch=${encodeURIComponent(cursor.epoch)}`);
+                query.push(`afterRevision=${encodeURIComponent(cursor.revision)}`);
+            }
+            return this.__http(
+                `/api/control/workers/${encodeURIComponent(identity.workerId)}/desired-state?${query.join('&')}`,
+                'GET',
+                null,
+                { allowDuringStop: true, timeout: 23000 }
+            );
+        }
+
         heartbeat(payload) {
             return new Promise((resolve) => {
                 let settled = false;
@@ -1446,8 +1464,13 @@
             this.transitionGeneration = 0;
             this.transitionController = null;
             this.heartbeatBusy = false;
-            this.lastHeartbeatOkAt = 0;
+            this.heartbeatRequested = false;
+            this.lastHeartbeatOkAt = Date.now();
             this.timer = null;
+            this.controlPollBusy = false;
+            this.controlPolling = false;
+            this.controlPollCursor = null;
+            this.controlPollPromise = null;
         }
 
         attachRunner(runner) {
@@ -1475,10 +1498,28 @@
             return true;
         }
 
+        reportExecutionFailure(error, generation = null) {
+            if (!this.isTransitionCurrent(generation)) return false;
+            const message = String(error?.message || error || '自动化执行失败').slice(0, 500);
+            this.setExecutionState('error', generation);
+            if (this.controlAck) {
+                this.controlAck = {
+                    ...this.controlAck,
+                    status: 'failed',
+                    executionState: 'error',
+                    message,
+                    acknowledgedAt: new Date().toISOString(),
+                };
+            }
+            this.requestHeartbeat();
+            return true;
+        }
+
         start() {
             this.statusIndicator.update('connecting', this.executionState);
             this.pulse();
             this.timer = window.setInterval(() => this.pulse(), 5000);
+            this.startControlPolling();
             const pulse = () => this.pulse();
             window.addEventListener('focus', pulse);
             window.addEventListener('online', pulse);
@@ -1531,19 +1572,14 @@
                 this.lastHeartbeatOkAt = Date.now();
                 if (result.heartbeatAccepted === false) {
                     this.connectionState = 'standby';
+                    this.controlPolling = false;
                     this.requestSafetyPause('stale_session');
                     this.statusIndicator.update(this.connectionState, this.executionState);
                     return;
                 }
                 this.connectionState = 'connected';
                 this.statusIndicator.update(this.connectionState, this.executionState);
-                if (result.control?.desiredState === 'stopped') {
-                    writeChildExecutionPermission('stopped');
-                } else if (result.control?.desiredState === 'running'
-                    && ['starting', 'running'].includes(this.executionState)) {
-                    writeChildExecutionPermission('running');
-                }
-                if (result.control) this.applyControl(result.control);
+                if (result.control) this.receiveControl(result.control);
             } catch (error) {
                 this.logs.unshift(...logs);
                 this.connectionState = 'disconnected';
@@ -1552,7 +1588,89 @@
             } finally {
                 if (this.logs.length > 200) this.logs.splice(200);
                 this.heartbeatBusy = false;
+                if (this.heartbeatRequested) {
+                    this.heartbeatRequested = false;
+                    queueMicrotask(() => this.pulse());
+                }
             }
+        }
+
+        requestHeartbeat() {
+            if (this.heartbeatBusy) {
+                this.heartbeatRequested = true;
+                return;
+            }
+            this.pulse();
+        }
+
+        startControlPolling() {
+            if (this.controlPolling) return;
+            this.controlPolling = true;
+            this.controlPollPromise = (async () => {
+                while (this.controlPolling) {
+                    const retryDelay = await this.pollControl();
+                    if (retryDelay > 0) {
+                        await new Promise((resolve) => window.setTimeout(resolve, retryDelay));
+                    }
+                }
+            })().catch((error) => {
+                this.controlPolling = false;
+                console.warn('[goodJobs] 控制长轮询意外结束', error);
+            });
+        }
+
+        async pollControl() {
+            if (this.controlPollBusy) return 0;
+            this.controlPollBusy = true;
+            try {
+                const result = await this.api.pollDesiredControl({
+                    workerId: this.identity.workerId,
+                    sessionId: this.sessionId,
+                    sessionEpoch: this.sessionEpoch,
+                }, this.controlPollCursor);
+                this.lastHeartbeatOkAt = Date.now();
+                this.connectionState = 'connected';
+                this.statusIndicator.update(this.connectionState, this.executionState);
+                if (result?.control) this.receiveControl(result.control);
+                return 0;
+            } catch (error) {
+                const status = Number(error?.status || 0);
+                if (status === 404) {
+                    this.lastHeartbeatOkAt = Date.now();
+                    this.connectionState = 'connecting';
+                    this.controlPollCursor = null;
+                } else if (status === 409) {
+                    this.lastHeartbeatOkAt = Date.now();
+                    this.connectionState = 'standby';
+                    this.controlPolling = false;
+                    this.requestSafetyPause('stale_session');
+                } else {
+                    this.connectionState = [401, 426, 503].includes(status) ? 'auth' : 'disconnected';
+                    if (Date.now() - this.lastHeartbeatOkAt >= 30000) {
+                        this.requestSafetyPause('backend_disconnected');
+                    }
+                }
+                this.statusIndicator.update(this.connectionState, this.executionState);
+                if (status === 409) return 0;
+                return [401, 426, 503].includes(status) ? 1000 : 250;
+            } finally {
+                this.controlPollBusy = false;
+            }
+        }
+
+        receiveControl(control) {
+            if (!['running', 'paused', 'stopped'].includes(control?.desiredState)) return;
+            this.controlPollCursor = {
+                epoch: control.epoch,
+                revision: Number(control.revision || 0),
+            };
+            if (control.desiredState === 'stopped') {
+                writeChildExecutionPermission('stopped');
+            } else if (control.desiredState === 'running'
+                && ['starting', 'running'].includes(this.executionState)) {
+                writeChildExecutionPermission('running');
+            }
+            this.applyControl(control);
         }
 
         sameControl(left, right) {
@@ -1595,6 +1713,7 @@
                     message: '',
                     acknowledgedAt: new Date().toISOString(),
                 };
+                this.requestHeartbeat();
             }
 
             Promise.resolve().then(() => {
@@ -1630,6 +1749,7 @@
                         message: failed ? String(result.message || '无法应用控制状态').slice(0, 500) : '',
                         acknowledgedAt: new Date().toISOString(),
                     };
+                    this.requestHeartbeat();
                 })
                 .catch((error) => {
                     if (!this.isTransitionCurrent(generation)) return;
@@ -1648,12 +1768,12 @@
                         message: String(error?.message || error).slice(0, 500),
                         acknowledgedAt: new Date().toISOString(),
                     };
+                    this.requestHeartbeat();
                 })
                 .finally(() => {
                     if (!this.isTransitionCurrent(generation)) return;
                     this.pendingControl = null;
                     this.transitionController = null;
-                    this.pulse();
                     const queued = this.queuedControl;
                     this.queuedControl = null;
                     if (queued) this.applyControl(queued);
@@ -1688,7 +1808,7 @@
                     message: '',
                     acknowledgedAt: new Date().toISOString(),
                 };
-                this.pulse();
+                this.requestHeartbeat();
                 return;
             }
             this.startTransition(control);
@@ -1915,7 +2035,7 @@
                 updateTransitionState('starting', transition);
                 if (!started) {
                     if (!initializationPromise) {
-                        initializationPromise = main().catch(async (error) => {
+                        initializationPromise = main(transition).catch(async (error) => {
                             if (!isStopError(error)) {
                                 logger.add(`初始化失败: ${error}`, { sender: 'system', verbosity: 'concise', level: 'error' });
                                 await teardownExecutor('initialization_failed');
@@ -1932,16 +2052,18 @@
                         return { state: 'paused', applied: false, failed: true, message: runtime.phase };
                     }
                     updateTransitionState('running', transition);
+                    scheduleStartRound(transition);
                     return 'running';
                 }
-                if (pendingRoundRestart) {
+                const shouldRestartRound = pendingRoundRestart;
+                if (shouldRestartRound) {
                     pendingRoundRestart = false;
-                    await startRound();
                 } else {
                     loop();
                 }
                 if (!transitionIsCurrent(transition)) return { state: runtime.state, applied: false };
                 updateTransitionState('running', transition);
+                if (shouldRestartRound) scheduleStartRound(transition);
                 return 'running';
             };
 
@@ -2971,8 +3093,7 @@
                     window.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
                     await tools.asyncSleep(600);
                     await search(keyword);
-                    logger.add(`第 ${currentRound} 轮已完成搜索（关键词：${keyword}），请在 ${(OPTIONS.manualFilterWaitMs / 1000).toFixed(0)} 秒内手动选择地区、薪资等筛选条件`, { sender: 'queue', verbosity: 'concise' });
-                    await tools.asyncSleep(OPTIONS.manualFilterWaitMs);
+                    logger.add(`第 ${currentRound} 轮已完成搜索（关键词：${keyword}），开始预加载岗位`, { sender: 'queue', verbosity: 'concise' });
                     await preloadJobs();
                     runtimeLifecycle.guard();
                     // 预加载完成后，先提取一批岗位链接再进入循环
@@ -2989,8 +3110,41 @@
                 }
             };
 
+            const scheduleStartRound = (transition = {}) => {
+                let cancelled = false;
+                let removeCleanup = () => void 0;
+                const cancel = () => {
+                    cancelled = true;
+                    transition.signal?.removeEventListener('abort', cancel);
+                    removeCleanup();
+                };
+                queueMicrotask(() => {
+                    queueMicrotask(() => {
+                        transition.signal?.removeEventListener('abort', cancel);
+                        removeCleanup();
+                        if (cancelled || !transitionIsCurrent(transition) || control.stopped || this.pause) {
+                            if (!control.stopped) pendingRoundRestart = true;
+                            return;
+                        }
+                        startRound().catch(async (error) => {
+                            if (isStopError(error) || control.stopped || !transitionIsCurrent(transition)) return;
+                            runtime.state = 'error';
+                            runtime.phase = '启动首轮任务失败';
+                            runtime.lastError = String(error?.message || error);
+                            logger.add(`启动首轮任务失败: ${error}`, {
+                                sender: 'system', verbosity: 'concise', level: 'error',
+                            });
+                            await teardownExecutor('initialization_failed');
+                            this.controlAgent?.reportExecutionFailure(error, transition.generation);
+                        });
+                    });
+                });
+                transition.signal?.addEventListener('abort', cancel, { once: true });
+                removeCleanup = runtimeLifecycle.addCleanup(cancel);
+            };
+
             // 主函数
-            const main = async () => {
+            const main = async (transition = {}) => {
                 runtime.state = 'running';
                 runtime.phase = '初始化脚本';
                 logger.add('--程序启动--', { sender: 'system', verbosity: 'concise' });
@@ -3042,7 +3196,6 @@
                     if (isStopError(e)) throw e;
                     logger.add('每日限制检查失败', { sender: 'claim', verbosity: 'concise', level: 'error' });
                 }
-                await startRound();
                 started = true;
             };
 

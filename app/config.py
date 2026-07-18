@@ -61,7 +61,6 @@ DEFAULT_USER_CONFIG = {
         'thread': 50,
         'timestampTimeout': 3000,
         'onlyGreet': False,
-        'manualFilterWaitMs': 10000,
         'roundRestartDelayMs': 2000,
         'maxEmptyRounds': 3,
         'detailTimeout': 10000,
@@ -242,6 +241,9 @@ def load_user_config() -> dict:
         return config
 
     user_config.pop('resume_content', None)
+    if isinstance(user_config.get('frontend'), dict):
+        # Removed in remote-control.3: searching now enters preload immediately.
+        user_config['frontend'].pop('manualFilterWaitMs', None)
     if isinstance(user_config.get('scoring'), dict):
         user_config['scoring'] = _unify_scoring_rules(
             user_config['scoring'],

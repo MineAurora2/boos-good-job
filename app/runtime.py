@@ -52,6 +52,8 @@ EXECUTION_STATES = frozenset({
 })
 CONTROL_ACK_STATUSES = frozenset({'applying', 'applied', 'failed'})
 CONTROL_PROTOCOL_VERSION = 1
+ACCOUNT_DAILY_LIMIT_MIN = 0
+ACCOUNT_DAILY_LIMIT_MAX = 150
 
 
 class RuntimeMonitor:
@@ -149,7 +151,22 @@ class RuntimeMonitor:
         if isinstance(data.get('plan'), dict):
             self._plan.update({key: value for key, value in data['plan'].items() if key in DEFAULT_PLAN})
         if isinstance(data.get('accounts'), dict):
-            self._account_policies = data['accounts']
+            for raw_account_id, raw_policy in data['accounts'].items():
+                account_id = self._clean_text(raw_account_id, 120)
+                if not account_id or not isinstance(raw_policy, dict):
+                    continue
+                policy = deepcopy(raw_policy)
+                if 'dailyLimit' in policy:
+                    try:
+                        daily_limit = int(policy['dailyLimit'])
+                    except (TypeError, ValueError):
+                        policy.pop('dailyLimit', None)
+                    else:
+                        policy['dailyLimit'] = min(
+                            ACCOUNT_DAILY_LIMIT_MAX,
+                            max(ACCOUNT_DAILY_LIMIT_MIN, daily_limit),
+                        )
+                self._account_policies[account_id] = policy
         control_epoch = self._clean_text(data.get('controlEpoch'), 160)
         if control_epoch:
             self._control_epoch = control_epoch
@@ -490,6 +507,55 @@ class RuntimeMonitor:
             'desiredState': worker['desiredState'],
         }
 
+    def desired_control(
+        self,
+        worker_id: str,
+        *,
+        protocol_version: int,
+        session_id: str,
+        session_epoch: int,
+        after_epoch: str | None = None,
+        after_revision: int | None = None,
+        timeout_seconds: float = 0,
+    ) -> dict:
+        """Return or briefly wait for one session's control target without mutating state."""
+        worker_id = self._clean_text(worker_id, 160)
+        protocol_version = self._integer_field(protocol_version, 'protocol_version')
+        session_id = self._clean_text(session_id, 160)
+        session_epoch = self._integer_field(session_epoch, 'session_epoch')
+        after_epoch = self._clean_text(after_epoch, 160) if after_epoch is not None else None
+        if after_revision is not None:
+            after_revision = self._integer_field(after_revision, 'after_revision')
+        try:
+            timeout_seconds = max(0.0, min(float(timeout_seconds), 20.0))
+        except (TypeError, ValueError) as error:
+            raise ValueError('invalid_timeout_seconds') from error
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while True:
+                if not worker_id or worker_id not in self._workers:
+                    raise KeyError('worker_not_found')
+                worker = self._workers[worker_id]
+                if (
+                    protocol_version < CONTROL_PROTOCOL_VERSION
+                    or protocol_version != int(worker.get('protocolVersion') or 0)
+                    or not session_id
+                    or session_id != worker.get('sessionId')
+                    or session_epoch != int(worker.get('sessionEpoch') or 0)
+                ):
+                    raise ValueError('stale_session')
+                control = self._control_for_worker_locked(worker_id)
+                unchanged = (
+                    after_epoch is not None
+                    and after_revision is not None
+                    and control['epoch'] == after_epoch
+                    and control['revision'] == after_revision
+                )
+                remaining = deadline - time.monotonic()
+                if not unchanged or remaining <= 0:
+                    return deepcopy(control)
+                self._condition.wait(remaining)
+
     @staticmethod
     def _fresh_heartbeat(previous: dict | None, protocol_version: int, session_id: str, session_epoch: int, sequence: int) -> tuple[bool, str]:
         if not previous:
@@ -678,6 +744,7 @@ class RuntimeMonitor:
             if workers_changed:
                 self._persist_state_locked(workers=workers)
                 self._workers = workers
+                self._condition.notify_all()
             self._clients[worker_id] = safe_client
         if not previous:
             self.publish('client_connected', {key: value for key, value in safe_client.items() if not key.startswith('_')})
@@ -828,7 +895,19 @@ class RuntimeMonitor:
             raise ValueError('invalid_account_policy')
         normalized = {}
         for key, value in patch.items():
-            if key in {'dailyLimit', 'dailyTarget'}:
+            if key == 'dailyLimit':
+                if isinstance(value, bool):
+                    raise ValueError('daily_limit_out_of_range')
+                raw_value = value
+                try:
+                    value = int(value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError('daily_limit_out_of_range') from error
+                if isinstance(raw_value, float) and not raw_value.is_integer():
+                    raise ValueError('daily_limit_out_of_range')
+                if not ACCOUNT_DAILY_LIMIT_MIN <= value <= ACCOUNT_DAILY_LIMIT_MAX:
+                    raise ValueError('daily_limit_out_of_range')
+            elif key == 'dailyTarget':
                 value = max(0, int(value))
             elif key == 'paused':
                 value = bool(value)

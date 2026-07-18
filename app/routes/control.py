@@ -8,13 +8,13 @@ from datetime import datetime
 import json
 import sqlite3
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.requests import Request
 
 from app.state import STATE, require_local_admin
 from app.config import Config
-from app.runtime import RUNTIME_MONITOR
+from app.runtime import ACCOUNT_DAILY_LIMIT_MAX, RUNTIME_MONITOR
 from app.llm.env_store import public_llm_config, save_llm_config
 from app.llm.manager import LLM_MANAGER
 from app.storage.admin_store import (
@@ -168,6 +168,35 @@ def control_state(request: Request):
     return state
 
 
+@router.get('/api/control/workers/{worker_id}/desired-state', summary='Get the latest desired state for one worker')
+def control_worker_desired_state(
+    worker_id: str,
+    response: Response,
+    protocol_version: int = Query(..., alias='protocolVersion', ge=1),
+    session_id: str = Query(..., alias='sessionId', min_length=1, max_length=160),
+    session_epoch: int = Query(..., alias='sessionEpoch', ge=0),
+    after_epoch: str | None = Query(None, alias='afterEpoch', max_length=160),
+    after_revision: int | None = Query(None, alias='afterRevision', ge=0),
+    timeout_ms: int = Query(20_000, alias='timeoutMs', ge=0, le=20_000),
+):
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        control = RUNTIME_MONITOR.desired_control(
+            worker_id,
+            protocol_version=protocol_version,
+            session_id=session_id,
+            session_epoch=session_epoch,
+            after_epoch=after_epoch,
+            after_revision=after_revision,
+            timeout_seconds=timeout_ms / 1000,
+        )
+        return {'control': control}
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='worker_not_found') from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @router.put('/api/control/desired-state/global', status_code=202, summary='更新所有已登记实例的期望状态')
 def control_update_global_desired_state(request: Request, payload: dict = Body(...)):
     require_local_admin(request)
@@ -272,9 +301,9 @@ def control_reload_config(request: Request):
     Config.reload()
     LLM_MANAGER.reload()
     LLM_MANAGER.reset_circuits(clear_cache=True)
-    STATE.delivery_store.daily_limit = max(
-        1,
-        int(Config.backend.get('daily_greet_limit', STATE.delivery_store.daily_limit)),
+    STATE.delivery_store.daily_limit = min(
+        ACCOUNT_DAILY_LIMIT_MAX,
+        max(1, int(Config.backend.get('daily_greet_limit', STATE.delivery_store.daily_limit))),
     )
     RUNTIME_MONITOR.audit('config_reloaded', {})
     RUNTIME_MONITOR.publish('config_updated', {'restartRequired': []})
@@ -322,9 +351,9 @@ def admin_save_config(request: Request, payload: dict = Body(...)):
     try:
         result = save_config(payload)
         LLM_MANAGER.reset_circuits(clear_cache=True)
-        STATE.delivery_store.daily_limit = max(
-            1,
-            int(Config.backend.get('daily_greet_limit', STATE.delivery_store.daily_limit)),
+        STATE.delivery_store.daily_limit = min(
+            ACCOUNT_DAILY_LIMIT_MAX,
+            max(1, int(Config.backend.get('daily_greet_limit', STATE.delivery_store.daily_limit))),
         )
         RUNTIME_MONITOR.publish('config_updated', {'restartRequired': result['restartRequiredFields']})
         return result
