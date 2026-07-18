@@ -441,7 +441,6 @@ function renderMetrics(records) {
     $('#uniqueCompanies').textContent = numberFormat.format(companies.size);
     $('#averageSalary').textContent = average === null ? '—' : average.toFixed(1);
     $('#todayApplications').textContent = today;
-    $('#navRecordCount').textContent = state.records.length > 999 ? '999+' : state.records.length;
     $('#totalDelta').textContent = `当前筛选覆盖 ${new Set(records.map((r) => r.loggedAt?.slice(0, 10))).size} 个日期`;
     $('#companyDelta').textContent = records.length ? `平均每家公司 ${(records.length / Math.max(companies.size, 1)).toFixed(1)} 份` : '暂无公司数据';
     $('#salaryHint').textContent = salaries.length ? `已识别 ${Math.round(salaries.length / Math.max(records.length, 1) * 100)}% 的薪资` : '暂无可识别薪资';
@@ -1117,7 +1116,7 @@ function restoreTablePreferences() {
             state.columnOrder = [...order, ...validKeys.filter((key) => !order.includes(key))];
         }
         if (saved.columnWidths && typeof saved.columnWidths === 'object') state.columnWidths = saved.columnWidths;
-        if (['compact', 'default', 'comfortable'].includes(saved.density)) state.density = saved.density;
+        state.density = 'default';
     } catch (_) { /* 使用默认表格设置 */ }
     $('#applications').dataset.density = state.density;
     $$('#densitySwitch button').forEach((button) => button.classList.toggle('active', button.dataset.density === state.density));
@@ -1636,7 +1635,9 @@ function decisionMarkup(decision) {
     const stateLabel = decision.decisionState || decision.state || (decision.discarded ? '准备丢弃' : '评分完成');
     const verdict = DECISION_STATE_LABELS[stateLabel] || stateLabel;
     const greeting = decision.greetingMode ? `<span class="decision-greeting">${escapeHtml(GREETING_MODE_LABELS[decision.greetingMode] || decision.greetingMode)}</span>` : '';
-    return `<div class="instance-decision"><div class="instance-decision-head"><span class="decision-company">${escapeHtml(decision.company || '公司未识别')}</span><span class="decision-verdict">${escapeHtml(verdict)}</span></div><div class="decision-title">${escapeHtml(decision.title || '岗位未识别')}</div><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div>`;
+    const company = escapeHtml(decision.company || '公司未识别');
+    const title = escapeHtml(decision.title || '岗位未识别');
+    return `<details class="instance-decision"><summary class="instance-decision-summary"><span class="instance-decision-summary-main"><span class="decision-company">${company}</span><span class="decision-title">${title}</span></span><span class="instance-decision-summary-meta"><span class="decision-verdict">${escapeHtml(verdict)}</span><b aria-hidden="true">&#9662;</b></span></summary><div class="instance-decision-body"><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div></details>`;
 }
 
 function renderControlInstances(instances, accounts) {
@@ -1663,7 +1664,7 @@ function renderControlInstances(instances, accounts) {
                 : `期望状态：${DESIRED_STATE_LABELS[desiredState]} · ${SYNC_STATE_LABELS[syncState]}${item.revision ? ` · r${Number(item.revision)}` : ''}`;
         const card = document.createElement('div');
         card.className = `control-instance-card ${item.online !== false ? 'online' : 'offline'} sync-${syncState}`;
-        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>账号标识<b>${escapeHtml(item.accountId || '—')}</b></span><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>今日投递<b>${Number(item.todayDelivered ?? item.counters?.sent ?? 0)}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span><span>操作编号<b>${escapeHtml(item.operationId || '—')}</b></span></div>${instanceQuotaMarkup(item, accounts)}<div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
+        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span></div>${instanceQuotaMarkup(item, accounts)}<div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
         container.appendChild(card);
     });
 }
