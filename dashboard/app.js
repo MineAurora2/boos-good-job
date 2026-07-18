@@ -52,6 +52,7 @@ const state = {
     control: null,
     controlOnline: false,
     lifecycleRequests: {},
+    expandedDecisions: new Set(),
     llm: null,
     llmDirty: false,
     configDirty: false,
@@ -1613,7 +1614,7 @@ function normalizedControlState() {
     };
 }
 
-function decisionMarkup(decision) {
+function decisionMarkup(decision, decisionKey = '', expanded = false) {
     if (!decision || !Object.keys(decision).length) {
         return '<div class="instance-decision empty">暂无正在评分的岗位</div>';
     }
@@ -1637,7 +1638,7 @@ function decisionMarkup(decision) {
     const greeting = decision.greetingMode ? `<span class="decision-greeting">${escapeHtml(GREETING_MODE_LABELS[decision.greetingMode] || decision.greetingMode)}</span>` : '';
     const company = escapeHtml(decision.company || '公司未识别');
     const title = escapeHtml(decision.title || '岗位未识别');
-    return `<details class="instance-decision"><summary class="instance-decision-summary"><span class="instance-decision-summary-main"><span class="decision-company">${company}</span><span class="decision-title">${title}</span></span><span class="instance-decision-summary-meta"><span class="decision-verdict">${escapeHtml(verdict)}</span><b aria-hidden="true">&#9662;</b></span></summary><div class="instance-decision-body"><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div></details>`;
+    return `<details class="instance-decision" data-decision-key="${escapeHtml(decisionKey)}"${expanded ? ' open' : ''}><summary class="instance-decision-summary"><span class="instance-decision-summary-main"><span class="decision-company">${company}</span><span class="decision-title">${title}</span></span><span class="instance-decision-summary-meta"><span class="decision-verdict">${escapeHtml(verdict)}</span><b aria-hidden="true">&#9662;</b></span></summary><div class="instance-decision-body"><div class="decision-stars" aria-label="剩余 ${stars} 星">${controlStars(stars)}</div><div class="decision-hr"><span>HR ${escapeHtml(hrLabel)}</span><em>${hrPassed}</em></div>${aiRow}${greeting}<div class="decision-deductions">${deductionRows}</div><div class="decision-final">最终决策：<b>${escapeHtml(decision.finalPassed === false ? '不投递' : decision.finalPassed === true ? '允许投递' : verdict)}</b>${decision.decisionReason ? `<small>${escapeHtml(decision.decisionReason)}</small>` : ''}</div></div></details>`;
 }
 
 function renderControlInstances(instances, accounts) {
@@ -1647,6 +1648,8 @@ function renderControlInstances(instances, accounts) {
     if (!onlineInstances.length) { container.innerHTML = '<div class="control-empty">暂无在线浏览器实例</div>'; return; }
     onlineInstances.forEach((item) => {
         const workerId = item.workerId || item.id || '';
+        const decisionKey = workerId || item.accountId || item.alias || '';
+        const decisionExpanded = Boolean(decisionKey && state.expandedDecisions?.has(decisionKey));
         const desiredState = desiredStateOf(item);
         const executionState = executionStateOf(item);
         const syncState = syncStateOf(item);
@@ -1664,7 +1667,7 @@ function renderControlInstances(instances, accounts) {
                 : `期望状态：${DESIRED_STATE_LABELS[desiredState]} · ${SYNC_STATE_LABELS[syncState]}${item.revision ? ` · r${Number(item.revision)}` : ''}`;
         const card = document.createElement('div');
         card.className = `control-instance-card ${item.online !== false ? 'online' : 'offline'} sync-${syncState}`;
-        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span></div>${instanceQuotaMarkup(item, accounts)}<div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision)}`;
+        card.innerHTML = `<div class="control-instance-top"><div class="control-instance-name"><i></i><strong>${escapeHtml(item.alias || item.accountId || workerId || '未命名实例')}</strong><small>${escapeHtml(workerId || '未登记标识')}</small></div><span class="control-instance-state ${executionState}">${EXECUTION_STATE_LABELS[executionState]}</span></div>${controlAxesMarkup(item)}<div class="control-instance-detail"><span>当前关键词<b>${escapeHtml(item.keyword || '—')}</b></span><span>当前岗位<b>${escapeHtml(item.currentJob || item.title || '—')}</b></span><span>最后心跳<b>${escapeHtml(controlTime(item.lastSeen || item.lastHeartbeatAt || item.updatedAt).slice(11) || '—')}</b></span></div>${instanceQuotaMarkup(item, accounts)}<div class="control-instance-actions" role="group" aria-label="${escapeHtml(item.alias || item.accountId || workerId || '实例')}生命周期">${lifecycleButtonsMarkup('worker', workerId, desiredState)}</div><div class="control-action-feedback ${request?.failed || syncState === 'failed' ? 'failed' : ''}" aria-live="polite">${feedback}</div>${decisionMarkup(item.currentDecision, decisionKey, decisionExpanded)}`;
         container.appendChild(card);
     });
 }
@@ -2629,6 +2632,17 @@ function bindEvents() {
     });
     $('#refreshControl').addEventListener('click', loadControlState);
     $('#controlSection').addEventListener('click', async (event) => {
+        const decisionSummary = event.target.closest('summary.instance-decision-summary');
+        if (decisionSummary) {
+            const decision = decisionSummary.parentElement;
+            const decisionKey = decision?.dataset.decisionKey || '';
+            if (decisionKey) {
+                if (!state.expandedDecisions) state.expandedDecisions = new Set();
+                if (decision.open) state.expandedDecisions.delete(decisionKey);
+                else state.expandedDecisions.add(decisionKey);
+            }
+            return;
+        }
         const lifecycleButton = event.target.closest('[data-desired-state]');
         if (lifecycleButton) {
             const scope = lifecycleButton.dataset.controlScope || 'worker';

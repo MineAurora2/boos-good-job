@@ -1430,6 +1430,7 @@
             this.logPanel = null;
             this.logList = null;
             this.logToggleButton = null;
+            this.settingsToggleButton = null;
             this.settingsPanel = null;
             this.settingsInputs = null;
             this.settingsError = null;
@@ -1476,6 +1477,7 @@
                 const startButton = this.createButton('▶ 开始', '开始自动化', 'color:#8df0b8;border-color:rgba(83,227,148,.28);background:rgba(83,227,148,.09);');
                 const pauseButton = this.createButton('Ⅱ 暂停', '暂停自动化', 'color:#ffd09b;border-color:rgba(255,173,91,.26);background:rgba(255,173,91,.08);');
                 const logToggleButton = this.createButton('日志', '展开或收起本地日志');
+                const settingsToggleButton = this.createButton('设置', '展开或收起脚本设置');
                 const logPanel = document.createElement('div');
                 const logHead = document.createElement('div');
                 const logTitle = document.createElement('strong');
@@ -1500,8 +1502,7 @@
                 statusRow.dataset.goodjobsStatusRow = '1';
                 statusRow.setAttribute('role', 'status');
                 statusRow.setAttribute('aria-live', 'polite');
-                statusRow.title = '右键打开脚本设置';
-                statusRow.style.cssText = 'display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:10px;min-width:0;cursor:context-menu;';
+                statusRow.style.cssText = 'display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:10px;min-width:0;';
                 image.src = STATUS_ICON_DATA_URL;
                 image.alt = '';
                 image.width = 40;
@@ -1517,7 +1518,10 @@
                 logToggleButton.dataset.goodjobsLogToggle = '1';
                 logToggleButton.setAttribute('aria-expanded', 'false');
                 logToggleButton.setAttribute('aria-controls', 'goodjobs-runtime-log-panel');
-                actions.style.cssText = 'display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;';
+                settingsToggleButton.dataset.goodjobsSettingsToggle = '1';
+                settingsToggleButton.setAttribute('aria-expanded', 'false');
+                settingsToggleButton.setAttribute('aria-controls', 'goodjobs-runtime-settings-panel');
+                actions.style.cssText = 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;';
 
                 logPanel.id = 'goodjobs-runtime-log-panel';
                 logPanel.dataset.goodjobsLogPanel = '1';
@@ -1539,6 +1543,7 @@
                 logList.tabIndex = 0;
                 logList.style.cssText = 'display:grid;gap:4px;max-height:min(220px,35vh);overflow:auto;overscroll-behavior:contain;min-height:0;padding-right:2px;user-select:text;';
 
+                settings.id = 'goodjobs-runtime-settings-panel';
                 settings.dataset.goodjobsSettings = '1';
                 settings.hidden = true;
                 settings.style.cssText = 'display:none;gap:9px;padding-top:9px;border-top:1px solid rgba(111,226,232,.13);';
@@ -1557,6 +1562,7 @@
                 actions.appendChild(startButton);
                 actions.appendChild(pauseButton);
                 actions.appendChild(logToggleButton);
+                actions.appendChild(settingsToggleButton);
                 logHead.appendChild(logTitle);
                 logHead.appendChild(clearLogsButton);
                 logPanel.appendChild(logHead);
@@ -1581,6 +1587,7 @@
                 this.logPanel = logPanel;
                 this.logList = logList;
                 this.logToggleButton = logToggleButton;
+                this.settingsToggleButton = settingsToggleButton;
                 this.settingsPanel = settings;
                 this.settingsInputs = {
                     account: accountField.input,
@@ -1589,14 +1596,10 @@
                 };
                 this.settingsError = settingsError;
 
-                statusRow.addEventListener('contextmenu', (event) => {
-                    event.preventDefault?.();
-                    event.stopPropagation?.();
-                    this.toggleSettings();
-                });
                 startButton.addEventListener('click', () => this.onDesiredState('running'));
                 pauseButton.addEventListener('click', () => this.onDesiredState('paused'));
                 logToggleButton.addEventListener('click', () => this.toggleLogs());
+                settingsToggleButton.addEventListener('click', () => this.toggleSettings());
                 clearLogsButton.addEventListener('click', () => this.clearLogs());
                 closeSettings.addEventListener('click', () => this.closeSettings());
                 cancelSettings.addEventListener('click', () => this.closeSettings());
@@ -1653,6 +1656,7 @@
             }
             this.settingsPanel.hidden = !open;
             this.settingsPanel.style.display = open ? 'grid' : 'none';
+            this.settingsToggleButton?.setAttribute('aria-expanded', String(open));
             this.root.dataset.settingsOpen = String(open);
         }
 
