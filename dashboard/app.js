@@ -80,25 +80,50 @@ const MAP_MAX_SCALE = 20;
 const CITY_DETAIL_ENTER_SCALE = 2.7;
 const CITY_DETAIL_EXIT_SCALE = 2.3;
 
-function dailyTarget() {
-    const quotas = state.control?.quotas;
-    if (quotas && typeof quotas === 'object' && !Array.isArray(quotas)) {
-        const total = Object.values(quotas).reduce((sum, quota) => sum + Number(quota?.limit || 0), 0);
-        if (total > 0) return total;
-    }
+function onlineScriptDailyProgress(fallbackToday = 0) {
+    const control = state.control;
     const backendLimit = Number(state.adminConfig?.backend?.daily_greet_limit);
-    if (Number.isFinite(backendLimit) && backendLimit > 0) return backendLimit;
-    return TODAY_TARGET_FALLBACK;
+    if (!control) {
+        return {
+            used: Math.max(0, Number(fallbackToday) || 0),
+            limit: Number.isFinite(backendLimit) && backendLimit > 0 ? backendLimit : TODAY_TARGET_FALLBACK,
+        };
+    }
+
+    const instances = Array.isArray(control.clients)
+        ? control.clients
+        : (Array.isArray(control.instances) ? control.instances : []);
+    const accountIds = new Set(
+        instances
+            .filter((item) => item?.online !== false)
+            .map((item) => String(item?.accountId || '').trim())
+            .filter(Boolean),
+    );
+    const quotas = control.quotas && typeof control.quotas === 'object' && !Array.isArray(control.quotas)
+        ? control.quotas
+        : {};
+    let used = 0;
+    let limit = 0;
+    accountIds.forEach((accountId) => {
+        const quota = quotas[accountId] || {};
+        const quotaUsed = Number(quota.count ?? quota.used ?? 0);
+        const quotaLimit = Number(quota.limit ?? 0);
+        if (Number.isFinite(quotaUsed)) used += Math.max(0, quotaUsed);
+        if (Number.isFinite(quotaLimit)) limit += Math.max(0, quotaLimit);
+    });
+    return { used, limit };
 }
 
 function renderDailyGoal(today = state.todayDelivered || 0) {
     state.todayDelivered = today;
-    const target = dailyTarget();
-    const goal = Math.min(100, Math.round(today / target * 100));
+    const { used, limit: target } = onlineScriptDailyProgress(today);
+    const goal = target > 0 ? Math.min(100, Math.round(used / target * 100)) : 0;
     $('#todayHint').textContent = `今日目标完成度 ${goal}%`;
-    $('#goalText').textContent = `${today} / ${target}`;
+    $('#goalText').textContent = `${used} / ${target}`;
     $('#goalBar').style.width = `${goal}%`;
-    $('#goalHint').textContent = today >= target ? '今日目标已完成，注意及时复盘' : `还差 ${Math.max(0, target - today)} 份完成今日目标`;
+    $('#goalHint').textContent = target <= 0
+        ? '暂无在线脚本'
+        : (used >= target ? '今日目标已完成，注意及时复盘' : `还差 ${Math.max(0, target - used)} 份完成今日目标`);
 }
 const REPORT_LAYOUT_KEY = 'goodjobs.dashboard.report-layout.v1';
 const TABLE_PREFS_KEY = 'goodjobs.dashboard.table-prefs.v1';

@@ -184,7 +184,7 @@ html[data-theme="light"] .metric-card, html[data-theme="light"] .panel { backgro
 .stream-state { display: flex; align-items: center; gap: 8px; color: #77909c; font-size: 9px; }
 .stream-state span { width: 7px; height: 7px; border-radius: 50%; background: var(--orange); box-shadow: 0 0 10px currentColor; }
 .stream-state.connected span { background: var(--green); }.stream-state.disconnected span { background: var(--red); }
-.monitor-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 10px 0 14px; }
+.monitor-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 10px 0 14px; }
 .monitor-metrics > div { padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.018); }
 .monitor-metrics span, .monitor-metrics small { display: block; }.monitor-metrics span { color: #758e9a; font-size: 9px; }.monitor-metrics strong { display: block; margin: 7px 0 4px; font-size: 22px; }.monitor-metrics small { color: #4e6673; font-size: 8px; }
 .monitor-grid { display: grid; grid-template-columns: .9fr 1.35fr; gap: 12px; }
