@@ -1632,8 +1632,8 @@
                 settingsActions.style.cssText = 'display:grid;grid-template-columns:1fr 1.35fr;gap:7px;';
 
                 copy.appendChild(connection);
-                copy.appendChild(account);
                 copy.appendChild(execution);
+                copy.appendChild(account);
                 statusRow.appendChild(image);
                 statusRow.appendChild(copy);
                 actions.appendChild(logToggleButton);
