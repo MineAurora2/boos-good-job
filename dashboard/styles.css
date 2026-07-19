@@ -855,6 +855,7 @@ html[data-theme="light"] .toast { box-shadow: 0 12px 30px rgba(40,70,84,.16); }
 .control-quota-edit { height: 29px; padding: 0 9px; border: 1px solid rgba(57,215,242,.17); border-radius: 6px; color: var(--cyan); background: rgba(57,215,242,.055); font-size: 8px; }
 .control-quota-edit:hover { border-color: rgba(57,215,242,.34); background: rgba(57,215,242,.1); }
 .control-instance-quota-editor { grid-template-columns: minmax(92px, 1fr) 52px 52px; }
+.control-instance-quota-editor[hidden] { display: none; }
 .control-quota-cancel { color: var(--muted-2) !important; border-color: var(--line) !important; background: transparent !important; }
 @media (max-width: 680px) {
     .control-instance-quota { grid-template-columns: 1fr; align-items: stretch; }
