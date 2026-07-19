@@ -29,8 +29,8 @@ const state = {
     pageSize: 10,
     sort: { key: 'loggedAt', direction: 'desc' },
     selectedIds: new Set(),
-    visibleColumns: new Set(['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'score', 'status']),
-    columnOrder: ['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'score', 'status'],
+    visibleColumns: new Set(['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'status']),
+    columnOrder: ['company', 'salary', 'city', 'industry', 'experience', 'education', 'hrActive', 'loggedAt', 'status'],
     columnWidths: {},
     density: 'default',
     chinaGeo: null,
@@ -1120,7 +1120,6 @@ const TABLE_COLUMNS = {
     education: { label: '学历', width: 90, min: 75, max: 150, sortable: true, value: (record) => record.education || '' },
     hrActive: { label: 'HR 活跃', width: 110, min: 90, max: 180, sortable: true, value: (record) => record.hrActiveLevel || record.hrActive || 'unknown' },
     loggedAt: { label: '投递时间', width: 125, min: 105, max: 200, sortable: true, value: (record) => record.loggedAt || '' },
-    score: { label: '匹配度', width: 105, min: 85, max: 160, sortable: true, value: (record) => Number(record.score ?? -1) },
     status: { label: '状态', width: 95, min: 80, max: 150, sortable: true, value: (record) => record.status || '' },
 };
 
@@ -1141,7 +1140,6 @@ function sortRecords(records) {
 
 function renderTableCell(key, record) {
     const datetime = formatDateTime(record.loggedAt);
-    const score = Number.isFinite(Number(record.score)) ? Number(record.score) : null;
     if (key === 'company') return `<div class="company-cell"><span class="company-avatar" title="${escapeHtml(record.industry || '行业未采集')}">${industryIcon(record.industry)}</span><div><strong title="${escapeHtml(record.company)}">${escapeHtml(record.company)}</strong><span title="${escapeHtml(record.title)}">${escapeHtml(record.title)}</span></div></div>`;
     if (key === 'salary') return `<span class="salary-value">${escapeHtml(record.salary)}</span>`;
     if (key === 'city') return `<span class="cell-value" title="${escapeHtml(record.city || record.location || '待补充')}">${escapeHtml(record.city || record.location || '待补充')}</span>`;
@@ -1153,7 +1151,6 @@ function renderTableCell(key, record) {
         return `<span class="hr-active-badge hr-${escapeHtml(level)}" title="${escapeHtml(record.hrActive || HR_ACTIVE_LABELS[level] || '未知')}">${escapeHtml(record.hrActive || HR_ACTIVE_LABELS[level] || '未知')}</span>`;
     }
     if (key === 'loggedAt') return `<div class="date-cell"><span>${datetime.date}</span><small>${datetime.time}</small></div>`;
-    if (key === 'score') return score === null ? '<span class="cell-muted">—</span>' : `<span class="score-pill"><i><span style="width:${Math.min(100, score)}%"></span></i>${score}</span>`;
     if (key === 'status') return `<span class="status-pill status-${escapeHtml(record.status)}">${STATUS_LABELS[record.status] || '进行中'}</span>`;
     return '';
 }
@@ -1402,7 +1399,7 @@ function openDrawer(id) {
     const datetime = formatDateTime(record.loggedAt);
     $('#drawerCompany').textContent = record.company; $('#drawerTitle').textContent = record.title; $('#drawerStatus').textContent = STATUS_LABELS[record.status] || '进行中';
     $('#drawerStatus').className = `drawer-status status-${record.status}`;
-    const details = [['薪资范围', record.salary], ['城市 / 地区', record.city || record.location || '历史记录未采集'], ['经验要求', record.experience || '未采集'], ['学历要求', record.education || '未采集'], ['所属行业', record.industry || '未采集'], ['HR 活跃', record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '未知'], ['搜索关键词', record.keyword || '未记录'], ['投递日期', `${datetime.date} ${datetime.time}`], ['匹配度', record.score ?? '未记录'], ['投递账号', record.accountId || '默认账号']];
+    const details = [['薪资范围', record.salary], ['城市 / 地区', record.city || record.location || '历史记录未采集'], ['经验要求', record.experience || '未采集'], ['学历要求', record.education || '未采集'], ['所属行业', record.industry || '未采集'], ['HR 活跃', record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '未知'], ['搜索关键词', record.keyword || '未记录'], ['投递日期', `${datetime.date} ${datetime.time}`], ['投递账号', record.accountId || '默认账号']];
     $('#drawerDetails').innerHTML = details.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
     $('#detailDrawer').classList.add('open'); $('#drawerBackdrop').classList.add('open'); $('#detailDrawer').setAttribute('aria-hidden', 'false');
 }
@@ -2000,8 +1997,8 @@ function toggleTheme() {
 }
 
 function exportRecords(records, filenamePrefix = '投递报表') {
-    const rows = [['公司', '岗位', '行业', '薪资', '最低K', '最高K', '城市', '经验', '学历', 'HR 活跃', '关键词', '投递时间', '匹配度', '状态', '账号']];
-    records.forEach((record) => rows.push([record.company, record.title, record.industry, record.salary, record.salaryMinK ?? '', record.salaryMaxK ?? '', record.city || record.location, record.experience, record.education, record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '', record.keyword, record.loggedAt, record.score ?? '', STATUS_LABELS[record.status] || record.status, record.accountId]));
+    const rows = [['公司', '岗位', '行业', '薪资', '最低K', '最高K', '城市', '经验', '学历', 'HR 活跃', '关键词', '投递时间', '状态', '账号']];
+    records.forEach((record) => rows.push([record.company, record.title, record.industry, record.salary, record.salaryMinK ?? '', record.salaryMaxK ?? '', record.city || record.location, record.experience, record.education, record.hrActive || HR_ACTIVE_LABELS[record.hrActiveLevel] || '', record.keyword, record.loggedAt, STATUS_LABELS[record.status] || record.status, record.accountId]));
     const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })), link = document.createElement('a'); link.href = url; link.download = `${filenamePrefix}_${localDateKey(new Date())}.csv`; link.click(); URL.revokeObjectURL(url); showToast(`已导出 ${records.length} 条记录`);
 }

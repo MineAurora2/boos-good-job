@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-19-remote-control.10
+// @version      2026-07-20-application-records.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,7 +16,7 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-19-remote-control.10';
+    const SCRIPT_VERSION = '2026-07-20-application-records.1';
     const CONTROL_PROTOCOL_VERSION = 1;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
@@ -330,7 +330,9 @@
                 CHATURL: 'redirect-url', // 聊天链接
                 COMPANY: '.company-name', // 公司名称
                 LOCATION: '.job-location .location-address, .location-address, .job-address-desc', // 工作地点
-                QUALIFICATION_TAGS: '.job-primary .job-tags span, .job-banner .job-tags span, .job-info .job-tags span, .tag-list li', // 经验学历标签
+                EXPERIENCE: '.job-primary .text-experiece, .job-primary .text-experience', // 工作经验
+                EDUCATION: '.job-primary .text-degree', // 学历要求
+                METADATA_DESCRIPTION: 'meta[name="description"]', // 职位元数据描述
                 INDUSTRY: '.company-info a[href*="industry"], .sider-company a[href*="industry"], a[ka*="industry"]', // 公司行业
                 BOSS_ACTIVE: '.job-boss-info h2.name .boss-online-tag, .job-boss-info h2.name .boss-active-time', // HR 当前在线或历史活跃状态
             },
@@ -361,6 +363,24 @@
             }
         },
     };
+
+    function extractJobQualifications(root = document) {
+        const experienceEl = root?.querySelector?.(SELECTORS.ZHIPIN.DETAIL.EXPERIENCE);
+        const educationEl = root?.querySelector?.(SELECTORS.ZHIPIN.DETAIL.EDUCATION);
+        let experience = experienceEl?.innerText?.trim() || '';
+        let education = educationEl?.innerText?.trim() || '';
+        if (experience && education) return { experience, education };
+
+        const metadataEl = root?.querySelector?.(SELECTORS.ZHIPIN.DETAIL.METADATA_DESCRIPTION);
+        const description = metadataEl?.getAttribute?.('content')?.trim() || '';
+        if (!experience) {
+            experience = description.match(/要求[：:]\s*([^，,。.;；]+)/)?.[1]?.trim() || '';
+        }
+        if (!education) {
+            education = description.match(/学历[：:]\s*([^，,。.;；]+)/)?.[1]?.trim() || '';
+        }
+        return { experience, education };
+    }
 
     // 搜索路径
     const SEARCHPATH = {
@@ -3826,10 +3846,7 @@
                 const company = companyEl ? companyEl.innerText.trim() : '';
                 const locationEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.LOCATION);
                 const location = locationEl ? locationEl.innerText.trim() : '';
-                const qualificationTexts = Array.from(document.querySelectorAll(SELECTORS.ZHIPIN.DETAIL.QUALIFICATION_TAGS))
-                    .map(el => el.innerText.trim()).filter(Boolean);
-                const experience = qualificationTexts.find(text => /经验|应届|在校|不限|\d+年/.test(text)) || '';
-                const education = qualificationTexts.find(text => /学历|初中|高中|中专|大专|本科|硕士|博士/.test(text)) || '';
+                const { experience, education } = extractJobQualifications(document);
                 const industryEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.INDUSTRY);
                 const industry = industryEl ? industryEl.innerText.trim() : '';
                 const hrActiveEl = document.querySelector(SELECTORS.ZHIPIN.DETAIL.BOSS_ACTIVE);
@@ -4640,6 +4657,7 @@
             runtimeLifecycle,
             writeChildExecutionPermission,
             childExecutionPermitted,
+            extractJobQualifications,
         });
         return;
     }

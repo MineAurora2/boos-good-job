@@ -410,8 +410,6 @@ tbody tr:hover { background: rgba(57,215,242,.025); }
 .salary-value { color: var(--cyan); font-weight: 700; }
 .location-value, .date-cell { color: #7f96a1; }
 .date-cell span { display: block; }.date-cell small { color: #4f6672; font-size: 8px; }
-.score-pill { display: inline-flex; align-items: center; gap: 6px; }
-.score-pill i { width: 26px; height: 3px; overflow: hidden; border-radius: 3px; background: #1a2a35; }.score-pill i span { display: block; height: 100%; background: var(--violet); }
 .status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 12px; font-size: 8px; }
 .status-pill::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .status-sent { color: var(--green); background: rgba(86,217,165,.08); }.status-queued { color: var(--orange); background: rgba(255,173,91,.08); }.status-failed_unknown { color: var(--red); background: rgba(255,111,127,.08); }
@@ -770,7 +768,6 @@ html[data-theme="light"] .location-value,
 html[data-theme="light"] .date-cell { color: #58717d; }
 html[data-theme="light"] .date-cell small,
 html[data-theme="light"] .cell-muted { color: #80939c; }
-html[data-theme="light"] .score-pill i { background: #dbe6ea; }
 html[data-theme="light"] .row-action { color: #657d88; }
 html[data-theme="light"] tbody tr.selected td { background-color: rgba(0,142,170,.055); }
 
