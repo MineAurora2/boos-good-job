@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-20-application-records.1
+// @version      2026-07-20-control-short-poll.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,8 +16,9 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-20-application-records.1';
+    const SCRIPT_VERSION = '2026-07-20-control-short-poll.1';
     const CONTROL_PROTOCOL_VERSION = 1;
+    const CONTROL_POLL_INTERVAL_MS = 2000;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
@@ -1420,7 +1421,7 @@
                 `protocolVersion=${encodeURIComponent(CONTROL_PROTOCOL_VERSION)}`,
                 `sessionId=${encodeURIComponent(identity.sessionId)}`,
                 `sessionEpoch=${encodeURIComponent(identity.sessionEpoch)}`,
-                'timeoutMs=20000',
+                'timeoutMs=0',
             ];
             if (cursor?.epoch != null && cursor?.revision != null) {
                 query.push(`afterEpoch=${encodeURIComponent(cursor.epoch)}`);
@@ -1430,7 +1431,7 @@
                 `/api/control/workers/${encodeURIComponent(identity.workerId)}/desired-state?${query.join('&')}`,
                 'GET',
                 null,
-                { allowDuringStop: true, timeout: 23000 }
+                { allowDuringStop: true, timeout: 5000 }
             );
         }
 
@@ -2257,7 +2258,7 @@
                 this.connectionState = 'connected';
                 this.statusIndicator.update(this.connectionState, this.executionState);
                 if (result?.control) this.receiveControl(result.control);
-                return 0;
+                return CONTROL_POLL_INTERVAL_MS;
             } catch (error) {
                 const status = Number(error?.status || 0);
                 if (status === 404) {
