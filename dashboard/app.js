@@ -52,6 +52,9 @@ const state = {
     control: null,
     controlOnline: false,
     lifecycleRequests: {},
+    scheduleDraft: null,
+    scheduleSaving: false,
+    scheduleFeedback: '',
     accountLimitDrafts: new Map(),
     accountLimitPending: new Map(),
     expandedDecisions: new Set(),
@@ -84,6 +87,8 @@ const EXECUTION_STATE_LABELS = { starting: '启动中', running: '运行中', pa
 const SYNC_STATE_LABELS = { pending: '等待同步', applying: '正在应用', synced: '已同步', failed: '同步失败' };
 const ACCOUNT_DAILY_LIMIT_MIN = 0;
 const ACCOUNT_DAILY_LIMIT_MAX = 150;
+const SCHEDULE_DEFAULT = { enabled: false, mode: 'daily', startTime: '', durationMinutes: 0, weekdays: [], dateStart: '', dateEnd: '' };
+const SCHEDULE_MODES = new Set(['daily', 'weekly', 'weekdays', 'date_range']);
 const CONTROL_DELIVERY_POLL_INTERVAL_MS = 150;
 const CONTROL_DELIVERY_TIMEOUT_MS = 6000;
 const LLM_USAGE_POLL_INTERVAL_MS = 30000;
@@ -1428,6 +1433,7 @@ function renderControlMonitorCounts() {
     const count = (value, fallback = 0) => { const parsed = Number(value); return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback; };
     const connected = count(control.connectedClientCount ?? control.activeClientCount, count(runtime.activeClientCount, clients.filter((item) => item.online !== false).length));
     const running = count(control.runningClientCount, clients.filter((item) => item.online !== false && item.executionState === 'running').length);
+    $('#connectedClients').textContent = connected;
     $('#activeClients').textContent = connected;
     $('#runningClients').textContent = running;
     $('#navControlAlerts').textContent = connected;
@@ -1722,7 +1728,138 @@ function normalizedControlState() {
         timeline: (controlArray(data.timeline || data.events).length ? controlArray(data.timeline || data.events) : controlArray(runtime.events)).map((event) => { if (!event.payload) return event; const entry = eventMessage(event), type = entry.level === 'error' ? 'error' : (event.type?.includes('job') ? 'delivery' : event.type?.includes('deduct') ? 'deduction' : 'system'); return { ...entry, type }; }),
         audit: controlArray(data.audit || data.commands || data.commandHistory),
         health: data.health || data.services || {},
+        schedule: { enabled: false, mode: 'daily', startTime: '', durationMinutes: 0, weekdays: [], dateStart: '', dateEnd: '', ...(data.plan?.schedule || task.schedule || {}) },
+        scheduleStatus: data.scheduleStatus || {},
     };
+}
+
+function schedulePayloadFromValues(values) {
+    const durationHours = Math.max(0, Number.parseInt(values.durationHours, 10) || 0);
+    const durationMinutes = Math.max(0, Number.parseInt(values.durationMinutes, 10) || 0);
+    const weekdays = [...new Set((Array.isArray(values.weekdays) ? values.weekdays : []).map((day) => Number(day)).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))].sort((a, b) => a - b);
+    return {
+        enabled: Boolean(values.enabled),
+        mode: String(values.mode || 'daily'),
+        startTime: String(values.startTime || '').trim(),
+        durationMinutes: durationHours * 60 + durationMinutes,
+        weekdays,
+        dateStart: String(values.dateStart || '').trim(),
+        dateEnd: String(values.dateEnd || '').trim(),
+    };
+}
+
+function validateSchedulePayload(schedule) {
+    if (!['daily', 'weekly', 'weekdays', 'date_range'].includes(schedule.mode)) return '请选择有效的周期';
+    if (!schedule.enabled) return '';
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(schedule.startTime)) return '请输入有效的开始时间';
+    if (!Number.isInteger(schedule.durationMinutes) || schedule.durationMinutes < 1 || schedule.durationMinutes > 1440) return '持续时长需为 1 分钟至 24 小时';
+    if (schedule.mode === 'weekly' && !schedule.weekdays.length) return '每周模式至少选择一天';
+    if (schedule.mode === 'date_range' && (!/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateStart) || !/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateEnd) || schedule.dateStart > schedule.dateEnd)) return '日期范围不能为空';
+    return '';
+}
+
+function renderGlobalLifecycle(data = normalizedControlState()) {
+    const container = $('#globalLifecycle');
+    if (!container) return;
+    const request = state.lifecycleRequests?.global;
+    const controlsLocked = lifecycleControlsLocked('global');
+    const desiredState = data.instances.length && data.instances.every((item) => desiredStateOf(item) === 'running') ? 'running' : 'stopped';
+    container.innerHTML = [
+        ['running', '▶', '开启全部', 'start'],
+        ['paused', 'Ⅱ', '暂停全部', 'pause'],
+        ['stopped', '■', '结束全部', 'danger'],
+    ].map(([value, icon, label, tone]) => `<button type="button" class="control-command ${tone} active" data-control-scope="global" data-desired-state="${value}" aria-pressed="${desiredState === value}"${controlsLocked ? ' disabled aria-busy="true"' : ''}><span aria-hidden="true">${icon}</span> ${label}</button>`).join('');
+    const feedback = $('#globalControlFeedback');
+    if (feedback) feedback.textContent = request?.pending ? '全局指令提交中…' : (request?.failed ? `操作失败：${request.message || '请重试'}` : '');
+}
+
+function scheduleStatusLabel(status) {
+    if (!status?.enabled) return '未启用定时计划';
+    if (status.state === 'running') return `定时投递运行中，剩余 ${Math.ceil(Number(status.remainingSeconds || 0) / 60)} 分钟`;
+    if (status.state === 'suppressed') return '本窗口已被手动暂停，下一窗口将重新评估';
+    if (status.nextStart) return `等待窗口，下一次开始 ${controlTime(status.nextStart)}`;
+    return '日期范围已结束';
+}
+
+function renderSchedulePanel(data = normalizedControlState()) {
+    const card = $('#deliveryScheduleCard');
+    if (!card) return;
+    const schedule = state.scheduleDraft || data.schedule || SCHEDULE_DEFAULT;
+    const status = data.scheduleStatus || {};
+    const setValue = (selector, value) => { const element = $(selector); if (element) element.value = value ?? ''; };
+    const setChecked = (selector, value) => { const element = $(selector); if (element) element.checked = Boolean(value); };
+    const duration = Math.max(0, Number(schedule.durationMinutes) || 0);
+    setChecked('#scheduleEnabled', schedule.enabled);
+    setValue('#scheduleMode', schedule.mode || 'daily');
+    setValue('#scheduleStartTime', schedule.startTime || '');
+    setValue('#scheduleDurationHours', Math.floor(duration / 60));
+    setValue('#scheduleDurationMinutes', duration % 60);
+    setValue('#scheduleDateStart', schedule.dateStart || '');
+    setValue('#scheduleDateEnd', schedule.dateEnd || '');
+    $$('[data-schedule-weekday]').forEach((input) => { input.checked = (schedule.weekdays || []).includes(Number(input.value)); });
+    $$('[data-schedule-section]').forEach((section) => { section.hidden = section.dataset.scheduleSection !== schedule.mode; });
+    const text = scheduleStatusLabel(status);
+    $('#scheduleStatusText').textContent = text;
+    $('#scheduleStatus').textContent = text;
+    $('#scheduleFeedback').textContent = state.scheduleFeedback || '';
+    ['#saveSchedule', '#applySchedule'].forEach((selector) => { const button = $(selector); if (button) button.disabled = state.scheduleSaving; });
+}
+
+function scheduleFormValues() {
+    return {
+        enabled: $('#scheduleEnabled')?.checked,
+        mode: $('#scheduleMode')?.value,
+        startTime: $('#scheduleStartTime')?.value,
+        durationHours: $('#scheduleDurationHours')?.value,
+        durationMinutes: $('#scheduleDurationMinutes')?.value,
+        weekdays: $$('[data-schedule-weekday]:checked').map((input) => Number(input.value)),
+        dateStart: $('#scheduleDateStart')?.value,
+        dateEnd: $('#scheduleDateEnd')?.value,
+    };
+}
+
+async function saveSchedule(applyNow) {
+    const schedule = schedulePayloadFromValues(scheduleFormValues());
+    const validationError = validateSchedulePayload(schedule);
+    if (validationError) {
+        state.scheduleFeedback = validationError;
+        renderSchedulePanel();
+        return null;
+    }
+    state.scheduleSaving = true;
+    state.scheduleFeedback = '正在保存计划…';
+    renderSchedulePanel();
+    try {
+        const result = await apiJson('/api/control/plan', { method: 'PUT', body: JSON.stringify({ schedule, applyNow }) });
+        state.scheduleDraft = null;
+        state.scheduleFeedback = applyNow ? '计划已保存并立即应用' : '计划已保存';
+        state.scheduleSaving = false;
+        await loadControlState();
+        return result;
+    } catch (error) {
+        state.scheduleSaving = false;
+        state.scheduleFeedback = `保存失败：${error.message}`;
+        renderSchedulePanel();
+        return null;
+    }
+}
+
+function bindScheduleControls() {
+    const card = $('#deliveryScheduleCard');
+    if (!card || card.dataset.bound === '1') return;
+    card.dataset.bound = '1';
+    card.addEventListener('change', (event) => {
+        if (!event.target.matches('[data-schedule-field], [data-schedule-weekday]')) return;
+        const values = schedulePayloadFromValues(scheduleFormValues());
+        state.scheduleDraft = values;
+        if (event.target.matches('#scheduleMode')) renderSchedulePanel();
+    });
+    card.addEventListener('input', (event) => {
+        if (!event.target.matches('[data-schedule-field]')) return;
+        state.scheduleDraft = schedulePayloadFromValues(scheduleFormValues());
+    });
+    $('#saveSchedule')?.addEventListener('click', () => saveSchedule(false));
+    $('#applySchedule')?.addEventListener('click', () => { const applyNow = true; saveSchedule(applyNow); });
 }
 
 function decisionMarkup(decision, decisionKey = '', expanded = false) {
@@ -1785,6 +1922,8 @@ function renderControlInstances(instances, accounts) {
 
 function renderControlCenter() {
     const data = normalizedControlState();
+    renderGlobalLifecycle(data);
+    renderSchedulePanel(data);
     renderControlInstances(data.instances, data.accounts); renderControlMonitorCounts();
     renderDailyGoal();
 }
@@ -2849,6 +2988,7 @@ function resetFilters() {
 }
 
 function bindEvents() {
+    bindScheduleControls();
     $$('#rangeSwitch button').forEach((button) => button.addEventListener('click', () => { $$('#rangeSwitch button').forEach((item) => item.classList.toggle('active', item === button)); state.range = button.dataset.range; state.page = 1; updateDashboard(); }));
     $('#searchInput').addEventListener('input', (event) => { state.search = event.target.value; state.page = 1; updateDashboard(); });
     $('#statusFilter').addEventListener('change', (event) => { state.status = event.target.value; state.page = 1; updateDashboard(); });

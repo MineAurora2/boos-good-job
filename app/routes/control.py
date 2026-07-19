@@ -173,6 +173,22 @@ def control_state(request: Request):
     return state
 
 
+@router.put('/api/control/plan', summary='淇濆瓨鍏ㄥ眬瀹氭椂鎶曢€掕鍒?')
+def control_update_plan(request: Request, payload: dict = Body(...)):
+    require_local_admin(request)
+    if not isinstance(payload, dict) or not isinstance(payload.get('schedule'), dict):
+        raise HTTPException(status_code=400, detail='invalid_schedule_payload')
+    apply_now = payload.get('applyNow', False)
+    if not isinstance(apply_now, bool):
+        raise HTTPException(status_code=400, detail='invalid_apply_now')
+    try:
+        plan = RUNTIME_MONITOR.update_plan({'schedule': payload['schedule']})
+        status = RUNTIME_MONITOR.run_schedule_tick() if apply_now else RUNTIME_MONITOR.schedule_status()
+        return {'plan': plan, 'scheduleStatus': status}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.get('/api/control/workers/{worker_id}/desired-state', summary='Get the latest desired state for one worker')
 def control_worker_desired_state(
     worker_id: str,

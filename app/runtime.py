@@ -17,6 +17,12 @@ import threading
 import time
 
 from app import paths
+from app.scheduling import (
+    DEFAULT_SCHEDULE,
+    next_schedule_start,
+    normalize_schedule,
+    schedule_window,
+)
 from app.storage.io import atomic_write_text
 
 
@@ -41,6 +47,7 @@ DEFAULT_PLAN = {
     'maxConsecutiveFailures': 3,
     'minDelayMs': 0,
     'maxDelayMs': 0,
+    'schedule': deepcopy(DEFAULT_SCHEDULE),
 }
 
 EVENT_SENDERS = frozenset({'system', 'delivery', 'claim', 'queue'})
@@ -87,6 +94,15 @@ class RuntimeMonitor:
         self._control_epoch = secrets.token_hex(16)
         self._control_revision = 0
         self._workers: dict[str, dict] = {}
+        self._schedule_thread: threading.Thread | None = None
+        self._schedule_stop = threading.Event()
+        self._schedule_wakeup = threading.Event()
+        self._schedule_tick_lock = threading.Lock()
+        self._schedule_window_key: str | None = None
+        self._schedule_owned_workers: set[str] = set()
+        self._schedule_suppressed_workers: set[str] = set()
+        self._schedule_last_action = ''
+        self._schedule_last_error = ''
         self.started_at = datetime.now().isoformat(timespec='seconds')
         self.started_monotonic = time.monotonic()
         self._load_state()
@@ -149,7 +165,14 @@ class RuntimeMonitor:
         if isinstance(data.get('safety'), dict):
             self._safety.update({key: bool(value) for key, value in data['safety'].items() if key in DEFAULT_SAFETY})
         if isinstance(data.get('plan'), dict):
-            self._plan.update({key: value for key, value in data['plan'].items() if key in DEFAULT_PLAN})
+            loaded_plan = {key: value for key, value in data['plan'].items() if key in DEFAULT_PLAN}
+            raw_schedule = loaded_plan.pop('schedule', None)
+            self._plan.update(loaded_plan)
+            if isinstance(raw_schedule, dict):
+                try:
+                    self._plan['schedule'] = normalize_schedule(raw_schedule)
+                except ValueError:
+                    self._plan['schedule'] = deepcopy(DEFAULT_SCHEDULE)
         if isinstance(data.get('accounts'), dict):
             for raw_account_id, raw_policy in data['accounts'].items():
                 account_id = self._clean_text(raw_account_id, 120)
@@ -536,6 +559,8 @@ class RuntimeMonitor:
         self._workers = workers
         for worker_id in offline_worker_ids:
             self._clients.pop(worker_id, None)
+            self._schedule_owned_workers.discard(worker_id)
+            self._schedule_suppressed_workers.discard(worker_id)
         self._condition.notify_all()
 
     def desired_control(
@@ -975,14 +1000,23 @@ class RuntimeMonitor:
                 value = self._clean_text(value, 5)
                 if value and (len(value) != 5 or value[2] != ':'):
                     raise ValueError(f'invalid_time:{key}')
+            elif key == 'schedule':
+                value = normalize_schedule(value)
             normalized[key] = value
         with self._condition:
-            candidate = {**self._plan, **normalized}
+            candidate = {**deepcopy(self._plan), **normalized}
             if candidate['maxDelayMs'] and candidate['maxDelayMs'] < candidate['minDelayMs']:
                 raise ValueError('max_delay_less_than_min_delay')
             self._persist_state_locked(plan=candidate)
             self._plan = candidate
+            if not candidate['schedule']['enabled']:
+                self._schedule_window_key = None
+                self._schedule_owned_workers.clear()
+                self._schedule_suppressed_workers.clear()
+                self._schedule_last_action = 'disabled'
+                self._schedule_last_error = ''
             result = deepcopy(self._plan)
+        self._schedule_wakeup.set()
         self.audit('plan_updated', {'changes': patch}, actor)
         self.publish('plan_updated', result)
         return result
@@ -1041,6 +1075,20 @@ class RuntimeMonitor:
     def _new_control_operation(self, revision: int) -> str:
         return f"control-{revision:x}-{secrets.token_hex(8)}"
 
+    def _record_manual_schedule_control_locked(
+        self,
+        worker_ids: set[str],
+        desired_state: str,
+        actor: str,
+    ) -> None:
+        if actor == 'scheduler' or not self._schedule_window_key:
+            return
+        if desired_state in {'paused', 'stopped'}:
+            self._schedule_suppressed_workers.update(worker_ids)
+        elif desired_state == 'running':
+            self._schedule_suppressed_workers.difference_update(worker_ids)
+            self._schedule_owned_workers.update(worker_ids)
+
     def set_global_desired_state(self, desired_state: str, *, actor: str = 'dashboard') -> dict:
         desired_state = self._desired_state(desired_state)
         updated_at = self._now_iso()
@@ -1059,6 +1107,7 @@ class RuntimeMonitor:
             self._persist_state_locked(control_revision=revision, workers=workers)
             self._control_revision = revision
             self._workers = workers
+            self._record_manual_schedule_control_locked(set(workers), desired_state, actor)
             self._condition.notify_all()
             result = {
                 'operationId': operation_id,
@@ -1092,6 +1141,7 @@ class RuntimeMonitor:
             self._persist_state_locked(control_revision=revision, workers=workers)
             self._control_revision = revision
             self._workers = workers
+            self._record_manual_schedule_control_locked({worker_id}, desired_state, actor)
             self._condition.notify_all()
             result = {
                 'operationId': operation_id,
@@ -1102,6 +1152,181 @@ class RuntimeMonitor:
         self.audit('worker_desired_state_updated', {**result, 'workerId': worker_id}, actor)
         self.publish('desired_state_updated', {**result, 'scope': 'worker', 'workerId': worker_id})
         return result
+
+    def _set_schedule_workers(self, worker_ids: set[str], desired_state: str) -> dict | None:
+        updated_at = self._now_iso()
+        with self._condition:
+            targets = sorted(
+                worker_id for worker_id in worker_ids
+                if worker_id in self._workers
+                and self._workers[worker_id]['desiredState'] != desired_state
+            )
+            if not targets:
+                return None
+            revision = self._control_revision + 1
+            operation_id = self._new_control_operation(revision)
+            workers = deepcopy(self._workers)
+            for worker_id in targets:
+                workers[worker_id].update({
+                    'desiredState': desired_state,
+                    'revision': revision,
+                    'operationId': operation_id,
+                    'updatedAt': updated_at,
+                })
+            self._persist_state_locked(control_revision=revision, workers=workers)
+            self._control_revision = revision
+            self._workers = workers
+            self._condition.notify_all()
+            result = {
+                'operationId': operation_id,
+                'revision': revision,
+                'desiredState': desired_state,
+                'targetCount': len(targets),
+                'workerIds': targets,
+            }
+        self.audit('schedule_desired_state_updated', result, 'scheduler')
+        self.publish('desired_state_updated', {**result, 'scope': 'schedule'})
+        return result
+
+    def schedule_status(self, now: datetime | None = None) -> dict:
+        now = now or datetime.now()
+        with self._condition:
+            schedule = deepcopy(self._plan['schedule'])
+            owned = len(self._schedule_owned_workers)
+            suppressed = len(self._schedule_suppressed_workers)
+            last_action = self._schedule_last_action
+            last_error = self._schedule_last_error
+            revision = self._control_revision
+        window = schedule_window(now, schedule)
+        next_start = next_schedule_start(now, schedule)
+        if not schedule['enabled']:
+            state = 'disabled'
+        elif window and owned and suppressed >= owned:
+            state = 'suppressed'
+        elif window:
+            state = 'running'
+        elif next_start:
+            state = 'waiting'
+        else:
+            state = 'finished'
+        return {
+            'enabled': schedule['enabled'],
+            'state': state,
+            'active': window is not None,
+            'timezone': 'local',
+            'currentStart': window.start.isoformat(timespec='seconds') if window else None,
+            'currentEnd': window.end.isoformat(timespec='seconds') if window else None,
+            'nextStart': next_start.isoformat(timespec='seconds') if next_start else None,
+            'remainingSeconds': max(0, int((window.end - now).total_seconds())) if window else 0,
+            'ownedCount': owned,
+            'suppressedCount': suppressed,
+            'lastAction': last_action,
+            'lastError': last_error,
+            'revision': revision,
+        }
+
+    def run_schedule_tick(self, now: datetime | None = None) -> dict:
+        now = now or datetime.now()
+        with self._schedule_tick_lock:
+            with self._condition:
+                self._prune_offline_workers_locked(time.monotonic())
+                schedule = deepcopy(self._plan['schedule'])
+                window = schedule_window(now, schedule)
+                if not schedule['enabled']:
+                    self._schedule_window_key = None
+                    self._schedule_owned_workers.clear()
+                    self._schedule_suppressed_workers.clear()
+                    self._schedule_last_action = 'disabled'
+                    self._schedule_last_error = ''
+                    return self.schedule_status(now)
+                previous_window_key = self._schedule_window_key
+                window_started = window is not None and window.key != previous_window_key
+                window_ended = window is None and previous_window_key is not None
+                if window_started:
+                    self._schedule_suppressed_workers.clear()
+                if window:
+                    eligible = set(self._workers) - self._schedule_suppressed_workers
+                    pause_targets: set[str] = set()
+                else:
+                    eligible = set()
+                    pause_targets = set(self._schedule_owned_workers)
+
+            if window:
+                operation = self._set_schedule_workers(eligible, 'running')
+                with self._condition:
+                    self._schedule_window_key = window.key
+                    self._schedule_owned_workers.update(eligible)
+                    self._schedule_last_action = 'window_started' if window_started else (
+                        'workers_started' if operation else self._schedule_last_action
+                    )
+                    self._schedule_last_error = ''
+                if window_started:
+                    self.publish('schedule_window_started', {
+                        'windowKey': window.key,
+                        'start': window.start.isoformat(timespec='seconds'),
+                        'end': window.end.isoformat(timespec='seconds'),
+                        'ownedCount': len(eligible),
+                    })
+            else:
+                operation = self._set_schedule_workers(pause_targets, 'paused')
+                with self._condition:
+                    if window_ended:
+                        self._schedule_window_key = None
+                        self._schedule_last_action = 'window_ended'
+                    self._schedule_last_error = ''
+                if window_ended:
+                    self.publish('schedule_window_ended', {
+                        'windowKey': previous_window_key,
+                        'pausedCount': operation['targetCount'] if operation else 0,
+                    })
+            return self.schedule_status(now)
+
+    def _scheduler_loop(self) -> None:
+        while not self._schedule_stop.is_set():
+            try:
+                self.run_schedule_tick()
+            except Exception as error:
+                message = self._clean_text(error, 1000)
+                with self._condition:
+                    self._schedule_last_error = message
+                self.record_error({
+                    'type': 'schedule_tick_failed',
+                    'message': message,
+                    'sender': 'system',
+                    'verbosity': 'concise',
+                    'level': 'error',
+                })
+            self._schedule_wakeup.wait(1)
+            self._schedule_wakeup.clear()
+
+    def start_scheduler(self) -> bool:
+        with self._condition:
+            if self._schedule_thread and self._schedule_thread.is_alive():
+                return False
+            self._schedule_stop.clear()
+            self._schedule_wakeup.clear()
+            self._schedule_thread = threading.Thread(
+                target=self._scheduler_loop,
+                name='delivery-scheduler',
+                daemon=True,
+            )
+            thread = self._schedule_thread
+        thread.start()
+        return True
+
+    def stop_scheduler(self) -> bool:
+        with self._condition:
+            thread = self._schedule_thread
+            if not thread:
+                return False
+            self._schedule_stop.set()
+            self._schedule_wakeup.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=2)
+        with self._condition:
+            if self._schedule_thread is thread:
+                self._schedule_thread = None
+        return True
 
     def effective_control(self, worker_id: str, account_id: str) -> dict:
         """合并全局与账号策略，返回工作器当前应采用的只读控制快照。"""
@@ -1206,6 +1431,7 @@ class RuntimeMonitor:
             **snapshot,
             'safety': safety,
             'plan': plan,
+            'scheduleStatus': self.schedule_status(),
             'accounts': accounts,
             'commands': commands,
             'errors': errors,

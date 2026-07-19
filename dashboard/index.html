@@ -112,12 +112,39 @@
                 </div>
 
                 <div class="monitor-metrics panel">
-                    <div><span>已连接实例</span><strong id="activeClients">0</strong><small id="heartbeatWindowHint">30 秒内有心跳</small></div>
+                    <div><span>已登记实例</span><strong id="connectedClients">0</strong><small>仅统计在线实例</small><strong id="activeClients" hidden>0</strong><small id="heartbeatWindowHint" hidden>30 秒内有心跳</small></div>
                     <div><span>正在运行</span><strong id="runningClients">0</strong><small>执行状态为运行中</small></div>
                     <div><span>今日已投递</span><strong id="monitorTodayDelivered">0</strong><small>当前本地日期</small></div>
                     <div><span>筛选投递率</span><strong id="filterDeliveryRate">—</strong><small id="filterDeliveryRateHint">已投递 0 / 已评估 0</small></div>
                 </div>
                 <div class="control-layout">
+                    <article class="control-card control-span-12 control-global-card">
+                        <div class="control-card-head"><div><span>全局运行控制</span><small>统一控制所有已登记浏览器实例</small></div><div id="globalControlFeedback" class="control-action-feedback" aria-live="polite"></div></div>
+                        <div id="globalLifecycle" class="control-primary-actions" role="group" aria-label="全局运行控制">
+                            <button type="button" class="control-command start active" data-control-scope="global" data-desired-state="running" aria-pressed="false"><span aria-hidden="true">▶</span> 开启全部</button>
+                            <button type="button" class="control-command pause active" data-control-scope="global" data-desired-state="paused" aria-pressed="false"><span aria-hidden="true">Ⅱ</span> 暂停全部</button>
+                            <button type="button" class="control-command danger active" data-control-scope="global" data-desired-state="stopped" aria-pressed="false"><span aria-hidden="true">■</span> 结束全部</button>
+                        </div>
+                    </article>
+
+                    <article id="deliveryScheduleCard" class="control-card control-span-12 delivery-schedule-card">
+                        <div class="control-card-head"><div><span>定时投递</span><small id="scheduleStatusText">计划默认关闭</small></div><label class="schedule-toggle"><input id="scheduleEnabled" type="checkbox" data-schedule-field="enabled"><span>启用计划</span></label></div>
+                        <div class="schedule-status" id="scheduleStatus" aria-live="polite">未启用定时计划</div>
+                        <div class="schedule-form-grid">
+                            <label><span>周期</span><select id="scheduleMode" data-schedule-field="mode"><option value="daily">每天</option><option value="weekly">每周</option><option value="weekdays">工作日</option><option value="date_range">日期范围</option></select></label>
+                            <label><span>开始时间</span><input id="scheduleStartTime" type="time" data-schedule-field="startTime"></label>
+                            <label><span>持续小时</span><input id="scheduleDurationHours" type="number" min="0" max="24" step="1" inputmode="numeric" data-schedule-field="durationHours" value="0"></label>
+                            <label><span>持续分钟</span><input id="scheduleDurationMinutes" type="number" min="0" max="59" step="1" inputmode="numeric" data-schedule-field="durationMinutes" value="0"></label>
+                        </div>
+                        <div id="scheduleWeekdays" class="schedule-weekdays" data-schedule-section="weekly" hidden>
+                            <span>执行日</span>
+                            <label><input type="checkbox" value="0" data-schedule-weekday>一</label><label><input type="checkbox" value="1" data-schedule-weekday>二</label><label><input type="checkbox" value="2" data-schedule-weekday>三</label><label><input type="checkbox" value="3" data-schedule-weekday>四</label><label><input type="checkbox" value="4" data-schedule-weekday>五</label><label><input type="checkbox" value="5" data-schedule-weekday>六</label><label><input type="checkbox" value="6" data-schedule-weekday>日</label>
+                        </div>
+                        <div id="scheduleWeekdayHint" class="schedule-hint" data-schedule-section="weekdays" hidden>工作日模式固定执行周一至周五</div>
+                        <div id="scheduleDateRange" class="schedule-date-range" data-schedule-section="date_range" hidden><label><span>开始日期</span><input id="scheduleDateStart" type="date" data-schedule-field="dateStart"></label><label><span>结束日期</span><input id="scheduleDateEnd" type="date" data-schedule-field="dateEnd"></label></div>
+                        <div class="schedule-actions"><span id="scheduleFeedback" aria-live="polite"></span><button id="saveSchedule" type="button" class="control-command subtle">保存计划</button><button id="applySchedule" type="button" class="control-command start">保存并立即应用</button></div>
+                    </article>
+
                     <article class="control-card control-span-12">
                         <div class="control-card-head"><div><span>浏览器实例</span><small id="controlInstanceSummary">等待脚本接入</small></div><button class="control-command subtle" data-control-action="refresh_instances">同步状态</button></div>
                         <div id="controlInstanceList" class="control-instance-grid"></div>
