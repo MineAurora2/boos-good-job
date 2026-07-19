@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260719-online-progress-1">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260719-echarts-trend-1">
 </head>
 <body>
     <div class="app-shell">
@@ -158,8 +158,7 @@
                         </div>
                     </div>
                     <div class="trend-summary"><strong id="trendTotal">0</strong><span>当前区间累计投递</span><em id="trendPeak">峰值 —</em></div>
-                    <div class="chart-box trend-chart-box" id="trendChart" aria-label="每日投递趋势图，按住图表可左右拖动日期，滚轮可缩放"></div>
-                    <div class="trend-scrollbar"><button id="trendZoomOut" title="缩小">−</button><input id="trendScroll" type="range" min="0" max="0" value="0" aria-label="趋势图水平滚动条"><button id="trendZoomIn" title="放大">＋</button></div>
+                    <div class="chart-box trend-chart-box" id="trendChart" role="img" aria-label="每日投递趋势图"></div>
                 </article>
 
                 <article class="panel funnel-panel report-card report-normal" data-widget-id="report-funnel">
@@ -406,6 +405,7 @@
     </div>
 
     <div class="toast" id="toast" role="status"></div>
-    <script src="/dashboard/app.js?v=20260719-online-progress-1" defer></script>
+    <script src="/dashboard/vendor/echarts.min.js" defer></script>
+    <script src="/dashboard/app.js?v=20260719-echarts-trend-1" defer></script>
 </body>
 </html>

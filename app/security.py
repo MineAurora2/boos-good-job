@@ -34,6 +34,7 @@ _PUBLIC_DASHBOARD_PATHS = frozenset(
         '/dashboard/',
         '/dashboard/app.js',
         '/dashboard/styles.css',
+        '/dashboard/vendor/echarts.min.js',
         '/dashboard/china.json',
         '/dashboard/china-cities.json',
     }

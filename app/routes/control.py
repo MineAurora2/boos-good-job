@@ -50,6 +50,11 @@ async def dashboard_script():
     return FileResponse(STATE.dashboard_dir / 'app.js', media_type='application/javascript')
 
 
+@router.get('/dashboard/vendor/echarts.min.js', include_in_schema=False)
+async def dashboard_echarts_script():
+    return FileResponse(STATE.dashboard_dir / 'vendor' / 'echarts.min.js', media_type='application/javascript')
+
+
 @router.get('/dashboard/china.json', include_in_schema=False)
 async def dashboard_china_map():
     return FileResponse(STATE.dashboard_dir / 'china.json', media_type='application/json')

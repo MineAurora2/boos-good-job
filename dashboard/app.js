@@ -5,7 +5,7 @@ const state = {
     trendRange: 'all',
     trendStart: '',
     trendEnd: '',
-    trendView: { zoom: 1, offset: 0, dragging: false, startX: 0, startOffset: 0, visibleCount: 0, autoWindow: true },
+    trendView: { resetZoom: true },
     search: '',
     status: 'all',
     city: 'all',
@@ -138,6 +138,7 @@ let controlStateLoadPromise = null;
 let authPromptResolver = null;
 let authPromptDismissed = false;
 let authPromptCloseTimer = null;
+let trendChartInstance = null;
 
 const LOCATION_ALIASES = {
     北京: ['北京'], 上海: ['上海'], 天津: ['天津'], 重庆: ['重庆'],
@@ -367,7 +368,7 @@ function getRangeRecords() {
     });
 }
 
-function getFilteredRecords(ignoreRange = false, ignoreMap = false) {
+function getFilteredRecords(ignoreRange = false, ignoreMap = false, ignoreExactDate = false) {
     const search = state.search.trim().toLowerCase();
     const keyword = state.keyword.trim().toLowerCase();
     return (ignoreRange ? state.records : getRangeRecords()).filter((record) => {
@@ -377,7 +378,7 @@ function getFilteredRecords(ignoreRange = false, ignoreMap = false) {
         if (keyword && !keywordHaystack.includes(keyword)) return false;
         if (state.industry && record.industry !== state.industry) return false;
         if (state.role && roleType(record.title) !== state.role) return false;
-        if (state.exactDate && !record.loggedAt?.startsWith(state.exactDate)) return false;
+        if (!ignoreExactDate && state.exactDate && !record.loggedAt?.startsWith(state.exactDate)) return false;
         if (state.status !== 'all' && record.status !== state.status) return false;
         if (state.city !== 'all' && recordCity(record) !== state.city) return false;
         if (state.experience !== 'all' && (record.experience || '未知经验') !== state.experience) return false;
@@ -445,10 +446,10 @@ function setTrendRange(range) {
     else if (range !== 'all') start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - Number(range) + 1);
     state.trendStart = start ? localDateKey(start) : '';
     state.trendEnd = range === 'all' ? '' : localDateKey(today);
-    state.trendView = { ...state.trendView, zoom: 1, offset: 0, autoWindow: true };
+    state.trendView.resetZoom = true;
     $('#trendStartDate').value = state.trendStart; $('#trendEndDate').value = state.trendEnd;
     $$('#trendQuickRange button').forEach((button) => button.classList.toggle('active', button.dataset.trendRange === range));
-    renderTrend(getFilteredRecords());
+    renderTrend(getFilteredRecords(true, false, true));
 }
 
 function renderSparkline(target, values, color) {
@@ -482,44 +483,108 @@ function renderMetrics(records) {
     renderSparkline('#todaySparkline', dailyValues.slice(-8), COLORS[3]);
 }
 
-function renderTrend(records) {
-    const rangedRecords = trendRangeRecords(records), fullData = groupTrendDaily(rangedRecords), container = $('#trendChart');
-    $('#trendTotal').textContent = numberFormat.format(rangedRecords.length);
-    if (state.trendView.autoWindow && fullData.length > 14) {
-        state.trendView.zoom = fullData.length / 14;
-        state.trendView.offset = fullData.length - 14;
-        state.trendView.autoWindow = false;
+function trendThemeColors() {
+    const style = getComputedStyle(document.documentElement);
+    const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+    return {
+        cyan: color('--cyan', '#39d7f2'),
+        axis: color('--chart-axis', '#4f6674'),
+        grid: color('--chart-grid', 'rgba(126,157,175,.10)'),
+        panel: color('--panel-strong', '#0f1e2b'),
+        text: color('--text-soft', '#91a8b3'),
+        muted: color('--muted-2', '#536a79'),
+    };
+}
+
+function ensureTrendChart() {
+    const container = $('#trendChart');
+    if (!window.echarts) {
+        container.innerHTML = '<div class="trend-chart-error">趋势图组件加载失败</div>';
+        return null;
     }
-    const visibleCount = Math.max(2, Math.ceil(fullData.length / state.trendView.zoom));
-    const maxOffset = Math.max(0, fullData.length - visibleCount);
-    state.trendView.visibleCount = visibleCount;
-    state.trendView.offset = Math.max(0, Math.min(maxOffset, Math.round(state.trendView.offset)));
-    const data = fullData.slice(state.trendView.offset, state.trendView.offset + visibleCount);
-    const scrollbar = $('#trendScroll'); scrollbar.max = String(maxOffset); scrollbar.value = String(state.trendView.offset); scrollbar.disabled = maxOffset === 0;
-    container.dataset.draggable = maxOffset > 0 ? 'true' : 'false';
+    if (!trendChartInstance) {
+        container.replaceChildren();
+        trendChartInstance = window.echarts.init(container, null, { renderer: 'canvas' });
+        trendChartInstance.on('click', (params) => {
+            const date = params?.data?.date || params?.name;
+            if (date) applyChartFilter({ exactDate: state.exactDate === date ? '' : date });
+        });
+    }
+    return trendChartInstance;
+}
+
+function trendChartOption(data, zoom, colors) {
+    return {
+        animation: false,
+        aria: { enabled: true, description: `每日投递趋势，共 ${data.length} 个日期` },
+        grid: { left: 46, right: 18, top: 28, bottom: 62, containLabel: false },
+        tooltip: {
+            trigger: 'axis',
+            backgroundColor: colors.panel,
+            borderColor: colors.grid,
+            textStyle: { color: colors.text, fontSize: 12 },
+            formatter: (items) => {
+                const item = items?.[0];
+                return item ? `${item.name}<br><strong>${numberFormat.format(item.value)} 份</strong>` : '';
+            },
+        },
+        xAxis: {
+            type: 'category',
+            boundaryGap: false,
+            data: data.map((item) => item.date),
+            axisLine: { lineStyle: { color: colors.grid } },
+            axisTick: { show: false },
+            axisLabel: { color: colors.axis, fontSize: 11, formatter: (value) => value.slice(5).replace('-', '/') },
+        },
+        yAxis: {
+            type: 'value',
+            minInterval: 1,
+            splitNumber: 4,
+            axisLabel: { color: colors.axis, fontSize: 11 },
+            splitLine: { lineStyle: { color: colors.grid } },
+        },
+        dataZoom: [
+            { type: 'inside', filterMode: 'none', start: zoom.start, end: zoom.end, zoomOnMouseWheel: true, moveOnMouseWheel: true, moveOnMouseMove: true },
+            { type: 'slider', filterMode: 'none', start: zoom.start, end: zoom.end, height: 18, bottom: 8, borderColor: colors.grid, backgroundColor: colors.grid, fillerColor: `${colors.cyan}33`, handleStyle: { color: colors.cyan, borderColor: colors.cyan }, textStyle: { color: colors.axis, fontSize: 10 } },
+        ],
+        series: [{
+            name: '每日投递',
+            type: 'line',
+            smooth: .24,
+            showSymbol: true,
+            symbol: 'circle',
+            symbolSize: 7,
+            lineStyle: { width: 2.5, color: colors.cyan, shadowColor: `${colors.cyan}66`, shadowBlur: 7 },
+            itemStyle: { color: colors.panel, borderColor: colors.cyan, borderWidth: 2 },
+            emphasis: { scale: 1.35, itemStyle: { color: colors.cyan } },
+            areaStyle: { color: new window.echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: `${colors.cyan}55` }, { offset: 1, color: `${colors.cyan}05` }]) },
+            markLine: { silent: true, symbol: 'none', label: { show: false }, lineStyle: { color: colors.muted, type: 'dashed' }, data: [{ type: 'average', name: '平均值' }] },
+            data: data.map((item) => ({ value: item.count, date: item.date, itemStyle: state.exactDate === item.date ? { color: colors.cyan } : undefined })),
+        }],
+    };
+}
+
+function renderTrend(records) {
+    const rangedRecords = trendRangeRecords(records);
+    const fullData = groupTrendDaily(rangedRecords);
+    const chart = ensureTrendChart();
+    $('#trendTotal').textContent = numberFormat.format(rangedRecords.length);
     const peak = fullData.reduce((best, item) => item.count > (best?.count ?? -1) ? item : best, null);
     $('#trendPeak').textContent = peak ? `峰值 ${peak.date.slice(5).replace('-', '/')} · ${peak.count} 份` : '峰值 —';
-    if (!data.length) { container.innerHTML = '<div class="empty-state"><strong>当前筛选暂无趋势数据</strong></div>'; return; }
-    const width = 760, height = 205, left = 34, right = 10, top = 12, bottom = 27;
-    const chartW = width - left - right, chartH = height - top - bottom;
-    const max = Math.max(...data.map((item) => item.count), 4), niceMax = Math.ceil(max / 5) * 5;
-    const coords = data.map((item, index) => ({ ...item, x: left + index / Math.max(data.length - 1, 1) * chartW, y: top + chartH - item.count / niceMax * chartH }));
-    const line = coords.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
-    const area = `${left},${top + chartH} ${line} ${left + chartW},${top + chartH}`;
-    const average = data.reduce((sum, item) => sum + item.count, 0) / data.length;
-    const avgY = top + chartH - average / niceMax * chartH;
-    const grid = Array.from({ length: 5 }, (_, index) => {
-        const value = Math.round(niceMax - niceMax / 4 * index), y = top + chartH / 4 * index;
-        return `<line class="grid-line" x1="${left}" y1="${y}" x2="${left + chartW}" y2="${y}"/><text class="axis-label" x="0" y="${y + 3}">${value}</text>`;
-    }).join('');
-    const step = Math.max(1, Math.ceil(data.length / 7));
-    const labels = coords.filter((_, index) => index % step === 0 || index === coords.length - 1).map((point) => `<text class="axis-label" text-anchor="middle" x="${point.x}" y="${height - 5}">${point.date.slice(5).replace('-', '/')}</text>`).join('');
-    const dots = coords.map((point) => `<circle class="trend-dot ${state.exactDate === point.date ? 'is-active' : ''}" data-date="${point.date}" cx="${point.x}" cy="${point.y}" r="2.8"><title>${point.date}：${point.count} 份，点击筛选</title></circle>`).join('');
-    const visibleRange = data.length ? `${data[0].date.slice(5).replace('-', '/')} — ${data.at(-1).date.slice(5).replace('-', '/')}` : '暂无日期';
-    const dragHint = maxOffset > 0
-        ? `<div class="trend-drag-indicator"><span>⇆</span><b>${visibleRange}</b><small>按住图表左右拖动日期</small></div>`
-        : `<div class="trend-drag-indicator static"><b>${visibleRange}</b><small>当前日期已全部显示</small></div>`;
-    container.innerHTML = `${dragHint}<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"><defs><linearGradient id="trendGradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--cyan)" stop-opacity=".23"/><stop offset="1" stop-color="var(--cyan)" stop-opacity="0"/></linearGradient></defs>${grid}<line class="average-line" x1="${left}" y1="${avgY}" x2="${left + chartW}" y2="${avgY}"/><polygon class="trend-area" points="${area}"/><polyline class="trend-line" points="${line}"/>${dots}${labels}</svg>`;
+    if (!chart) return;
+    if (!fullData.length) {
+        chart.clear();
+        chart.setOption({ title: { show: true, text: '当前筛选暂无趋势数据', left: 'center', top: 'middle', textStyle: { color: trendThemeColors().muted, fontSize: 12, fontWeight: 500 } } });
+        return;
+    }
+    const currentZoom = !state.trendView.resetZoom ? chart.getOption()?.dataZoom?.[0] : null;
+    const defaultStart = fullData.length > 14 ? Math.max(0, (fullData.length - 14) / fullData.length * 100) : 0;
+    const zoom = {
+        start: Number.isFinite(currentZoom?.start) ? currentZoom.start : defaultStart,
+        end: Number.isFinite(currentZoom?.end) ? currentZoom.end : 100,
+    };
+    chart.setOption(trendChartOption(fullData, zoom, trendThemeColors()), { notMerge: true });
+    state.trendView.resetZoom = false;
 }
 
 function renderFunnel(records) {
@@ -1289,18 +1354,11 @@ function bindChartInteractions() {
 }
 
 function bindTrendInteractions() {
-    const chart = $('#trendChart');
-    const redraw = () => renderTrend(getFilteredRecords(true));
+    const redraw = () => renderTrend(getFilteredRecords(true, false, true));
     $('#trendQuickRange').addEventListener('click', (event) => { const button = event.target.closest('[data-trend-range]'); if (button) setTrendRange(button.dataset.trendRange); });
-    const applyCustomDates = () => { state.trendStart = $('#trendStartDate').value; state.trendEnd = $('#trendEndDate').value; if (state.trendStart && state.trendEnd && state.trendStart > state.trendEnd) [state.trendStart, state.trendEnd] = [state.trendEnd, state.trendStart]; state.trendRange = 'custom'; state.trendView.zoom = 1; state.trendView.offset = 0; state.trendView.autoWindow = true; $$('#trendQuickRange button').forEach((button) => button.classList.remove('active')); redraw(); };
+    const applyCustomDates = () => { state.trendStart = $('#trendStartDate').value; state.trendEnd = $('#trendEndDate').value; if (state.trendStart && state.trendEnd && state.trendStart > state.trendEnd) [state.trendStart, state.trendEnd] = [state.trendEnd, state.trendStart]; state.trendRange = 'custom'; state.trendView.resetZoom = true; $$('#trendQuickRange button').forEach((button) => button.classList.remove('active')); redraw(); };
     $('#trendStartDate').addEventListener('change', applyCustomDates); $('#trendEndDate').addEventListener('change', applyCustomDates);
-    $('#trendScroll').addEventListener('input', (event) => { state.trendView.autoWindow = false; state.trendView.offset = Number(event.target.value); redraw(); });
-    const zoom = (factor, anchor = .5) => { const oldZoom = state.trendView.zoom; const next = Math.max(1, Math.min(12, oldZoom * factor)); state.trendView.offset += (1 - oldZoom / next) * anchor * Math.max(0, Number($('#trendScroll').max)); state.trendView.zoom = next; state.trendView.autoWindow = false; redraw(); };
-    $('#trendZoomIn').addEventListener('click', () => zoom(1.5)); $('#trendZoomOut').addEventListener('click', () => zoom(1 / 1.5));
-    chart.addEventListener('wheel', (event) => { event.preventDefault(); const rect = chart.getBoundingClientRect(); zoom(event.deltaY < 0 ? 1.25 : .8, (event.clientX - rect.left) / rect.width); }, { passive: false });
-    chart.addEventListener('pointerdown', (event) => { if (event.target.closest('.trend-dot') || Number($('#trendScroll').max) <= 0) return; state.trendView.autoWindow = false; state.trendView.dragging = true; state.trendView.startX = event.clientX; state.trendView.startOffset = state.trendView.offset; chart.setPointerCapture(event.pointerId); chart.classList.add('is-panning'); });
-    chart.addEventListener('pointermove', (event) => { if (!state.trendView.dragging) return; const pixelsPerDay = Math.max(chart.clientWidth, 1) / Math.max(1, state.trendView.visibleCount - 1); state.trendView.offset = state.trendView.startOffset - (event.clientX - state.trendView.startX) / pixelsPerDay; redraw(); });
-    const stop = () => { if (!state.trendView.dragging) return; state.trendView.dragging = false; state.trendView.offset = Math.round(state.trendView.offset); chart.classList.remove('is-panning'); redraw(); }; chart.addEventListener('pointerup', stop); chart.addEventListener('pointercancel', stop);
+    window.addEventListener('resize', () => trendChartInstance?.resize());
 }
 
 function initDatePicker() {
@@ -1340,7 +1398,7 @@ function closeDrawer() { $('#detailDrawer').classList.remove('open'); $('#drawer
 
 function updateDashboard() {
     const records = getFilteredRecords();
-    renderMetrics(records); renderTrend(getFilteredRecords(true)); renderFunnel(records); renderMap(getFilteredRecords(false, true)); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics();
+    renderMetrics(records); renderTrend(getFilteredRecords(true, false, true)); renderFunnel(records); renderMap(getFilteredRecords(false, true)); renderSalary(records); renderRoles(records); renderIndustry(records); renderRecords(records); renderFilterChips(); updateMonitorMetrics();
 }
 
 function updateMonitorMetrics() {
@@ -1913,7 +1971,10 @@ function applyTheme(theme, persist = true) {
         button.title = normalized === 'dark' ? '切换白天主题' : '切换深蓝主题';
         button.setAttribute('aria-label', button.title);
     }
-    if (state.payload) renderMap(getFilteredRecords());
+    if (state.payload) {
+        renderMap(getFilteredRecords());
+        renderTrend(getFilteredRecords(true, false, true));
+    }
 }
 
 function toggleTheme() {
