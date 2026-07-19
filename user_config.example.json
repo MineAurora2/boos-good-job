@@ -47,7 +47,15 @@
       "today",
       "within_3_days",
       "this_week",
-      "this_month"
+      "within_2_weeks",
+      "this_month",
+      "within_2_months",
+      "within_3_months",
+      "within_4_months",
+      "within_5_months",
+      "within_half_year",
+      "half_year_ago",
+      "unknown"
     ]
   },
   "scoring": {

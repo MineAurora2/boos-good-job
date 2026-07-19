@@ -12,7 +12,12 @@ import json
 from pathlib import Path
 
 from app import config
-from app.config import Config, HR_ACTIVE_LEVELS, hr_active_levels_from_minimum
+from app.config import (
+    Config,
+    HR_ACTIVE_LEVELS,
+    HR_ACTIVE_TIME_LEVELS,
+    hr_active_levels_from_minimum,
+)
 from app.llm import prompts
 from app.storage.resume_store import (
     list_resume_files,
@@ -99,7 +104,7 @@ def validate_config(config: dict) -> None:
         raise ValueError('hrActiveFilterEnabled 必须是开关值')
     if (
         'hrActiveMinLevel' in frontend
-        and frontend.get('hrActiveMinLevel') not in HR_ACTIVE_LEVELS
+        and frontend.get('hrActiveMinLevel') not in HR_ACTIVE_TIME_LEVELS
     ):
         raise ValueError('hrActiveMinLevel 不是有效的活跃档位')
     hr_active_levels = frontend.get('hrActiveLevels')

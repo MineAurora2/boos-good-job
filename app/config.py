@@ -19,26 +19,44 @@ HR_ACTIVE_LEVELS = (
     'today',
     'within_3_days',
     'this_week',
+    'within_2_weeks',
     'this_month',
+    'within_2_months',
+    'within_3_months',
+    'within_4_months',
+    'within_5_months',
+    'within_half_year',
+    'half_year_ago',
+    'unknown',
 )
+HR_ACTIVE_TIME_LEVELS = HR_ACTIVE_LEVELS[:-1]
 
 
 def hr_active_levels_from_minimum(value: object) -> list[str] | None:
     """Convert the legacy minimum threshold into an equivalent allow-list."""
-    if value not in HR_ACTIVE_LEVELS:
+    if value not in HR_ACTIVE_TIME_LEVELS:
         return None
-    return list(HR_ACTIVE_LEVELS[:HR_ACTIVE_LEVELS.index(value) + 1])
+    return list(HR_ACTIVE_TIME_LEVELS[:HR_ACTIVE_TIME_LEVELS.index(value) + 1])
 
 
 def migrate_hr_active_settings(frontend: dict) -> dict:
     """Migrate the legacy scalar HR threshold without overriding a new allow-list."""
-    if (
-        ('hrActiveLevels' not in frontend or frontend.get('hrActiveLevels') is None)
-        and 'hrActiveMinLevel' in frontend
-    ):
-        migrated = hr_active_levels_from_minimum(frontend.get('hrActiveMinLevel'))
-        if migrated is not None:
-            frontend['hrActiveLevels'] = migrated
+    missing = object()
+    levels = frontend.get('hrActiveLevels', missing)
+    legacy_present = 'hrActiveMinLevel' in frontend
+    migrated = (
+        hr_active_levels_from_minimum(frontend.get('hrActiveMinLevel'))
+        if legacy_present
+        else None
+    )
+    if isinstance(levels, list):
+        frontend['hrActiveLevels'] = [
+            level for level in levels if level in HR_ACTIVE_LEVELS
+        ]
+    elif migrated is not None:
+        frontend['hrActiveLevels'] = migrated
+    elif levels is not missing or legacy_present:
+        frontend['hrActiveLevels'] = []
     frontend.pop('hrActiveMinLevel', None)
     return frontend
 

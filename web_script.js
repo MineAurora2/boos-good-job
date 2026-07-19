@@ -745,19 +745,31 @@
 
     const HR_ACTIVE_LEVELS = Object.freeze({
         unknown: 0,
-        this_month: 1,
-        this_week: 2,
-        within_3_days: 3,
-        today: 4,
-        just_now: 5,
-        online: 6,
+        half_year_ago: 1,
+        within_half_year: 2,
+        within_5_months: 3,
+        within_4_months: 4,
+        within_3_months: 5,
+        within_2_months: 6,
+        this_month: 7,
+        within_2_weeks: 8,
+        this_week: 9,
+        within_3_days: 10,
+        today: 11,
+        just_now: 12,
+        online: 13,
     });
     const HR_ACTIVE_LEVEL_ORDER = Object.freeze([
-        'online', 'just_now', 'today', 'within_3_days', 'this_week', 'this_month',
+        'online', 'just_now', 'today', 'within_3_days', 'this_week', 'within_2_weeks',
+        'this_month', 'within_2_months', 'within_3_months', 'within_4_months',
+        'within_5_months', 'within_half_year', 'half_year_ago', 'unknown',
     ]);
     const HR_ACTIVE_LABELS = Object.freeze({
         online: '当前在线', just_now: '刚刚活跃', today: '今日活跃',
-        within_3_days: '3 日内活跃', this_week: '本周活跃', this_month: '本月活跃',
+        within_3_days: '3 日内活跃', this_week: '本周活跃', within_2_weeks: '2 周内活跃',
+        this_month: '本月活跃', within_2_months: '2 月内活跃', within_3_months: '3 月内活跃',
+        within_4_months: '4 月内活跃', within_5_months: '5 月内活跃',
+        within_half_year: '近半年活跃', half_year_ago: '半年前活跃', unknown: '未知',
     });
 
     function normalizeHrActive(value) {
@@ -768,7 +780,14 @@
         if (/今日活跃/.test(text)) return 'today';
         if (/3日内活跃|3天内活跃/.test(text)) return 'within_3_days';
         if (/本周活跃/.test(text)) return 'this_week';
+        if (/2周内活跃/.test(text)) return 'within_2_weeks';
         if (/本月活跃/.test(text)) return 'this_month';
+        if (/2月内活跃/.test(text)) return 'within_2_months';
+        if (/3月内活跃/.test(text)) return 'within_3_months';
+        if (/4月内活跃/.test(text)) return 'within_4_months';
+        if (/5月内活跃/.test(text)) return 'within_5_months';
+        if (/近半年活跃/.test(text)) return 'within_half_year';
+        if (/半年前活跃/.test(text)) return 'half_year_ago';
         return 'unknown';
     }
 
@@ -778,7 +797,7 @@
         }
         const minimum = HR_ACTIVE_LEVELS[OPTIONS.hrActiveMinLevel];
         if (!minimum) return [];
-        return HR_ACTIVE_LEVEL_ORDER.filter((level) => HR_ACTIVE_LEVELS[level] >= minimum);
+        return HR_ACTIVE_LEVEL_ORDER.filter((level) => level !== 'unknown' && HR_ACTIVE_LEVELS[level] >= minimum);
     }
 
     function hrActiveSelectionLabel() {
@@ -786,9 +805,9 @@
     }
 
     function hrActivePasses(level) {
-        if (!OPTIONS.hrActiveFilterEnabled || level === 'unknown') return true;
+        if (!OPTIONS.hrActiveFilterEnabled) return true;
         const selected = configuredHrActiveLevels();
-        if (!selected.length) return true;
+        if (!selected.length) return false;
         return selected.includes(level);
     }
 

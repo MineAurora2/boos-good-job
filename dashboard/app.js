@@ -62,7 +62,7 @@ const state = {
 
 const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)', 'var(--red)', 'var(--blue)'];
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
-const HR_ACTIVE_LABELS = { online: '当前在线', just_now: '刚刚活跃', today: '今日活跃', within_3_days: '3 日内活跃', this_week: '本周活跃', this_month: '本月活跃', unknown: '未知' };
+const HR_ACTIVE_LABELS = { online: '当前在线', just_now: '刚刚活跃', today: '今日活跃', within_3_days: '3 日内活跃', this_week: '本周活跃', within_2_weeks: '2 周内活跃', this_month: '本月活跃', within_2_months: '2 月内活跃', within_3_months: '3 月内活跃', within_4_months: '4 月内活跃', within_5_months: '5 月内活跃', within_half_year: '近半年活跃', half_year_ago: '半年前活跃', unknown: '未知' };
 const DECISION_STATE_LABELS = { evaluating: '正在评估', hr_filtered: 'HR 活跃未达标', below_threshold: '低于投递阈值', ai_rejected: 'AI 未通过', random_skipped: '随机跳过', claiming: '正在领取投递权', queued: '等待投递', sent: '已投递', failed: '处理失败' };
 const GREETING_MODE_LABELS = { none: '仅立即沟通', fixed: '固定招呼语', llm: 'AI 招呼语' };
 const LOG_SENDER_LABELS = { system: '系统', delivery: '投递', claim: '领取投递', queue: '投递等待' };
@@ -2042,7 +2042,7 @@ const CONFIG_TAG_MAX_LENGTH = 80;
 const HIDDEN_CONFIG_PATHS = new Set(['frontend.serverHost']);
 const CONFIG_ENUM_OPTIONS = {};
 const CONFIG_MULTI_OPTIONS = {
-    hrActiveLevels: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['this_month', '本月活跃']],
+    hrActiveLevels: [['online', '当前在线'], ['just_now', '刚刚活跃'], ['today', '今日活跃'], ['within_3_days', '3 日内活跃'], ['this_week', '本周活跃'], ['within_2_weeks', '2 周内活跃'], ['this_month', '本月活跃'], ['within_2_months', '2 月内活跃'], ['within_3_months', '3 月内活跃'], ['within_4_months', '4 月内活跃'], ['within_5_months', '5 月内活跃'], ['within_half_year', '近半年活跃'], ['half_year_ago', '半年前活跃'], ['unknown', '未知']],
 };
 
 function configLabel(key) { return CONFIG_LABELS[key] || key; }

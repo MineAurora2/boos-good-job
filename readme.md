@@ -154,8 +154,8 @@ http://127.0.0.1:47999/dashboard
 
 常用自动化配置：
 
-- `frontend.hrActiveFilterEnabled`：开启 HR 活跃度过滤；无法识别活跃状态时默认放行
-- `frontend.hrActiveLevels`：允许的活跃状态数组，可多选 `online`、`just_now`、`today`、`within_3_days`、`this_week`、`this_month`；岗位命中任一所选状态即通过
+- `frontend.hrActiveFilterEnabled`：开启 HR 活跃度过滤；开启后岗位必须命中 `frontend.hrActiveLevels` 所选状态
+- `frontend.hrActiveLevels`：允许的活跃状态数组，可多选 `online`、`just_now`、`today`、`within_3_days`、`this_week`、`within_2_weeks`、`this_month`、`within_2_months`、`within_3_months`、`within_4_months`、`within_5_months`、`within_half_year`、`half_year_ago`、`unknown`；无法识别的活跃文案归入 `unknown`，只有选中 `unknown` 才放行
 - `frontend.antiDetectionEnabled`：开启岗位顺序、随机跳过、随机等待和随机省略招呼语等行为节奏随机化
 
 ### 6. 部署浏览器脚本
