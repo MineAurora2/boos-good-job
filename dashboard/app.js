@@ -1377,26 +1377,98 @@ function bindTrendInteractions() {
 }
 
 function initDatePicker() {
-    const picker = document.createElement('div'); picker.className = 'gj-date-picker'; picker.hidden = true; picker.innerHTML = '<div class="gj-calendar-head"><button type="button" data-calendar-nav="-1" aria-label="上个月">‹</button><strong></strong><button type="button" data-calendar-nav="1" aria-label="下个月">›</button></div><div class="gj-calendar-week"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div><div class="gj-calendar-days"></div><div class="gj-calendar-foot"><button type="button" data-calendar-action="clear">清空</button><button type="button" data-calendar-action="today">今天</button></div>';
+    const picker = document.createElement('div'); picker.id = 'dashboardDatePicker'; picker.className = 'gj-date-picker'; picker.hidden = true; picker.setAttribute('role', 'dialog'); picker.setAttribute('aria-label', '日期选择器'); picker.innerHTML = '<div class="gj-calendar-head"><button type="button" data-calendar-nav="-1" aria-label="上个月"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></svg></button><strong></strong><button type="button" data-calendar-nav="1" aria-label="下个月"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></svg></button></div><div class="gj-calendar-range-status" hidden></div><div class="gj-calendar-week"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div><div class="gj-calendar-days"></div><div class="gj-calendar-foot"><button type="button" data-calendar-action="clear">清空</button><button type="button" data-calendar-action="today">今天</button></div>';
     document.body.appendChild(picker);
-    let activeInput = null; let viewDate = new Date();
+    let activeInput = null; let returnFocus = null; let viewDate = new Date(); let mode = 'single'; let rangeStart = ''; let rangeEnd = ''; let selectingRangeEnd = false;
     const selectedDate = () => activeInput?.value ? new Date(`${activeInput.value}T00:00:00`) : null;
-    const close = () => { picker.hidden = true; activeInput = null; };
-    const position = () => { if (!activeInput || picker.hidden) return; const rect = activeInput.closest('.trend-date-field').getBoundingClientRect(); const width = 286; let left = Math.min(rect.left, window.innerWidth - width - 12); let top = rect.bottom + 8; if (top + 350 > window.innerHeight) top = Math.max(12, rect.top - 350); picker.style.left = `${Math.max(12, left)}px`; picker.style.top = `${top}px`; };
+    const activeAnchor = () => mode === 'range' ? $('#scheduleDateTrigger') : activeInput?.closest('.trend-date-field');
+    const close = (restoreFocus = false) => {
+        picker.hidden = true;
+        $('#scheduleDateTrigger')?.setAttribute('aria-expanded', 'false');
+        activeInput = null;
+        if (restoreFocus) returnFocus?.focus();
+        returnFocus = null;
+    };
+    const position = () => { const anchor = activeAnchor(); if (!anchor || picker.hidden) return; const rect = anchor.getBoundingClientRect(); const width = 306; let left = Math.min(rect.left, window.innerWidth - width - 12); let top = rect.bottom + 8; if (top + 390 > window.innerHeight) top = Math.max(12, rect.top - 390); picker.style.left = `${Math.max(12, left)}px`; picker.style.top = `${top}px`; };
     const render = () => {
         const year = viewDate.getFullYear(), month = viewDate.getMonth(); picker.querySelector('.gj-calendar-head strong').textContent = `${year} 年 ${String(month + 1).padStart(2, '0')} 月`;
         const first = new Date(year, month, 1), offset = (first.getDay() + 6) % 7, start = new Date(year, month, 1 - offset), selected = selectedDate(), todayKey = localDateKey(new Date());
-        picker.querySelector('.gj-calendar-days').innerHTML = Array.from({ length: 42 }, (_, index) => { const date = new Date(start); date.setDate(start.getDate() + index); const key = localDateKey(date); const outside = date.getMonth() !== month; return `<button type="button" data-calendar-date="${key}" class="${outside ? 'outside' : ''} ${key === todayKey ? 'today' : ''} ${selected && key === localDateKey(selected) ? 'selected' : ''}"><span>${date.getDate()}</span></button>`; }).join('');
+        picker.querySelector('.gj-calendar-days').innerHTML = Array.from({ length: 42 }, (_, index) => {
+            const date = new Date(start); date.setDate(start.getDate() + index);
+            const key = localDateKey(date), outside = date.getMonth() !== month;
+            const singleSelected = mode === 'single' && selected && key === localDateKey(selected);
+            const rangeSelected = mode === 'range' && (key === rangeStart || key === rangeEnd);
+            const inRange = mode === 'range' && rangeStart && rangeEnd && key > rangeStart && key < rangeEnd;
+            const classes = [outside ? 'outside' : '', key === todayKey ? 'today' : '', singleSelected || rangeSelected ? 'selected' : '', key === rangeStart ? 'range-start' : '', key === rangeEnd ? 'range-end' : '', inRange ? 'in-range' : ''].filter(Boolean).join(' ');
+            return `<button type="button" data-calendar-date="${key}" class="${classes}" aria-label="${key}" aria-pressed="${singleSelected || rangeSelected}"><span>${date.getDate()}</span></button>`;
+        }).join('');
+        const rangeStatus = picker.querySelector('.gj-calendar-range-status');
+        rangeStatus.hidden = mode !== 'range';
+        if (mode === 'range') rangeStatus.textContent = selectingRangeEnd ? `${rangeStart} → 请选择结束日期` : (rangeStart && rangeEnd ? `${rangeStart} → ${rangeEnd}` : '请选择开始日期');
     };
-    const open = (input) => { activeInput = input; const parsed = selectedDate(); viewDate = parsed || new Date(); picker.hidden = false; render(); position(); };
-    ['trendStartDate', 'trendEndDate'].forEach((id) => { const input = document.getElementById(id); input.addEventListener('click', () => open(input)); input.closest('.trend-date-field').addEventListener('click', () => open(input)); });
+    const openSingle = (input) => { mode = 'single'; activeInput = input; returnFocus = input; const parsed = selectedDate(); viewDate = parsed || new Date(); picker.hidden = false; render(); position(); };
+    const openRange = () => {
+        mode = 'range'; activeInput = null; returnFocus = $('#scheduleDateTrigger'); rangeStart = $('#scheduleDateStart').value; rangeEnd = $('#scheduleDateEnd').value; selectingRangeEnd = Boolean(rangeStart && !rangeEnd);
+        viewDate = rangeStart ? new Date(`${rangeStart}T00:00:00`) : new Date(); picker.hidden = false; returnFocus.setAttribute('aria-expanded', 'true'); render(); position();
+    };
+    ['trendStartDate', 'trendEndDate'].forEach((id) => { const input = document.getElementById(id); input.closest('.trend-date-field').addEventListener('click', () => openSingle(input)); });
+    $('#scheduleDateTrigger')?.addEventListener('click', openRange);
+    const applyRange = (startValue, endValue) => {
+        const [normalizedStart, normalizedEnd] = normalizeDateRange(startValue, endValue);
+        $('#scheduleDateStart').value = normalizedStart; $('#scheduleDateEnd').value = normalizedEnd;
+        $('#scheduleDateStart').dispatchEvent(new Event('change', { bubbles: true }));
+        $('#scheduleDateEnd').dispatchEvent(new Event('change', { bubbles: true }));
+    };
     picker.addEventListener('click', (event) => {
         const nav = event.target.closest('[data-calendar-nav]'); if (nav) { viewDate = new Date(viewDate.getFullYear(), viewDate.getMonth() + Number(nav.dataset.calendarNav), 1); render(); return; }
-        const day = event.target.closest('[data-calendar-date]'); if (day && activeInput) { activeInput.value = day.dataset.calendarDate; activeInput.dispatchEvent(new Event('change', { bubbles: true })); close(); return; }
-        const action = event.target.closest('[data-calendar-action]'); if (!action || !activeInput) return; activeInput.value = action.dataset.calendarAction === 'today' ? localDateKey(new Date()) : ''; activeInput.dispatchEvent(new Event('change', { bubbles: true })); close();
+        const day = event.target.closest('[data-calendar-date]');
+        if (day && mode === 'single' && activeInput) { activeInput.value = day.dataset.calendarDate; activeInput.dispatchEvent(new Event('change', { bubbles: true })); close(true); return; }
+        if (day && mode === 'range') {
+            if (!selectingRangeEnd) { rangeStart = day.dataset.calendarDate; rangeEnd = ''; selectingRangeEnd = true; render(); return; }
+            rangeEnd = day.dataset.calendarDate; applyRange(rangeStart, rangeEnd); close(true); return;
+        }
+        const action = event.target.closest('[data-calendar-action]');
+        if (!action) return;
+        const value = action.dataset.calendarAction === 'today' ? localDateKey(new Date()) : '';
+        if (mode === 'single' && activeInput) { activeInput.value = value; activeInput.dispatchEvent(new Event('change', { bubbles: true })); close(true); return; }
+        if (mode === 'range') { applyRange(value, value); close(true); }
     });
-    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !event.target.closest('.trend-date-field')) close(); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') close(); }); window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
+    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !event.target.closest('.trend-date-field') && !event.target.closest('#scheduleDateTrigger')) close(); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); }); window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
+}
+
+function initScheduleTimePicker() {
+    const trigger = $('#scheduleTimeTrigger');
+    if (!trigger) return;
+    const picker = document.createElement('div'); picker.id = 'scheduleTimePicker'; picker.className = 'gj-time-picker'; picker.hidden = true; picker.setAttribute('role', 'dialog'); picker.setAttribute('aria-label', '开始时间选择器');
+    const wheelButtons = (count, unit) => Array.from({ length: count }, (_, value) => `<button type="button" data-time-unit="${unit}" data-time-value="${String(value).padStart(2, '0')}">${String(value).padStart(2, '0')}</button>`).join('');
+    picker.innerHTML = `<div class="gj-time-head"><span>开始时间</span><strong>24 小时制</strong></div><div class="gj-time-wheels"><div><span>小时</span><div class="gj-time-wheel" data-time-wheel="hour">${wheelButtons(24, 'hour')}</div></div><i>:</i><div><span>分钟</span><div class="gj-time-wheel" data-time-wheel="minute">${wheelButtons(60, 'minute')}</div></div></div><div class="gj-time-foot"><button type="button" data-time-action="now">现在</button><div><button type="button" data-time-action="cancel">取消</button><button type="button" data-time-action="apply">确定</button></div></div>`;
+    document.body.appendChild(picker);
+    let hour = '09', minute = '00';
+    const position = () => { if (picker.hidden) return; const rect = trigger.getBoundingClientRect(); const width = 300; let left = Math.min(rect.left, window.innerWidth - width - 12); let top = rect.bottom + 8; if (top + 350 > window.innerHeight) top = Math.max(12, rect.top - 350); picker.style.left = `${Math.max(12, left)}px`; picker.style.top = `${top}px`; };
+    const render = (scroll = false) => {
+        picker.querySelectorAll('[data-time-unit="hour"]').forEach((button) => button.classList.toggle('selected', button.dataset.timeValue === hour));
+        picker.querySelectorAll('[data-time-unit="minute"]').forEach((button) => button.classList.toggle('selected', button.dataset.timeValue === minute));
+        if (scroll) requestAnimationFrame(() => picker.querySelectorAll('.selected').forEach((button) => button.scrollIntoView({ block: 'center' })));
+    };
+    const close = (restoreFocus = false) => { picker.hidden = true; trigger.setAttribute('aria-expanded', 'false'); if (restoreFocus) trigger.focus(); };
+    const open = () => {
+        const current = /^([01]\d|2[0-3]):([0-5]\d)$/.exec($('#scheduleStartTime').value);
+        const now = new Date(); hour = current?.[1] || String(now.getHours()).padStart(2, '0'); minute = current?.[2] || String(now.getMinutes()).padStart(2, '0');
+        picker.hidden = false; trigger.setAttribute('aria-expanded', 'true'); render(true); position();
+    };
+    trigger.addEventListener('click', () => { if (picker.hidden) open(); else close(true); });
+    picker.addEventListener('click', (event) => {
+        const option = event.target.closest('[data-time-unit]');
+        if (option) { if (option.dataset.timeUnit === 'hour') hour = option.dataset.timeValue; else minute = option.dataset.timeValue; render(); return; }
+        const action = event.target.closest('[data-time-action]')?.dataset.timeAction;
+        if (action === 'cancel') { close(true); return; }
+        if (action === 'now') { const now = new Date(); hour = String(now.getHours()).padStart(2, '0'); minute = String(now.getMinutes()).padStart(2, '0'); render(true); return; }
+        if (action === 'apply') { $('#scheduleStartTime').value = `${hour}:${minute}`; $('#scheduleStartTime').dispatchEvent(new Event('change', { bubbles: true })); close(true); }
+    });
+    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !trigger.contains(event.target)) close(); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); });
+    window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
 }
 
 function openDrawer(id) {
@@ -1734,14 +1806,13 @@ function normalizedControlState() {
 }
 
 function schedulePayloadFromValues(values) {
-    const durationHours = Math.max(0, Number.parseInt(values.durationHours, 10) || 0);
-    const durationMinutes = Math.max(0, Number.parseInt(values.durationMinutes, 10) || 0);
+    const durationHours = Math.max(0, Math.min(24, Number.parseInt(values.durationHours, 10) || 0));
     const weekdays = [...new Set((Array.isArray(values.weekdays) ? values.weekdays : []).map((day) => Number(day)).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))].sort((a, b) => a - b);
     return {
         enabled: Boolean(values.enabled),
         mode: String(values.mode || 'daily'),
         startTime: String(values.startTime || '').trim(),
-        durationMinutes: durationHours * 60 + durationMinutes,
+        durationMinutes: durationHours * 60,
         weekdays,
         dateStart: String(values.dateStart || '').trim(),
         dateEnd: String(values.dateEnd || '').trim(),
@@ -1752,10 +1823,64 @@ function validateSchedulePayload(schedule) {
     if (!['daily', 'weekly', 'weekdays', 'date_range'].includes(schedule.mode)) return '请选择有效的周期';
     if (!schedule.enabled) return '';
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(schedule.startTime)) return '请输入有效的开始时间';
-    if (!Number.isInteger(schedule.durationMinutes) || schedule.durationMinutes < 1 || schedule.durationMinutes > 1440) return '持续时长需为 1 分钟至 24 小时';
+    if (!Number.isInteger(schedule.durationMinutes) || schedule.durationMinutes < 60 || schedule.durationMinutes > 1440 || schedule.durationMinutes % 60 !== 0) return '持续时长请选择 1 至 24 小时';
     if (schedule.mode === 'weekly' && !schedule.weekdays.length) return '每周模式至少选择一天';
     if (schedule.mode === 'date_range' && (!/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateStart) || !/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateEnd) || schedule.dateStart > schedule.dateEnd)) return '日期范围不能为空';
     return '';
+}
+
+function durationHoursFromMinutes(value) {
+    const minutes = Math.max(0, Number(value) || 0);
+    if (!minutes) return 0;
+    return Math.min(24, Math.ceil(minutes / 60));
+}
+
+function scheduleWindowModel(startTime, durationHours) {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(startTime || ''));
+    const hours = Math.max(0, Math.min(24, Number.parseInt(durationHours, 10) || 0));
+    if (!match || !hours) {
+        return { startMinutes: null, endMinutes: null, crossesMidnight: false, startLabel: '', endLabel: '', summary: '请选择开始时间和持续时长' };
+    }
+    const startMinutes = Number(match[1]) * 60 + Number(match[2]);
+    const totalMinutes = startMinutes + hours * 60;
+    const endMinutes = totalMinutes % 1440;
+    const crossesMidnight = totalMinutes >= 1440;
+    const endLabel = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`;
+    return {
+        startMinutes,
+        endMinutes,
+        crossesMidnight,
+        startLabel: `${match[1]}:${match[2]}`,
+        endLabel,
+        summary: `${match[1]}:${match[2]} → ${crossesMidnight ? '次日 ' : ''}${endLabel}`,
+    };
+}
+
+function durationHoursFromDialAngle(startTime, angleDegrees) {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(startTime || ''));
+    if (!match) return 1;
+    const startMinutes = Number(match[1]) * 60 + Number(match[2]);
+    const startAngle = startMinutes / 4;
+    const normalizedAngle = ((Number(angleDegrees) % 360) + 360) % 360;
+    const delta = (normalizedAngle - startAngle + 360) % 360;
+    const roundedHours = Math.round(delta / 15);
+    return roundedHours === 0 ? 24 : Math.max(1, Math.min(24, roundedHours));
+}
+
+function adjustScheduleDurationByKey(currentHours, key) {
+    const current = Math.max(1, Math.min(24, Number.parseInt(currentHours, 10) || 1));
+    if (key === 'Home') return 1;
+    if (key === 'End') return 24;
+    if (key === 'ArrowUp' || key === 'ArrowRight') return Math.min(24, current + 1);
+    if (key === 'ArrowDown' || key === 'ArrowLeft') return Math.max(1, current - 1);
+    return null;
+}
+
+function normalizeDateRange(start, end) {
+    const first = String(start || '');
+    const second = String(end || '');
+    if (!first || !second || first <= second) return [first, second];
+    return [second, first];
 }
 
 function renderGlobalLifecycle(data = normalizedControlState()) {
@@ -1781,6 +1906,95 @@ function scheduleStatusLabel(status) {
     return '日期范围已结束';
 }
 
+function scheduleDialPoint(angle, radius = 124) {
+    const radians = (Number(angle) - 90) * Math.PI / 180;
+    return { x: 160 + Math.cos(radians) * radius, y: 160 + Math.sin(radians) * radius };
+}
+
+function renderScheduleDial(startTime, durationHours) {
+    const dial = $('#scheduleDurationDial');
+    const arc = $('#scheduleDurationArc');
+    const handle = $('#scheduleDurationHandle');
+    const startMarker = $('#scheduleStartMarker');
+    if (!dial || !arc || !handle || !startMarker) return;
+    const model = scheduleWindowModel(startTime, durationHours);
+    const hours = Math.max(0, Math.min(24, Number(durationHours) || 0));
+    const startAngle = model.startMinutes === null ? 0 : model.startMinutes / 4;
+    const endAngle = (startAngle + hours * 15) % 360;
+    const startPoint = scheduleDialPoint(startAngle, 112);
+    const endPoint = scheduleDialPoint(endAngle);
+    const ticks = $('#scheduleDialTicks');
+    if (ticks && !ticks.childElementCount) {
+        const namespace = 'http://www.w3.org/2000/svg';
+        Array.from({ length: 24 }, (_, hour) => {
+            const angle = hour * 15;
+            const outer = scheduleDialPoint(angle, hour % 6 === 0 ? 114 : 112);
+            const inner = scheduleDialPoint(angle, hour % 6 === 0 ? 102 : 106);
+            const line = document.createElementNS(namespace, 'line');
+            line.setAttribute('x1', inner.x.toFixed(2)); line.setAttribute('y1', inner.y.toFixed(2));
+            line.setAttribute('x2', outer.x.toFixed(2)); line.setAttribute('y2', outer.y.toFixed(2));
+            if (hour % 6 === 0) line.classList.add('major');
+            ticks.appendChild(line);
+        });
+    }
+    dial.dataset.unset = hours ? 'false' : 'true';
+    arc.style.strokeDasharray = hours ? `${hours / 24 * 100} ${100 - hours / 24 * 100}` : '0 100';
+    arc.style.transform = `rotate(${startAngle - 90}deg)`;
+    startMarker.setAttribute('transform', `translate(${startPoint.x.toFixed(2)} ${startPoint.y.toFixed(2)})`);
+    handle.setAttribute('transform', `translate(${endPoint.x.toFixed(2)} ${endPoint.y.toFixed(2)})`);
+    handle.setAttribute('aria-valuenow', String(hours || 1));
+    handle.setAttribute('aria-valuetext', hours ? `${hours} 小时` : '未设置');
+    $('#scheduleDurationValue').textContent = hours || '—';
+    $('#scheduleWindowSummary').textContent = model.summary;
+}
+
+function schedulePlanSummary(schedule, durationHours) {
+    const modeLabels = { daily: '每天', weekly: '每周', weekdays: '工作日', date_range: '日期范围' };
+    const weekdayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+    const parts = [modeLabels[schedule.mode] || '未选择周期'];
+    if (schedule.mode === 'weekly' && schedule.weekdays?.length) parts.push(schedule.weekdays.map((day) => weekdayLabels[day]).join('、'));
+    if (schedule.mode === 'date_range' && schedule.dateStart && schedule.dateEnd) parts.push(`${schedule.dateStart} 至 ${schedule.dateEnd}`);
+    if (schedule.startTime) parts.push(schedule.startTime);
+    if (durationHours) parts.push(`${durationHours} 小时`);
+    return parts.length >= 3 || (schedule.mode === 'daily' && schedule.startTime && durationHours) || (schedule.mode === 'weekdays' && schedule.startTime && durationHours)
+        ? parts.join(' · ')
+        : '计划尚未完成';
+}
+
+function formatScheduleDate(value) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+    return match ? `${match[1]}.${match[2]}.${match[3]}` : '选择日期';
+}
+
+function scheduleDraftFromForm() {
+    const values = scheduleFormValues();
+    const payload = schedulePayloadFromValues(values);
+    return { ...payload, durationHours: Math.max(0, Math.min(24, Number.parseInt(values.durationHours, 10) || 0)) };
+}
+
+function clearScheduleErrors() {
+    $$('.schedule-field-error').forEach((element) => { element.textContent = ''; });
+    $$('.schedule-field-invalid').forEach((element) => element.classList.remove('schedule-field-invalid'));
+}
+
+function showScheduleValidationError(message) {
+    clearScheduleErrors();
+    const target = message.includes('开始时间')
+        ? ['#scheduleStartTimeError', '#scheduleTimeTrigger']
+        : message.includes('持续时长')
+            ? ['#scheduleDurationError', '#scheduleDurationHandle']
+            : message.includes('每周')
+                ? ['#scheduleWeekdaysError', '#scheduleWeekdays']
+                : message.includes('日期范围')
+                    ? ['#scheduleDateRangeError', '#scheduleDateTrigger']
+                    : [null, '#scheduleMode'];
+    if (target[0]) $(target[0]).textContent = message;
+    const control = $(target[1]);
+    control?.classList.add('schedule-field-invalid');
+    const focusTarget = control?.matches('button,[tabindex],input,select') ? control : control?.querySelector('button,input,[tabindex]');
+    focusTarget?.focus();
+}
+
 function renderSchedulePanel(data = normalizedControlState()) {
     const card = $('#deliveryScheduleCard');
     if (!card) return;
@@ -1788,21 +2002,40 @@ function renderSchedulePanel(data = normalizedControlState()) {
     const status = data.scheduleStatus || {};
     const setValue = (selector, value) => { const element = $(selector); if (element) element.value = value ?? ''; };
     const setChecked = (selector, value) => { const element = $(selector); if (element) element.checked = Boolean(value); };
-    const duration = Math.max(0, Number(schedule.durationMinutes) || 0);
+    const durationHours = schedule.durationHours === undefined
+        ? durationHoursFromMinutes(schedule.durationMinutes)
+        : Math.max(0, Math.min(24, Number(schedule.durationHours) || 0));
     setChecked('#scheduleEnabled', schedule.enabled);
     setValue('#scheduleMode', schedule.mode || 'daily');
     setValue('#scheduleStartTime', schedule.startTime || '');
-    setValue('#scheduleDurationHours', Math.floor(duration / 60));
-    setValue('#scheduleDurationMinutes', duration % 60);
+    setValue('#scheduleDurationHours', durationHours);
     setValue('#scheduleDateStart', schedule.dateStart || '');
     setValue('#scheduleDateEnd', schedule.dateEnd || '');
     $$('[data-schedule-weekday]').forEach((input) => { input.checked = (schedule.weekdays || []).includes(Number(input.value)); });
     $$('[data-schedule-section]').forEach((section) => { section.hidden = section.dataset.scheduleSection !== schedule.mode; });
+    $$('[data-schedule-mode]').forEach((button) => {
+        const selected = button.dataset.scheduleMode === schedule.mode;
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+    });
+    $('#scheduleStartTimeDisplay').textContent = schedule.startTime || '选择开始时间';
+    $('#scheduleDateStartDisplay').textContent = formatScheduleDate(schedule.dateStart);
+    $('#scheduleDateEndDisplay').textContent = formatScheduleDate(schedule.dateEnd);
+    $('#schedulePlanSummary').textContent = schedulePlanSummary(schedule, durationHours);
+    renderScheduleDial(schedule.startTime, durationHours);
     const text = scheduleStatusLabel(status);
     $('#scheduleStatusText').textContent = text;
-    $('#scheduleStatus').textContent = text;
+    const statusNode = $('#scheduleStatus');
+    statusNode.querySelector('span').textContent = text;
+    statusNode.classList.toggle('running', status.state === 'running');
+    statusNode.classList.toggle('waiting', Boolean(status.enabled && status.state !== 'running'));
     $('#scheduleFeedback').textContent = state.scheduleFeedback || '';
-    ['#saveSchedule', '#applySchedule'].forEach((selector) => { const button = $(selector); if (button) button.disabled = state.scheduleSaving; });
+    ['#saveSchedule', '#applySchedule'].forEach((selector) => {
+        const button = $(selector);
+        if (!button) return;
+        button.disabled = state.scheduleSaving;
+        button.setAttribute('aria-busy', String(state.scheduleSaving));
+    });
 }
 
 function scheduleFormValues() {
@@ -1811,7 +2044,6 @@ function scheduleFormValues() {
         mode: $('#scheduleMode')?.value,
         startTime: $('#scheduleStartTime')?.value,
         durationHours: $('#scheduleDurationHours')?.value,
-        durationMinutes: $('#scheduleDurationMinutes')?.value,
         weekdays: $$('[data-schedule-weekday]:checked').map((input) => Number(input.value)),
         dateStart: $('#scheduleDateStart')?.value,
         dateEnd: $('#scheduleDateEnd')?.value,
@@ -1824,8 +2056,10 @@ async function saveSchedule(applyNow) {
     if (validationError) {
         state.scheduleFeedback = validationError;
         renderSchedulePanel();
+        showScheduleValidationError(validationError);
         return null;
     }
+    clearScheduleErrors();
     state.scheduleSaving = true;
     state.scheduleFeedback = '正在保存计划…';
     renderSchedulePanel();
@@ -1848,16 +2082,56 @@ function bindScheduleControls() {
     const card = $('#deliveryScheduleCard');
     if (!card || card.dataset.bound === '1') return;
     card.dataset.bound = '1';
+    const updateDraft = () => { state.scheduleDraft = scheduleDraftFromForm(); renderSchedulePanel(); };
+    card.addEventListener('click', (event) => {
+        const modeButton = event.target.closest('[data-schedule-mode]');
+        if (modeButton) {
+            $('#scheduleMode').value = modeButton.dataset.scheduleMode;
+            $('#scheduleMode').dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    });
     card.addEventListener('change', (event) => {
         if (!event.target.matches('[data-schedule-field], [data-schedule-weekday]')) return;
-        const values = schedulePayloadFromValues(scheduleFormValues());
-        state.scheduleDraft = values;
-        if (event.target.matches('#scheduleMode')) renderSchedulePanel();
+        clearScheduleErrors();
+        updateDraft();
     });
     card.addEventListener('input', (event) => {
         if (!event.target.matches('[data-schedule-field]')) return;
-        state.scheduleDraft = schedulePayloadFromValues(scheduleFormValues());
+        clearScheduleErrors();
+        updateDraft();
     });
+    const setDuration = (hours) => {
+        const input = $('#scheduleDurationHours');
+        input.value = Math.max(1, Math.min(24, Number(hours) || 1));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const dialSvg = $('#scheduleDurationDial svg');
+    const durationFromPointer = (event) => {
+        const rect = dialSvg.getBoundingClientRect();
+        const x = event.clientX - (rect.left + rect.width / 2);
+        const y = event.clientY - (rect.top + rect.height / 2);
+        const angle = ((Math.atan2(y, x) * 180 / Math.PI) + 90 + 360) % 360;
+        setDuration(durationHoursFromDialAngle($('#scheduleStartTime').value || '00:00', angle));
+    };
+    let draggingDial = false;
+    dialSvg.addEventListener('pointerdown', (event) => {
+        draggingDial = true;
+        dialSvg.setPointerCapture?.(event.pointerId);
+        $('#scheduleDurationHandle').focus();
+        durationFromPointer(event);
+    });
+    dialSvg.addEventListener('pointermove', (event) => { if (draggingDial) durationFromPointer(event); });
+    const stopDragging = () => { draggingDial = false; };
+    dialSvg.addEventListener('pointerup', stopDragging);
+    dialSvg.addEventListener('pointercancel', stopDragging);
+    $('#scheduleDurationHandle').addEventListener('keydown', (event) => {
+        const next = adjustScheduleDurationByKey($('#scheduleDurationHours').value, event.key);
+        if (next === null) return;
+        event.preventDefault();
+        setDuration(next);
+    });
+    $('#scheduleDurationDecrease').addEventListener('click', () => setDuration(Math.max(1, (Number($('#scheduleDurationHours').value) || 1) - 1)));
+    $('#scheduleDurationIncrease').addEventListener('click', () => setDuration(Math.min(24, (Number($('#scheduleDurationHours').value) || 0) + 1)));
     $('#saveSchedule')?.addEventListener('click', () => saveSchedule(false));
     $('#applySchedule')?.addEventListener('click', () => { const applyNow = true; saveSchedule(applyNow); });
 }
@@ -3197,6 +3471,7 @@ initReportDrag();
 bindChartInteractions();
 bindTrendInteractions();
 initDatePicker();
+initScheduleTimePicker();
 bindTableInteractions();
 initMapNavigation();
 bindEvents();
