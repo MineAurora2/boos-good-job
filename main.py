@@ -10,6 +10,7 @@ import webbrowser
 
 from fastapi import FastAPI
 
+from app.llm.manager import LLM_MANAGER
 from app.security import HybridAuthMiddleware, SecurityPolicy
 from app.state import STATE
 from app.routes import control_router, delivery_router, shutdown_introduce_jobs
@@ -22,10 +23,14 @@ DASHBOARD_URL = 'http://127.0.0.1:47999/dashboard'
 async def lifespan(_app: FastAPI):
     """Initialize configuration, SQLite storage, and one-time legacy migration."""
     STATE.startup()
+    LLM_MANAGER.set_usage_recorder(STATE.llm_usage_store.record_attempt)
     try:
         yield
     finally:
-        await shutdown_introduce_jobs()
+        try:
+            await shutdown_introduce_jobs()
+        finally:
+            LLM_MANAGER.set_usage_recorder(None)
 
 
 def create_app() -> FastAPI:

@@ -22,6 +22,47 @@ import httpx
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+def _valid_token(value: object) -> int | None:
+    """Accept only native, non-negative integer token counts."""
+    if type(value) is int and value >= 0:
+        return value
+    return None
+
+
+def extract_usage(data: object) -> tuple[bool, int, int, int]:
+    """Extract token usage from either OpenAI or input/output naming schemes."""
+    if not isinstance(data, dict):
+        return False, 0, 0, 0
+    usage = data.get('usage')
+    if not isinstance(usage, dict):
+        return False, 0, 0, 0
+
+    def first_valid(*keys: str) -> int | None:
+        for key in keys:
+            value = _valid_token(usage.get(key))
+            if value is not None:
+                return value
+        return None
+
+    input_tokens = first_valid('input_tokens', 'prompt_tokens')
+    output_tokens = first_valid('output_tokens', 'completion_tokens')
+    total_tokens = first_valid('total_tokens')
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+
+    reported = any(value is not None for value in (input_tokens, output_tokens, total_tokens))
+    return (
+        reported,
+        input_tokens or 0,
+        output_tokens or 0,
+        total_tokens or 0,
+    )
+
+
+# Keep a private spelling available to callers that used the helper during rollout.
+_extract_usage = extract_usage
+
+
 def response_text(value) -> str:
     """把不同兼容服务返回的字符串或内容分片统一整理为纯文本。"""
     if isinstance(value, str):
@@ -217,7 +258,26 @@ class LLMGateway:
         except ValueError:
             return 0.0
 
-    async def _request(self, config: dict, payload: dict) -> dict:
+    @staticmethod
+    async def _notify_attempt(observer: Callable | None, event: dict) -> None:
+        """Run accounting off the event loop without changing request outcomes."""
+        if observer is None:
+            return
+        try:
+            result = await asyncio.to_thread(observer, event)
+            if hasattr(result, '__await__'):
+                await result
+        except Exception:
+            # Accounting is deliberately fail-open. The manager logs recorder failures.
+            return
+
+    async def _request(
+        self,
+        config: dict,
+        payload: dict,
+        purpose: str = '',
+        attempt_observer: Callable | None = None,
+    ) -> dict:
         """执行一次逻辑请求，包含限流、重试、响应校验和熔断统计。"""
         max_concurrent = self._int(config, 'max_concurrent_requests', 1, 1)
         retries = self._int(config, 'retry_count', 2, 0)
@@ -252,10 +312,30 @@ class LLMGateway:
                         if wait_for_slot:
                             await asyncio.sleep(wait_for_slot)
                         response = None
+                        data = None
+                        usage_reported = False
+                        input_tokens = output_tokens = total_tokens = 0
+                        attempt_model = str(config.get('model') or '')
+                        attempt_started = False
+                        attempt_success = False
+                        retry_delay: float | None = None
                         try:
+                            # Set this immediately before invoking the transport. A circuit
+                            # rejection, client construction error, or throttling cancellation
+                            # therefore cannot be mistaken for a real upstream attempt.
+                            attempt_started = True
                             response = await client.post(url, json=payload, headers=headers)
+                            parse_error = None
+                            try:
+                                data = response.json()
+                            except (ValueError, json.JSONDecodeError) as error:
+                                parse_error = error
+                            if isinstance(data, dict):
+                                usage_reported, input_tokens, output_tokens, total_tokens = extract_usage(data)
+                                attempt_model = str(data.get('model') or config.get('model') or '')
                             response.raise_for_status()
-                            data = response.json()
+                            if parse_error is not None:
+                                raise parse_error
                             if not isinstance(data, dict):
                                 raise ValueError('LLM response must be a JSON object')
                             choices = data.get('choices')
@@ -272,6 +352,7 @@ class LLMGateway:
                                 raise ValueError('LLM response content is empty')
                             self._record_success()
                             outcome_recorded = True
+                            attempt_success = True
                             return data
                         except (httpx.HTTPError, ValueError, KeyError, json.JSONDecodeError) as error:
                             status_code = response.status_code if response is not None else None
@@ -289,8 +370,30 @@ class LLMGateway:
                             # 指数退避叠加少量随机抖动，减少多个任务同时重试造成的尖峰；
                             # 服务端明确给出的 Retry-After 拥有更高优先级。
                             delay = min(max_delay, base_delay * (2 ** attempt))
-                            delay = max(retry_after, delay + random.uniform(0, max(0.05, delay * 0.2)))
-                            await asyncio.sleep(delay)
+                            retry_delay = max(
+                                retry_after,
+                                delay + random.uniform(0, max(0.05, delay * 0.2)),
+                            )
+                        finally:
+                            if attempt_started:
+                                await self._notify_attempt(
+                                    attempt_observer,
+                                    {
+                                        'provider_id': config.get('provider_id', ''),
+                                        'provider_name': config.get('provider_name', ''),
+                                        'api_base': config.get('api_base', ''),
+                                        'model': attempt_model,
+                                        'purpose': purpose,
+                                        'success': attempt_success,
+                                        'usage_reported': usage_reported,
+                                        'input_tokens': input_tokens,
+                                        'output_tokens': output_tokens,
+                                        'total_tokens': total_tokens,
+                                        'occurred_at': datetime.now().astimezone(),
+                                    },
+                                )
+                        if retry_delay is not None:
+                            await asyncio.sleep(retry_delay)
 
                 final_error = last_error or LLMGatewayError('unknown LLM gateway error')
                 self._record_failure(config, final_error)
@@ -302,7 +405,13 @@ class LLMGateway:
                 if is_probe and not outcome_recorded:
                     self._clear_half_open_probe()
 
-    async def chat_completions(self, config: dict, payload: dict, purpose: str) -> dict:
+    async def chat_completions(
+        self,
+        config: dict,
+        payload: dict,
+        purpose: str,
+        attempt_observer: Callable | None = None,
+    ) -> dict:
         """返回聊天补全结果，并合并同一事件循环中的相同在途请求。"""
         cache_ttl = self._float(config, 'cache_ttl_seconds', 1800)
         cache_key = self._cache_key(config, payload, purpose)
@@ -315,7 +424,9 @@ class LLMGateway:
         with self._lock:
             task = self._inflight.get(inflight_key)
             if task is None:
-                task = asyncio.create_task(self._request(config, payload))
+                task = asyncio.create_task(
+                    self._request(config, payload, purpose, attempt_observer)
+                )
                 self._inflight[inflight_key] = task
 
                 def complete(completed: asyncio.Task) -> None:

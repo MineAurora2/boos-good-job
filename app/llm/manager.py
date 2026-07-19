@@ -11,13 +11,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import itertools
 import threading
 import time
 
 import httpx
 
-from app.llm.gateway import LLMGateway, LLMGatewayError
+from app.llm.gateway import LLMGateway, LLMGatewayError, extract_usage, response_text
 from app.llm import env_store as llm_env_store
 
 
@@ -47,8 +48,10 @@ class LLMProvider:
         timeout: int,
         proxy_url: str = '',
         proxy_enabled: bool = False,
+        provider_id: str = '',
     ):
         self.index = index
+        self.provider_id = str(provider_id or '')
         self.name = name or f'接口{index}'
         self.api_base = api_base
         self.api_key = api_key
@@ -62,6 +65,8 @@ class LLMProvider:
         """LLMGateway.chat_completions 需要的配置字典。"""
         return {
             **_GATEWAY_DEFAULTS,
+            'provider_id': self.provider_id,
+            'provider_name': self.name,
             'api_base': self.api_base,
             'api_key': self.api_key,
             'model': self.model,
@@ -88,6 +93,7 @@ class LLMProvider:
         gate = self.gateway.snapshot()
         return {
             'index': self.index,
+            'providerId': self.provider_id,
             'name': self.name,
             'model': self.model,
             'apiBase': self.api_base,
@@ -112,7 +118,33 @@ class LLMManager:
         self._strategy = llm_env_store.DEFAULT_STRATEGY
         self._job_filter = False
         self._round_robin = itertools.count()
+        self._usage_recorder = None
+        self._usage_warning_at: float | None = None
         self.reload()
+
+    def set_usage_recorder(self, recorder) -> None:
+        """Attach the process-wide usage sink; ``None`` disables accounting."""
+        with self._lock:
+            self._usage_recorder = recorder
+
+    def _record_usage_event(self, event: dict) -> None:
+        """Persist one event without allowing storage failures to affect an LLM call."""
+        with self._lock:
+            recorder = self._usage_recorder
+        if recorder is None:
+            return
+        try:
+            recorder(**event)
+        except Exception as error:
+            now = time.monotonic()
+            should_warn = False
+            with self._lock:
+                last_warning = getattr(self, '_usage_warning_at', None)
+                if last_warning is None or now - last_warning >= 60:
+                    self._usage_warning_at = now
+                    should_warn = True
+            if should_warn:
+                print(f'[LLM usage] recording failed: {error}', flush=True)
 
     # ------------------------------------------------------------------ 配置
 
@@ -121,12 +153,21 @@ class LLMManager:
         config = llm_env_store.load_llm_config()
         with self._lock:
             existing_by_index = {provider.index: provider for provider in self._providers}
+            existing_by_id = {
+                provider.provider_id: provider
+                for provider in self._providers
+                if provider.provider_id
+            }
         providers = []
         for item in config['providers']:
             if not item.get('enabled'):
                 continue
-            provider = existing_by_index.get(item['index'])
+            provider = (
+                existing_by_id.get(item.get('provider_id'))
+                or existing_by_index.get(item['index'])
+            )
             unchanged = provider is not None and (
+                provider.provider_id,
                 provider.api_base,
                 provider.api_key,
                 provider.model,
@@ -134,6 +175,7 @@ class LLMManager:
                 provider.proxy_url,
                 provider.proxy_enabled,
             ) == (
+                item.get('provider_id', ''),
                 item['api_base'],
                 item['api_key'],
                 item['model'],
@@ -142,9 +184,11 @@ class LLMManager:
                 item['proxy_enabled'],
             )
             if unchanged:
+                provider.index = item['index']
                 provider.name = item['name'] or f'接口{item["index"]}'
             else:
                 provider = LLMProvider(
+                    provider_id=item.get('provider_id', ''),
                     index=item['index'],
                     name=item['name'],
                     api_base=item['api_base'],
@@ -204,7 +248,10 @@ class LLMManager:
             request_payload = {**payload, 'model': provider.model}
             try:
                 return await provider.gateway.chat_completions(
-                    provider.gateway_config(), request_payload, purpose
+                    provider.gateway_config(),
+                    request_payload,
+                    purpose,
+                    attempt_observer=self._record_usage_event,
                 )
             except LLMGatewayError as error:
                 last_error = error
@@ -219,7 +266,11 @@ class LLMManager:
         target = next((item for item in config['providers'] if item['index'] == index), None)
         if target is None:
             return {'ok': False, 'error': '接口不存在'}
-        return await self._test_provider_config(target, config['timeout'])
+        return await self._test_provider_config(
+            target,
+            config['timeout'],
+            usage_recorder=self._record_usage_event,
+        )
 
     async def test_provider_payload(self, payload: dict) -> dict:
         """使用前端当前卡片内容测活，无需先保存。"""
@@ -228,10 +279,14 @@ class LLMManager:
         except ValueError as error:
             return {'ok': False, 'error': str(error)}
         config = llm_env_store.load_llm_config()
-        return await self._test_provider_config(target, config['timeout'])
+        return await self._test_provider_config(
+            target,
+            config['timeout'],
+            usage_recorder=self._record_usage_event,
+        )
 
     @staticmethod
-    async def _test_provider_config(target: dict, timeout: int) -> dict:
+    async def _test_provider_config(target: dict, timeout: int, usage_recorder=None) -> dict:
         """用最小聊天请求测试一份已解析配置，并返回延迟和连接方式。"""
         if not (target['api_base'] and target['api_key'] and target['model']):
             return {'ok': False, 'error': '接口地址、模型或 API Key 未配置完整'}
@@ -252,10 +307,28 @@ class LLMManager:
         started = time.monotonic()
         # 与正式请求保持一致：开关关闭时传 None，且禁用环境代理，确保真正直连。
         proxy = target.get('proxy_url') if target.get('proxy_enabled') else None
+        response = None
+        data = None
+        usage_reported = False
+        input_tokens = output_tokens = total_tokens = 0
+        attempt_model = str(target.get('model') or '')
+        result_model = ''
+        attempt_started = False
+        attempt_success = False
         try:
             async with httpx.AsyncClient(timeout=min(30, timeout), proxy=proxy, trust_env=False) as client:
+                attempt_started = True
                 response = await client.post(url, json=body, headers=headers)
             latency = round((time.monotonic() - started) * 1000)
+            parse_error = None
+            try:
+                data = response.json()
+            except (ValueError, TypeError) as error:
+                parse_error = error
+            if isinstance(data, dict):
+                usage_reported, input_tokens, output_tokens, total_tokens = extract_usage(data)
+                attempt_model = str(data.get('model') or target.get('model') or '')
+                result_model = attempt_model
             if response.status_code >= 400:
                 detail = response.text[:200]
                 return {
@@ -263,21 +336,64 @@ class LLMManager:
                     'status': response.status_code,
                     'latencyMs': latency,
                     'error': f'HTTP {response.status_code}: {detail}',
+                    'providerId': target.get('provider_id') or target.get('providerId', ''),
                 }
-            data = response.json()
-            model = ''
-            if isinstance(data, dict):
-                model = str(data.get('model') or target['model'])
+            if parse_error is not None:
+                raise parse_error
+            if not isinstance(data, dict):
+                raise ValueError('LLM response must be a JSON object')
+            choices = data.get('choices')
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise ValueError('LLM response is missing choices')
+            message = choices[0].get('message')
+            if not isinstance(message, dict):
+                raise ValueError('LLM response is missing message')
+            if (
+                not response_text(message.get('content'))
+                and not response_text(message.get('reasoning_content'))
+                and not response_text(message.get('reasoning'))
+            ):
+                raise ValueError('LLM response content is empty')
+            attempt_success = True
             return {
                 'ok': True,
                 'status': response.status_code,
                 'latencyMs': latency,
-                'model': model,
+                'model': result_model,
                 'viaProxy': bool(proxy),
+                'providerId': target.get('provider_id') or target.get('providerId', ''),
             }
         except (httpx.HTTPError, httpx.InvalidURL, ValueError, ImportError) as error:
             latency = round((time.monotonic() - started) * 1000)
-            return {'ok': False, 'latencyMs': latency, 'error': f'{type(error).__name__}: {error}'}
+            return {
+                'ok': False,
+                'latencyMs': latency,
+                'error': f'{type(error).__name__}: {error}',
+                'providerId': target.get('provider_id') or target.get('providerId', ''),
+            }
+        finally:
+            if attempt_started:
+                event = {
+                    'provider_id': target.get('provider_id') or target.get('providerId', ''),
+                    'provider_name': target.get('name', ''),
+                    'api_base': target.get('api_base', ''),
+                    'model': attempt_model,
+                    'purpose': 'connection_test',
+                    'success': attempt_success,
+                    'usage_reported': usage_reported,
+                    'input_tokens': input_tokens,
+                    'output_tokens': output_tokens,
+                    'total_tokens': total_tokens,
+                    'occurred_at': datetime.now().astimezone(),
+                }
+                if usage_recorder is not None:
+                    try:
+                        result = await asyncio.to_thread(usage_recorder, event)
+                        if hasattr(result, '__await__'):
+                            await result
+                    except Exception:
+                        # Health checks must retain their existing fail-open behavior.
+                        pass
 
     async def test_all(self) -> list[dict]:
         """并发测试所有已保存接口，单个异常不会中断其余结果收集。"""

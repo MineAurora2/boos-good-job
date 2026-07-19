@@ -57,6 +57,18 @@ const state = {
     expandedDecisions: new Set(),
     llm: null,
     llmDirty: false,
+    llmUsage: {
+        days: 7,
+        data: null,
+        dataDays: null,
+        loading: false,
+        error: null,
+        chart: null,
+        lastLoadedAt: null,
+        timer: null,
+        active: false,
+        requestId: 0,
+    },
     configDirty: false,
 };
 
@@ -74,6 +86,7 @@ const ACCOUNT_DAILY_LIMIT_MIN = 0;
 const ACCOUNT_DAILY_LIMIT_MAX = 150;
 const CONTROL_DELIVERY_POLL_INTERVAL_MS = 150;
 const CONTROL_DELIVERY_TIMEOUT_MS = 6000;
+const LLM_USAGE_POLL_INTERVAL_MS = 30000;
 const TODAY_TARGET_FALLBACK = 20;
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
@@ -1975,6 +1988,9 @@ function applyTheme(theme, persist = true) {
         renderMap(getFilteredRecords());
         renderTrend(getFilteredRecords(true, false, true));
     }
+    if (state.llmUsage.active) {
+        requestAnimationFrame(() => { renderLlmUsageChart(); state.llmUsage.chart?.resize(); });
+    }
 }
 
 function toggleTheme() {
@@ -2334,6 +2350,7 @@ function llmProviderCard(provider = {}) {
     const proxyConfigured = Boolean(provider.proxyUrlConfigured);
     const proxyEnabled = Boolean(provider.proxyEnabled);
     card.dataset.index = provider.index != null ? String(provider.index) : '';
+    card.dataset.providerId = String(provider.providerId || '').trim();
     card.dataset.keyConfigured = keyConfigured ? '1' : '0';
     card.dataset.keyDirty = '0';
     card.dataset.keyMasked = provider.apiKeyMasked || '';
@@ -2399,6 +2416,7 @@ function collectLlmProvider(card) {
     const indexRaw = card.dataset.index;
     return {
         index: indexRaw === '' ? null : Number(indexRaw),
+        providerId: String(card.dataset.providerId || '').trim() || null,
         name: field('name').value.trim(),
         api_base: field('api_base').value.trim(),
         model: field('model').value.trim(),
@@ -2464,6 +2482,228 @@ function applyLlmConfig(data) {
     refreshAdminSaveState();
 }
 
+function llmUsagePurposeLabel(purpose) {
+    const labels = {
+        introduce: '招呼语生成',
+        introduce_retry: '招呼语纠正重试',
+        job_filter: '岗位筛选',
+        job_filter_retry: '岗位筛选纠正重试',
+        connection_test: '接口测活',
+    };
+    const key = String(purpose || '').trim();
+    return labels[key] || key || '未知用途';
+}
+
+function llmUsageCounter(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function llmUsageSummary(data = state.llmUsage.data) {
+    const summary = data?.summary || {};
+    return {
+        upstreamCalls: llmUsageCounter(summary.upstreamCalls),
+        successfulCalls: llmUsageCounter(summary.successfulCalls),
+        failedCalls: llmUsageCounter(summary.failedCalls),
+        usageReportedCalls: llmUsageCounter(summary.usageReportedCalls),
+        inputTokens: llmUsageCounter(summary.inputTokens),
+        outputTokens: llmUsageCounter(summary.outputTokens),
+        totalTokens: llmUsageCounter(summary.totalTokens),
+        successRate: summary.successRate == null ? null : llmUsageCounter(summary.successRate),
+    };
+}
+
+function llmUsageThemeColors() {
+    const base = trendThemeColors();
+    const style = getComputedStyle(document.documentElement);
+    const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+    return {
+        ...base,
+        input: color('--violet', '#8b7cf6'),
+        output: color('--cyan', '#39d7f2'),
+        total: color('--orange', '#ffad5b'),
+    };
+}
+
+function llmUsageChartOption(daily, colors) {
+    const dates = daily.map((item) => String(item?.date || ''));
+    return {
+        animation: false,
+        aria: { enabled: true, description: `每日 Token 使用趋势，共 ${daily.length} 个日期` },
+        color: [colors.input, colors.output, colors.total],
+        grid: { left: 52, right: 18, top: 34, bottom: 38, containLabel: false },
+        legend: { top: 0, right: 4, itemWidth: 9, itemHeight: 7, textStyle: { color: colors.text, fontSize: 9 }, data: ['输入 Token', '输出 Token', '总 Token'] },
+        tooltip: {
+            trigger: 'axis',
+            backgroundColor: colors.panel,
+            borderColor: colors.grid,
+            textStyle: { color: colors.text, fontSize: 11 },
+            valueFormatter: (value) => numberFormat.format(llmUsageCounter(value)),
+        },
+        xAxis: {
+            type: 'category',
+            data: dates,
+            axisLine: { lineStyle: { color: colors.grid } },
+            axisTick: { show: false },
+            axisLabel: { color: colors.axis, fontSize: 10, formatter: (value) => value.slice(5).replace('-', '/') },
+        },
+        yAxis: {
+            type: 'value',
+            minInterval: 1,
+            splitNumber: 4,
+            axisLabel: { color: colors.axis, fontSize: 10 },
+            splitLine: { lineStyle: { color: colors.grid } },
+        },
+        series: [
+            { name: '输入 Token', type: 'bar', stack: 'total', barMaxWidth: 26, itemStyle: { color: colors.input, borderRadius: [2, 2, 0, 0] }, data: daily.map((item) => llmUsageCounter(item?.inputTokens)) },
+            { name: '输出 Token', type: 'bar', stack: 'total', barMaxWidth: 26, itemStyle: { color: colors.output, borderRadius: [2, 2, 0, 0] }, data: daily.map((item) => llmUsageCounter(item?.outputTokens)) },
+            { name: '总 Token', type: 'line', smooth: .24, symbol: 'circle', symbolSize: 6, lineStyle: { width: 2, color: colors.total }, itemStyle: { color: colors.panel, borderColor: colors.total, borderWidth: 2 }, data: daily.map((item) => llmUsageCounter(item?.totalTokens)) },
+        ],
+    };
+}
+
+function ensureLlmUsageChart() {
+    if (!state.llmUsage.active || document.hidden) return null;
+    const panel = $('#llmUsagePanel');
+    const container = $('#llmUsageTrend');
+    if (!panel || !container || !panel.closest('.admin-view')?.classList.contains('active')) return null;
+    const bounds = container.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return null;
+    if (!window.echarts) {
+        container.replaceChildren();
+        const message = document.createElement('div'); message.className = 'llm-usage-empty'; message.textContent = 'Token 趋势图组件加载失败'; container.appendChild(message);
+        return null;
+    }
+    if (!state.llmUsage.chart) {
+        container.replaceChildren();
+        state.llmUsage.chart = window.echarts.init(container, null, { renderer: 'canvas' });
+    }
+    return state.llmUsage.chart;
+}
+
+function renderLlmUsageChart() {
+    const chart = ensureLlmUsageChart();
+    if (!chart) return;
+    const daily = Array.isArray(state.llmUsage.data?.daily) ? state.llmUsage.data.daily : [];
+    const summary = llmUsageSummary();
+    chart.resize();
+    if (!daily.length || daily.every((item) => llmUsageCounter(item?.totalTokens) === 0)) {
+        const message = summary.upstreamCalls ? '调用尚未上报 Token 用量' : '当前范围暂无 LLM 调用';
+        chart.clear();
+        chart.setOption({ title: { show: true, text: message, left: 'center', top: 'middle', textStyle: { color: llmUsageThemeColors().muted, fontSize: 11, fontWeight: 500 } } });
+        return;
+    }
+    chart.setOption(llmUsageChartOption(daily, llmUsageThemeColors()), { notMerge: true });
+}
+
+function renderLlmUsageRanking(targetSelector, items, copyFor) {
+    const target = $(targetSelector);
+    target.replaceChildren();
+    if (!items.length) {
+        const empty = document.createElement('div'); empty.className = 'llm-usage-empty'; empty.textContent = targetSelector.includes('Provider') ? '暂无接口 / 模型用量' : '暂无用途用量'; target.appendChild(empty);
+        return;
+    }
+    items.slice(0, 6).forEach((item) => {
+        const copy = copyFor(item);
+        const row = document.createElement('div'); row.className = 'llm-usage-rank-row';
+        const text = document.createElement('div'); text.className = 'llm-usage-rank-copy';
+        const title = document.createElement('strong'); title.textContent = copy.title;
+        const detail = document.createElement('small'); detail.textContent = copy.detail;
+        const value = document.createElement('span'); value.className = 'llm-usage-rank-value'; value.textContent = numberFormat.format(llmUsageCounter(item?.totalTokens));
+        text.append(title, detail); row.append(text, value); target.appendChild(row);
+    });
+}
+
+function renderLlmUsageRankings() {
+    const providers = Array.isArray(state.llmUsage.data?.providers) ? state.llmUsage.data.providers : [];
+    const purposes = Array.isArray(state.llmUsage.data?.purposes) ? state.llmUsage.data.purposes : [];
+    renderLlmUsageRanking('#llmUsageProviderRanking', providers, (item) => ({
+        title: String(item?.name || item?.providerId || '未命名接口'),
+        detail: `${String(item?.model || '未指定模型')} · ${numberFormat.format(llmUsageCounter(item?.upstreamCalls))} 次调用`,
+    }));
+    renderLlmUsageRanking('#llmUsagePurposeRanking', purposes, (item) => ({
+        title: llmUsagePurposeLabel(item?.purpose),
+        detail: `${numberFormat.format(llmUsageCounter(item?.upstreamCalls))} 次调用 · ${numberFormat.format(llmUsageCounter(item?.usageReportedCalls))} 次上报`,
+    }));
+}
+
+function renderLlmUsage() {
+    const usage = state.llmUsage;
+    const summary = llmUsageSummary();
+    const callsWithoutUsage = Math.max(0, summary.upstreamCalls - summary.usageReportedCalls);
+    const loadedDays = usage.dataDays || usage.data?.range?.days || usage.days;
+    $('#llmUsageTotalTokens').textContent = usage.data ? numberFormat.format(summary.totalTokens) : '—';
+    $('#llmUsageInputTokens').textContent = usage.data ? numberFormat.format(summary.inputTokens) : '—';
+    $('#llmUsageOutputTokens').textContent = usage.data ? numberFormat.format(summary.outputTokens) : '—';
+    $('#llmUsageUpstreamCalls').textContent = usage.data ? numberFormat.format(summary.upstreamCalls) : '—';
+    $('#llmUsageSuccessRate').textContent = usage.data && summary.successRate != null ? `${summary.successRate.toFixed(1)}%` : '—';
+    $('#llmUsageTotalHint').textContent = usage.data ? (summary.upstreamCalls ? `已上报 ${summary.usageReportedCalls} / ${summary.upstreamCalls} 次` : '暂无 Token 数据') : '等待统计';
+    $('#llmUsageUnreported').textContent = `未上报 ${numberFormat.format(callsWithoutUsage)} 次`;
+    const generated = parseDate(usage.data?.generatedAt || usage.lastLoadedAt);
+    $('#llmUsageUpdatedAt').textContent = generated ? `${String(generated.getHours()).padStart(2, '0')}:${String(generated.getMinutes()).padStart(2, '0')} 更新` : '尚未更新';
+    if (!usage.loading) {
+        $('#llmUsageStatus').textContent = usage.error && usage.data
+            ? `统计刷新失败，展示最近 ${loadedDays} 天已载入数据`
+            : usage.data
+            ? (summary.upstreamCalls ? `最近 ${usage.days} 天 · 成功 ${summary.successfulCalls} 次 · 失败 ${summary.failedCalls} 次` : `最近 ${usage.days} 天暂无上游调用`)
+            : 'Token 统计尚未载入';
+    }
+    const error = $('#llmUsageError'); error.textContent = usage.error ? `Token 统计读取失败：${usage.error}` : ''; error.hidden = !usage.error;
+    const refresh = $('#llmUsageRefresh'); refresh.disabled = usage.loading; refresh.classList.toggle('loading', usage.loading);
+    renderLlmUsageRankings();
+    renderLlmUsageChart();
+}
+
+async function loadLlmUsage({ silent = false } = {}) {
+    const usage = state.llmUsage;
+    const days = usage.days;
+    usage.requestId = (usage.requestId || 0) + 1;
+    const requestId = usage.requestId;
+    usage.loading = true;
+    usage.error = null;
+    if (!silent) $('#llmUsageStatus').textContent = `正在读取最近 ${days} 天 Token 统计...`;
+    $('#llmUsageRefresh').disabled = true; $('#llmUsageRefresh').classList.add('loading');
+    try {
+        const data = await apiJson(`/api/admin/llm/usage?days=${encodeURIComponent(days)}`);
+        if (requestId !== usage.requestId) return null;
+        usage.data = data;
+        usage.dataDays = Number(data?.range?.days) || days;
+        usage.lastLoadedAt = new Date();
+        return data;
+    } catch (error) {
+        if (requestId === usage.requestId) usage.error = error.message || '未知错误';
+        return null;
+    } finally {
+        if (requestId === usage.requestId) { usage.loading = false; renderLlmUsage(); }
+    }
+}
+
+function stopLlmUsagePolling() {
+    if (state.llmUsage.timer !== null) { clearInterval(state.llmUsage.timer); state.llmUsage.timer = null; }
+}
+
+function startLlmUsagePolling() {
+    if (!state.llmUsage.active || document.hidden) { stopLlmUsagePolling(); return; }
+    if (state.llmUsage.timer === null) state.llmUsage.timer = setInterval(() => loadLlmUsage({ silent: true }), LLM_USAGE_POLL_INTERVAL_MS);
+}
+
+function setLlmUsageActive(active) {
+    state.llmUsage.active = Boolean(active);
+    if (!state.llmUsage.active || document.hidden) { stopLlmUsagePolling(); return; }
+    requestAnimationFrame(() => {
+        if (!state.llmUsage.active || document.hidden) return;
+        if (!state.llmUsage.data && !state.llmUsage.loading) loadLlmUsage();
+        else renderLlmUsage();
+        state.llmUsage.chart?.resize();
+        startLlmUsagePolling();
+    });
+}
+
+function refreshLlmUsageSilently() {
+    if (!state.llmUsage.active || document.hidden) return Promise.resolve(null);
+    return loadLlmUsage({ silent: true });
+}
+
 async function loadLlm() {
     try { applyLlmConfig(await apiJson('/api/admin/llm')); }
     catch (error) { $('#llmNotice').textContent = `接口配置读取失败：${error.message}`; }
@@ -2486,16 +2726,17 @@ function addLlmProvider() {
     card.querySelector('[data-llm-field="name"]').focus({ preventScroll: true });
 }
 
-async function testLlmProvider(card) {
+async function testLlmProvider(card, { refreshUsage = true } = {}) {
     if (!validateLlmCard(card, true)) { setLlmTestState(card, 'bad', '配置不完整'); return false; }
     const button = card.querySelector('[data-llm-action="test"]');
     button.disabled = true; card.classList.add('is-testing'); setLlmTestState(card, 'testing', '连接中...');
     try {
         const result = await apiJson('/api/admin/llm/test', { method: 'POST', body: JSON.stringify({ provider: collectLlmProvider(card) }) });
+        if (result.providerId) card.dataset.providerId = String(result.providerId).trim();
         if (result.ok) { setLlmTestState(card, 'ok', `${result.viaProxy ? '代理' : '直连'}可用 · ${result.latencyMs ?? '—'}ms`); return true; }
         setLlmTestState(card, 'bad', `失败 · ${result.error || result.status || '未知错误'}`); return false;
     } catch (error) { setLlmTestState(card, 'bad', `失败 · ${error.message}`); return false; }
-    finally { button.disabled = false; card.classList.remove('is-testing'); }
+    finally { button.disabled = false; card.classList.remove('is-testing'); if (refreshUsage) refreshLlmUsageSilently(); }
 }
 
 async function testAllLlm() {
@@ -2503,10 +2744,10 @@ async function testAllLlm() {
     if (!cards.length) return showToast('请先添加大模型接口');
     const button = $('#llmTestAll'); button.disabled = true; button.classList.add('loading');
     try {
-        const results = await Promise.all(cards.map(testLlmProvider));
+        const results = await Promise.all(cards.map((card) => testLlmProvider(card, { refreshUsage: false })));
         const successCount = results.filter(Boolean).length;
         showToast(`测活完成：${successCount} / ${cards.length} 个接口可用`);
-    } finally { button.disabled = false; button.classList.remove('loading'); }
+    } finally { button.disabled = false; button.classList.remove('loading'); refreshLlmUsageSilently(); }
 }
 
 async function loadAdmin() {
@@ -2667,11 +2908,20 @@ function bindEvents() {
     $$('#adminTabs button').forEach((button) => button.addEventListener('click', () => {
         $$('#adminTabs button').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-selected', String(active)); });
         $$('.admin-view').forEach((view) => view.classList.toggle('active', view.dataset.adminView === button.dataset.adminTab));
+        setLlmUsageActive(button.dataset.adminTab === 'llm');
         refreshAdminSaveState(button.dataset.adminTab);
     }));
     $('#visualConfigForm').addEventListener('input', markConfigDirty); $('#visualConfigForm').addEventListener('change', markConfigDirty);
     $('#saveConfig').addEventListener('click', saveAdminConfig); $('#resumeSelect').addEventListener('change', (event) => selectCurrentResume(event.target.value)); $('#createResume').addEventListener('click', createResume); $('#saveResume').addEventListener('click', saveCurrentResume); $('#promptSelect').addEventListener('change', (event) => showPrompt(event.target.value)); $('#savePrompt').addEventListener('click', saveCurrentPrompt);
     $('#saveLlm').addEventListener('click', saveLlm); $('#llmAddProvider').addEventListener('click', addLlmProvider); $('#llmTestAll').addEventListener('click', testAllLlm);
+    $('#llmUsageRefresh').addEventListener('click', () => loadLlmUsage());
+    $('#llmUsageRange').addEventListener('click', (event) => {
+        const button = event.target.closest('[data-llm-usage-days]'); if (!button) return;
+        const days = Number(button.dataset.llmUsageDays); if (![1, 7, 30].includes(days)) return;
+        state.llmUsage.days = days;
+        $$('#llmUsageRange [data-llm-usage-days]').forEach((item) => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
+        loadLlmUsage();
+    });
     $('#llmStrategy').addEventListener('click', (event) => { const button = event.target.closest('[data-llm-strategy]'); if (button) setLlmStrategy(button.dataset.llmStrategy, true); });
     $('#llmTimeout').addEventListener('input', () => markLlmDirty());
     $('#llmJobFilter').addEventListener('input', (event) => { $('#llmJobFilterState').textContent = event.target.checked ? '已启用' : '已关闭'; markLlmDirty(); });
@@ -2842,11 +3092,17 @@ function stopPolling() {
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         stopPolling();
+        stopLlmUsagePolling();
     } else {
         // 恢复可见立即补一次，再重启定时轮询。
         loadRuntime();
         loadControlState();
         startPolling();
+        if (state.llmUsage.active) {
+            refreshLlmUsageSilently();
+            requestAnimationFrame(() => { renderLlmUsageChart(); state.llmUsage.chart?.resize(); });
+            startLlmUsagePolling();
+        }
     }
 });
 

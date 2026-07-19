@@ -6,6 +6,7 @@
     GOODJOB_LLM_JOB_FILTER=false         # AI 二次筛选开关
     GOODJOB_LLM_TIMEOUT=180              # 全局请求超时（秒）
     GOODJOB_LLM_1_NAME=SenseNova
+    GOODJOB_LLM_1_ID=550e8400-e29b-41d4-a716-446655440000
     GOODJOB_LLM_1_API_BASE=https://token.sensenova.cn/v1
     GOODJOB_LLM_1_API_KEY=sk-****
     GOODJOB_LLM_1_MODEL=deepseek-v4-flash
@@ -24,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from app import paths
@@ -45,7 +47,7 @@ _SAVE_LOCK = threading.Lock()
 
 _TRUE_VALUES = {'1', 'true', 'yes', 'on'}
 _PROVIDER_RE = re.compile(
-    r'^GOODJOB_LLM_(\d+)_(NAME|API_BASE|API_KEY|MODEL|PROXY_URL|PROXY_ENABLED|ENABLED)$'
+    r'^GOODJOB_LLM_(\d+)_(ID|NAME|API_BASE|API_KEY|MODEL|PROXY_URL|PROXY_ENABLED|ENABLED)$'
 )
 
 
@@ -77,6 +79,51 @@ def _to_bool(value, default: bool = True) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in _TRUE_VALUES
+
+
+def _canonical_api_base(api_base: str) -> str:
+    """Normalize the non-secret identity portion of an API base URL."""
+    text = str(api_base or '').strip()
+    if not text:
+        return ''
+    try:
+        parsed = urlsplit(text)
+        hostname = parsed.hostname
+        if not hostname:
+            return text.rstrip('/').lower()
+        host = hostname.lower()
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        default_port = (parsed.scheme.lower() == 'http' and port == 80) or (
+            parsed.scheme.lower() == 'https' and port == 443
+        )
+        netloc = host if port is None or default_port else f'{host}:{port}'
+        path = parsed.path.rstrip('/')
+        return urlunsplit((parsed.scheme.lower(), netloc, path, '', ''))
+    except ValueError:
+        return text.rstrip('/').lower()
+
+
+def _legacy_provider_id(api_base: str, index: int) -> str:
+    """Derive the stable ID used for configurations written before IDs existed."""
+    canonical = _canonical_api_base(api_base)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f'{canonical}|{index}'))
+
+
+def _validate_provider_id(value: object, *, fallback: str | None = None) -> str:
+    """Return a canonical UUID string or raise a user-facing validation error."""
+    if value is None or str(value).strip() == '':
+        if fallback is not None:
+            return fallback
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (ValueError, AttributeError, TypeError) as error:
+        raise ValueError('providerId 必须是合法 UUID') from error
 
 
 def _read_lines() -> list[str]:
@@ -182,13 +229,34 @@ def _load_raw() -> dict:
         }
 
     ordered = []
+    seen_provider_ids: set[str] = set()
     for index in sorted(providers):
         item = providers[index]
+        api_base = str(item.get('api_base') or '').strip()
+        provider_id = _validate_provider_id(
+            item.get('id'),
+            fallback=_legacy_provider_id(api_base, index),
+        )
+        # A hand-edited .env can contain the same ID twice. Keep startup usable
+        # and split the malformed entry deterministically until the next save.
+        if provider_id in seen_provider_ids:
+            provider_id = _legacy_provider_id(api_base, index)
+            salt = 0
+            while provider_id in seen_provider_ids:
+                salt += 1
+                provider_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f'{_canonical_api_base(api_base)}|{index}|duplicate|{salt}',
+                    )
+                )
+        seen_provider_ids.add(provider_id)
         proxy_url = str(item.get('proxy_url') or '').strip()
         ordered.append({
             'index': index,
+            'provider_id': provider_id,
             'name': str(item.get('name') or f'接口{index}').strip(),
-            'api_base': str(item.get('api_base') or '').strip(),
+            'api_base': api_base,
             'api_key': str(item.get('api_key') or '').strip(),
             'model': str(item.get('model') or '').strip(),
             'proxy_url': proxy_url,
@@ -215,6 +283,7 @@ def public_llm_config() -> dict:
     for item in raw['providers']:
         providers.append({
             'index': item['index'],
+            'providerId': item['provider_id'],
             'name': item['name'],
             'api_base': item['api_base'],
             'model': item['model'],
@@ -258,6 +327,7 @@ def _validate_incoming(payload: dict) -> dict:
     # 原编号取回明文，不能把星号占位符或哨兵本身写入配置文件。
     existing = {item['index']: item for item in _load_raw()['providers']}
     cleaned = []
+    seen_provider_ids: set[str] = set()
     for order, item in enumerate(incoming, start=1):
         if not isinstance(item, dict):
             raise ValueError('每个接口必须是对象')
@@ -265,11 +335,23 @@ def _validate_incoming(payload: dict) -> dict:
         api_base = str(item.get('api_base') or '').strip()
         model = str(item.get('model') or '').strip()[:120]
         enabled = _to_bool(item.get('enabled'), True)
+        old_index = item.get('index')
+        existing_provider_id = (
+            existing.get(old_index, {}).get('provider_id')
+            if isinstance(old_index, int)
+            else None
+        )
+        provider_id = _validate_provider_id(
+            item.get('providerId'),
+            fallback=existing_provider_id,
+        )
+        if provider_id in seen_provider_ids:
+            raise ValueError('providerId 必须唯一')
+        seen_provider_ids.add(provider_id)
         if api_base:
             if not re.match(r'^https?://[^\s]+$', api_base):
                 raise ValueError(f'{name} 的接口地址必须是有效的 HTTP(S) 地址')
         api_key_input = item.get('api_key')
-        old_index = item.get('index')
         if api_key_input == KEEP_SECRET or api_key_input is None:
             # 保留旧 key：按原编号回填明文。
             api_key = existing.get(old_index, {}).get('api_key', '') if isinstance(old_index, int) else ''
@@ -295,6 +377,7 @@ def _validate_incoming(payload: dict) -> dict:
         if enabled and (not api_base or not model or not api_key):
             raise ValueError(f'{name} 已启用，但接口地址、模型名称或 API Key 不完整')
         cleaned.append({
+            'provider_id': provider_id,
             'name': name,
             'api_base': api_base,
             'api_key': api_key,
@@ -350,6 +433,7 @@ def _save_llm_config(payload: dict) -> dict:
     lines.append(f'GOODJOB_LLM_TIMEOUT={config["timeout"]}')
     for index, provider in enumerate(config['providers'], start=1):
         lines.append('')
+        lines.append(f'GOODJOB_LLM_{index}_ID={_quote(provider["provider_id"])}')
         lines.append(f'GOODJOB_LLM_{index}_NAME={_quote(provider["name"])}')
         lines.append(f'GOODJOB_LLM_{index}_API_BASE={_quote(provider["api_base"])}')
         lines.append(f'GOODJOB_LLM_{index}_API_KEY={_quote(provider["api_key"])}')
@@ -380,6 +464,7 @@ def _sync_environ(config: dict) -> None:
     os.environ['GOODJOB_LLM_JOB_FILTER'] = 'true' if config['jobFilter'] else 'false'
     os.environ['GOODJOB_LLM_TIMEOUT'] = str(config['timeout'])
     for index, provider in enumerate(config['providers'], start=1):
+        os.environ[f'GOODJOB_LLM_{index}_ID'] = provider['provider_id']
         os.environ[f'GOODJOB_LLM_{index}_NAME'] = provider['name']
         os.environ[f'GOODJOB_LLM_{index}_API_BASE'] = provider['api_base']
         os.environ[f'GOODJOB_LLM_{index}_API_KEY'] = provider['api_key']

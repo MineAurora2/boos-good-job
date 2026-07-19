@@ -384,6 +384,19 @@ def admin_save_llm(request: Request, payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
+@router.get('/api/admin/llm/usage', summary='读取大模型 Token 使用统计')
+def admin_get_llm_usage(
+    request: Request,
+    response: Response,
+    days: str = Query('7'),
+):
+    require_local_admin(request)
+    if days not in {'1', '7', '30'}:
+        raise HTTPException(status_code=400, detail='days must be one of 1, 7, or 30')
+    response.headers['Cache-Control'] = 'no-store'
+    return STATE.llm_usage_store.query(int(days))
+
+
 @router.post('/api/admin/llm/test', summary='测试大模型接口连通性')
 async def admin_test_llm(request: Request, payload: dict = Body(default={})):
     require_local_admin(request)

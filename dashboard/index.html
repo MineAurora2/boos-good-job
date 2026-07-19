@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260719-echarts-trend-1">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260719-llm-usage-1">
 </head>
 <body>
     <div class="app-shell">
@@ -316,6 +316,47 @@
                         <div><span class="eyebrow">MODEL ROUTING</span><h3>大模型连接</h3></div>
                         <span class="llm-provider-summary" id="llmProviderSummary"><i></i>尚未载入接口</span>
                     </div>
+                    <section id="llmUsagePanel" class="llm-usage-panel" aria-labelledby="llmUsageTitle">
+                        <div class="llm-usage-head">
+                            <div>
+                                <span class="eyebrow">TOKEN TELEMETRY</span>
+                                <h3 id="llmUsageTitle">Token 使用统计</h3>
+                                <p id="llmUsageStatus" role="status" aria-live="polite">切换到接口管理后载入最近 7 天数据</p>
+                            </div>
+                            <div class="llm-usage-tools">
+                                <div class="llm-usage-range" id="llmUsageRange" role="group" aria-label="Token 统计范围">
+                                    <button type="button" data-llm-usage-days="1" aria-pressed="false">1 天</button>
+                                    <button type="button" class="active" data-llm-usage-days="7" aria-pressed="true">7 天</button>
+                                    <button type="button" data-llm-usage-days="30" aria-pressed="false">30 天</button>
+                                </div>
+                                <button id="llmUsageRefresh" class="icon-button llm-usage-refresh" type="button" title="刷新 Token 统计" aria-label="刷新 Token 统计"><span aria-hidden="true">↻</span></button>
+                            </div>
+                        </div>
+                        <p id="llmUsageError" class="llm-usage-error" role="alert" hidden></p>
+                        <div class="llm-usage-kpis" aria-label="Token 使用摘要">
+                            <div class="llm-usage-kpi"><span>总 Token</span><strong id="llmUsageTotalTokens">—</strong><small id="llmUsageTotalHint">等待统计</small></div>
+                            <div class="llm-usage-kpi"><span>输入 Token</span><strong id="llmUsageInputTokens">—</strong><small>请求提示词</small></div>
+                            <div class="llm-usage-kpi"><span>输出 Token</span><strong id="llmUsageOutputTokens">—</strong><small>模型生成内容</small></div>
+                            <div class="llm-usage-kpi"><span>上游调用</span><strong id="llmUsageUpstreamCalls">—</strong><small id="llmUsageUnreported">未上报 0 次</small></div>
+                            <div class="llm-usage-kpi"><span>成功率</span><strong id="llmUsageSuccessRate">—</strong><small id="llmUsageUpdatedAt">尚未更新</small></div>
+                        </div>
+                        <div class="llm-usage-grid">
+                            <div class="llm-usage-trend-wrap">
+                                <div class="llm-usage-block-head"><span>每日 Token 趋势</span><small id="llmUsageTrendHint">输入 / 输出 · 总量</small></div>
+                                <div id="llmUsageTrend" class="llm-usage-trend" role="img" aria-label="每日 Token 使用趋势"></div>
+                            </div>
+                            <div class="llm-usage-rankings" aria-label="Token 使用排行">
+                                <div class="llm-usage-ranking">
+                                    <div class="llm-usage-block-head"><span>接口 / 模型排行</span><small>按总 Token</small></div>
+                                    <div id="llmUsageProviderRanking" class="llm-usage-ranking-list"></div>
+                                </div>
+                                <div class="llm-usage-ranking">
+                                    <div class="llm-usage-block-head"><span>用途排行</span><small>按总 Token</small></div>
+                                    <div id="llmUsagePurposeRanking" class="llm-usage-ranking-list"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
                     <div class="llm-global-bar" aria-label="大模型全局设置">
                         <div class="llm-setting llm-strategy-setting">
                             <span>调度策略</span>
@@ -406,6 +447,6 @@
 
     <div class="toast" id="toast" role="status"></div>
     <script src="/dashboard/vendor/echarts.min.js" defer></script>
-    <script src="/dashboard/app.js?v=20260719-echarts-trend-1" defer></script>
+    <script src="/dashboard/app.js?v=20260719-llm-usage-1" defer></script>
 </body>
 </html>
