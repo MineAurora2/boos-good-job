@@ -1,0 +1,104 @@
+{
+  "date": "2026-07-19",
+  "evaluated": 473,
+  "entered": 95,
+  "queuedEvents": 94,
+  "sent": 89,
+  "queued": 4,
+  "reserved": 1,
+  "failed": 1,
+  "allTimeEvaluated": 3665,
+  "sameDayRate": 20.1,
+  "sentRate": 18.8,
+  "displayedRate": 3,
+  "lossBreakdown": [
+    {
+      "label": "HR 活跃筛除",
+      "value": 191,
+      "color": "FF6B6B"
+    },
+    {
+      "label": "领取前未记录/中断",
+      "value": 132,
+      "color": "FFB454"
+    },
+    {
+      "label": "AI 筛除（HR通过后）",
+      "value": 35,
+      "color": "A995FF"
+    },
+    {
+      "label": "随机跳过",
+      "value": 18,
+      "color": "6EB6FF"
+    },
+    {
+      "label": "规则阈值",
+      "value": 2,
+      "color": "91AAB5"
+    }
+  ],
+  "accountStats": {
+    "主号9481": {
+      "entered": 43,
+      "sent": 39,
+      "limit": 60,
+      "rate": 71.7
+    },
+    "19245914558": {
+      "entered": 44,
+      "sent": 42,
+      "limit": 60,
+      "rate": 73.3
+    },
+    "18060868190": {
+      "entered": 8,
+      "sent": 8,
+      "limit": 60,
+      "rate": 13.3
+    }
+  },
+  "periods": [
+    {
+      "account": "18060868190",
+      "start": "22:01",
+      "end": "22:24"
+    },
+    {
+      "account": "19245914558",
+      "start": "17:48",
+      "end": "22:25"
+    },
+    {
+      "account": "主号9481",
+      "start": "02:54",
+      "end": "04:57"
+    },
+    {
+      "account": "主号9481",
+      "start": "17:40",
+      "end": "22:27"
+    }
+  ],
+  "popupSkips": {
+    "18060868190": 23
+  },
+  "hrFilteredLevels": {
+    "within_3_days": 147,
+    "this_week": 26,
+    "this_month": 18
+  },
+  "aiRejectedTotal": 67,
+  "aiCategories": {
+    "电气/电工等非目标方向": 36,
+    "语言或海外要求": 16,
+    "经验/资历不匹配": 14,
+    "技能或岗位方向不匹配": 1
+  },
+  "source": [
+    "job_actions.jsonl",
+    "ai_filter_log.jsonl",
+    "delivery_state.db/company_deliveries",
+    "dashboard/app.js renderFunnel"
+  ]
+}
