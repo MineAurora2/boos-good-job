@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 import threading
 import webbrowser
@@ -48,6 +49,13 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+
+def build_uvicorn_log_config(default_config: dict) -> dict:
+    """Keep Uvicorn startup and access records on the terminal error stream."""
+    configured = deepcopy(default_config)
+    configured['handlers']['access']['stream'] = 'ext://sys.stderr'
+    return configured
 
 
 def open_dashboard_when_started(
@@ -97,6 +105,9 @@ def run_server() -> None:
         reload=False,
         proxy_headers=False,
         timeout_graceful_shutdown=3,
+        log_config=build_uvicorn_log_config(uvicorn.config.LOGGING_CONFIG),
+        access_log=True,
+        log_level='info',
     )
     server = uvicorn.Server(config)
     stop_event = threading.Event()
