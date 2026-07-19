@@ -1549,6 +1549,7 @@
                 const image = document.createElement('img');
                 const copy = document.createElement('div');
                 const connection = document.createElement('strong');
+                const account = document.createElement('span');
                 const execution = document.createElement('span');
                 const actions = document.createElement('div');
                 const logToggleButton = this.createButton('日志', '展开或收起本地日志');
@@ -1586,6 +1587,8 @@
                 copy.style.cssText = 'min-width:0;display:grid;gap:3px;line-height:1.2;letter-spacing:0;pointer-events:none;';
                 connection.dataset.goodjobsConnection = '1';
                 connection.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650;letter-spacing:0;';
+                account.dataset.goodjobsAccount = '1';
+                account.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;pointer-events:auto;';
                 execution.dataset.goodjobsExecution = '1';
                 execution.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#aebfc3;letter-spacing:0;';
                 logToggleButton.dataset.goodjobsLogToggle = '1';
@@ -1629,6 +1632,7 @@
                 settingsActions.style.cssText = 'display:grid;grid-template-columns:1fr 1.35fr;gap:7px;';
 
                 copy.appendChild(connection);
+                copy.appendChild(account);
                 copy.appendChild(execution);
                 statusRow.appendChild(image);
                 statusRow.appendChild(copy);
@@ -1880,10 +1884,16 @@
         render() {
             if (!this.root) return;
             const connection = this.root.querySelector?.('[data-goodjobs-connection]');
+            const account = this.root.querySelector?.('[data-goodjobs-account]');
             const execution = this.root.querySelector?.('[data-goodjobs-execution]');
+            const accountId = deliveryIdentity.get().accountId;
             const connectionLabel = CONNECTION_LABELS[this.connectionState] || '后端状态未知';
             const executionLabel = EXECUTION_LABELS[this.executionState] || this.executionState;
             if (connection) connection.textContent = connectionLabel;
+            if (account) {
+                account.textContent = `账号：${accountId}`;
+                account.title = `账号标识：${accountId}`;
+            }
             if (execution) execution.textContent = `脚本：${executionLabel}${this.commandMessage ? ` · ${this.commandMessage}` : ''}`;
             const connected = this.connectionState === 'connected';
             const color = connected ? '#53e394' : (this.connectionState === 'connecting' ? '#68dce7' : '#ff8d8d');
