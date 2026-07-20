@@ -1389,7 +1389,16 @@ function initDatePicker() {
         if (restoreFocus) returnFocus?.focus();
         returnFocus = null;
     };
-    const position = () => { const anchor = activeAnchor(); if (!anchor || picker.hidden) return; const rect = anchor.getBoundingClientRect(); const width = 306; let left = Math.min(rect.left, window.innerWidth - width - 12); let top = rect.bottom + 8; if (top + 390 > window.innerHeight) top = Math.max(12, rect.top - 390); picker.style.left = `${Math.max(12, left)}px`; picker.style.top = `${top}px`; };
+    picker.addEventListener('schedule-picker-close', () => close(false));
+    const position = () => {
+        const anchor = activeAnchor(); if (!anchor || picker.hidden) return;
+        const rect = anchor.getBoundingClientRect(); const width = 306;
+        const preferredLeft = mode === 'range' ? rect.left + (rect.width - width) / 2 : rect.left;
+        const maxLeft = Math.max(12, window.innerWidth - width - 12);
+        const left = Math.min(maxLeft, Math.max(12, preferredLeft));
+        let top = rect.bottom + 8; if (top + 390 > window.innerHeight) top = Math.max(12, rect.top - 390);
+        picker.style.left = `${left}px`; picker.style.top = `${top}px`;
+    };
     const render = () => {
         const year = viewDate.getFullYear(), month = viewDate.getMonth(); picker.querySelector('.gj-calendar-head strong').textContent = `${year} 年 ${String(month + 1).padStart(2, '0')} 月`;
         const first = new Date(year, month, 1), offset = (first.getDay() + 6) % 7, start = new Date(year, month, 1 - offset), selected = selectedDate(), todayKey = localDateKey(new Date());
@@ -1406,8 +1415,14 @@ function initDatePicker() {
         rangeStatus.hidden = mode !== 'range';
         if (mode === 'range') rangeStatus.textContent = selectingRangeEnd ? `${rangeStart} → 请选择结束日期` : (rangeStart && rangeEnd ? `${rangeStart} → ${rangeEnd}` : '请选择开始日期');
     };
-    const openSingle = (input) => { mode = 'single'; activeInput = input; returnFocus = input; const parsed = selectedDate(); viewDate = parsed || new Date(); picker.hidden = false; render(); position(); };
+    const openSingle = (input) => {
+        if (!picker.hidden) close(false);
+        mode = 'single'; activeInput = input; returnFocus = input;
+        $('#scheduleDateTrigger')?.setAttribute('aria-expanded', 'false');
+        const parsed = selectedDate(); viewDate = parsed || new Date(); picker.hidden = false; render(); position();
+    };
     const openRange = () => {
+        if (!picker.hidden) close(false);
         mode = 'range'; activeInput = null; returnFocus = $('#scheduleDateTrigger'); rangeStart = $('#scheduleDateStart').value; rangeEnd = $('#scheduleDateEnd').value; selectingRangeEnd = Boolean(rangeStart && !rangeEnd);
         viewDate = rangeStart ? new Date(`${rangeStart}T00:00:00`) : new Date(); picker.hidden = false; returnFocus.setAttribute('aria-expanded', 'true'); render(); position();
     };
@@ -1433,7 +1448,7 @@ function initDatePicker() {
         if (mode === 'single' && activeInput) { activeInput.value = value; activeInput.dispatchEvent(new Event('change', { bubbles: true })); close(true); return; }
         if (mode === 'range') { applyRange(value, value); close(true); }
     });
-    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !event.target.closest('.trend-date-field') && !event.target.closest('#scheduleDateTrigger')) close(); });
+    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !event.target.closest('.trend-date-field') && !event.target.closest('#scheduleDateTrigger')) close(true); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); }); window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
 }
 
@@ -1452,6 +1467,7 @@ function initScheduleTimePicker() {
         if (scroll) requestAnimationFrame(() => picker.querySelectorAll('.selected').forEach((button) => button.scrollIntoView({ block: 'center' })));
     };
     const close = (restoreFocus = false) => { picker.hidden = true; trigger.setAttribute('aria-expanded', 'false'); if (restoreFocus) trigger.focus(); };
+    picker.addEventListener('schedule-picker-close', () => close(false));
     const open = () => {
         const current = /^([01]\d|2[0-3]):([0-5]\d)$/.exec($('#scheduleStartTime').value);
         const now = new Date(); hour = current?.[1] || String(now.getHours()).padStart(2, '0'); minute = current?.[2] || String(now.getMinutes()).padStart(2, '0');
@@ -1466,7 +1482,7 @@ function initScheduleTimePicker() {
         if (action === 'now') { const now = new Date(); hour = String(now.getHours()).padStart(2, '0'); minute = String(now.getMinutes()).padStart(2, '0'); render(true); return; }
         if (action === 'apply') { $('#scheduleStartTime').value = `${hour}:${minute}`; $('#scheduleStartTime').dispatchEvent(new Event('change', { bubbles: true })); close(true); }
     });
-    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !trigger.contains(event.target)) close(); });
+    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !trigger.contains(event.target)) close(true); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); });
     window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
 }
@@ -1977,6 +1993,33 @@ function clearScheduleErrors() {
     $$('.schedule-field-invalid').forEach((element) => element.classList.remove('schedule-field-invalid'));
 }
 
+function setScheduleConfigExpanded(expanded) {
+    const collapse = $('#scheduleConfigCollapse');
+    const toggle = $('#scheduleEnabled');
+    if (!collapse) return;
+    const isExpanded = Boolean(expanded);
+    if (!isExpanded) {
+        const activeElement = document.activeElement;
+        const dateTrigger = $('#scheduleDateTrigger');
+        const timeTrigger = $('#scheduleTimeTrigger');
+        const datePicker = $('#dashboardDatePicker');
+        const timePicker = $('#scheduleTimePicker');
+        const datePickerOpen = dateTrigger?.getAttribute('aria-expanded') === 'true';
+        const timePickerOpen = timeTrigger?.getAttribute('aria-expanded') === 'true';
+        const shouldRestoreFocus = collapse.contains(activeElement)
+            || (datePickerOpen && datePicker?.contains(activeElement))
+            || (timePickerOpen && timePicker?.contains(activeElement));
+        if (datePickerOpen) datePicker?.dispatchEvent(new Event('schedule-picker-close'));
+        if (timePickerOpen) timePicker?.dispatchEvent(new Event('schedule-picker-close'));
+        if (shouldRestoreFocus) toggle?.focus();
+    }
+    collapse.classList.toggle('expanded', isExpanded);
+    collapse.setAttribute('aria-hidden', String(!isExpanded));
+    if (isExpanded) collapse.removeAttribute('inert');
+    else collapse.setAttribute('inert', '');
+    toggle?.setAttribute('aria-expanded', String(isExpanded));
+}
+
 function showScheduleValidationError(message) {
     clearScheduleErrors();
     const target = message.includes('开始时间')
@@ -2030,12 +2073,19 @@ function renderSchedulePanel(data = normalizedControlState()) {
     statusNode.classList.toggle('running', status.state === 'running');
     statusNode.classList.toggle('waiting', Boolean(status.enabled && status.state !== 'running'));
     $('#scheduleFeedback').textContent = state.scheduleFeedback || '';
-    ['#saveSchedule', '#applySchedule'].forEach((selector) => {
-        const button = $(selector);
-        if (!button) return;
+    setScheduleConfigExpanded(schedule.enabled);
+    const actions = $('.schedule-actions');
+    const showActions = Boolean(schedule.enabled || state.scheduleDraft);
+    if (actions) {
+        if (!showActions && actions.contains(document.activeElement)) $('#scheduleEnabled')?.focus();
+        actions.hidden = !showActions;
+        actions.setAttribute('aria-hidden', String(!showActions));
+    }
+    const button = $('#saveSchedule');
+    if (button) {
         button.disabled = state.scheduleSaving;
         button.setAttribute('aria-busy', String(state.scheduleSaving));
-    });
+    }
 }
 
 function scheduleFormValues() {
@@ -2060,6 +2110,7 @@ async function saveSchedule(applyNow) {
         return null;
     }
     clearScheduleErrors();
+    if (!schedule.enabled && document.activeElement === $('#saveSchedule')) $('#scheduleEnabled')?.focus();
     state.scheduleSaving = true;
     state.scheduleFeedback = '正在保存计划…';
     renderSchedulePanel();
@@ -2130,10 +2181,7 @@ function bindScheduleControls() {
         event.preventDefault();
         setDuration(next);
     });
-    $('#scheduleDurationDecrease').addEventListener('click', () => setDuration(Math.max(1, (Number($('#scheduleDurationHours').value) || 1) - 1)));
-    $('#scheduleDurationIncrease').addEventListener('click', () => setDuration(Math.min(24, (Number($('#scheduleDurationHours').value) || 0) + 1)));
-    $('#saveSchedule')?.addEventListener('click', () => saveSchedule(false));
-    $('#applySchedule')?.addEventListener('click', () => { const applyNow = true; saveSchedule(applyNow); });
+    $('#saveSchedule')?.addEventListener('click', () => saveSchedule(true));
 }
 
 function decisionMarkup(decision, decisionKey = '', expanded = false) {

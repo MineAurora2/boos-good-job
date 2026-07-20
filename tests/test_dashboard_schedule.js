@@ -48,6 +48,65 @@ test('schedule editor exposes the accessible dial and styled picker contracts', 
     assert.match(stylesSource, /\.schedule-actions \.control-command\.start\s*\{[^}]*color:var\(--green\)/);
 });
 
+test('schedule settings are collapsed until the enable toggle is selected', () => {
+    const cardStart = htmlSource.indexOf('id="deliveryScheduleCard"');
+    assert.notEqual(cardStart, -1, 'missing schedule card');
+    const card = htmlSource.slice(cardStart, htmlSource.indexOf('</article>', cardStart));
+
+    assert.match(card, /<input\b(?=[^>]*id="scheduleEnabled")(?=[^>]*aria-controls="scheduleConfigCollapse")[^>]*>/);
+    assert.match(card, /<input\b(?=[^>]*id="scheduleEnabled")(?=[^>]*aria-expanded="false")[^>]*>/);
+    assert.match(card, /<[^>]*\bid="scheduleConfigCollapse"(?=[^>]*class="schedule-config-collapse")(?=[^>]*aria-hidden="true")[^>]*>/);
+    assert.match(card, /class="schedule-config-inner"/);
+    assert.match(card, /class="schedule-actions"[^>]*hidden[^>]*aria-hidden="true"/);
+    assert.ok(card.indexOf('id="scheduleFeedback"') < card.indexOf('class="schedule-actions"'));
+
+    assert.match(stylesSource, /\.schedule-config-collapse[^,{]*\{[^}]*grid-template-rows\s*:\s*0fr[^}]*transition/);
+    assert.match(stylesSource, /\.schedule-config-collapse[^}]*\.schedule-config-inner[^}]*min-height\s*:\s*0/);
+    assert.match(stylesSource, /\.schedule-config-collapse[^}]*grid-template-rows\s*:\s*1fr/);
+    assert.match(stylesSource, /\.schedule-actions\[hidden\]\s*\{[^}]*display\s*:\s*none/);
+    assert.doesNotMatch(stylesSource, /\.schedule-feedback:empty\s*\{[^}]*display\s*:\s*none/);
+
+    assert.match(appSource, /scheduleConfigCollapse/);
+    assert.match(appSource, /aria-hidden/);
+    assert.match(appSource, /inert/);
+});
+
+test('duration dial has no separate plus or minus stepper controls', () => {
+    assert.doesNotMatch(htmlSource, /scheduleDuration(?:Decrease|Increase)|schedule-duration-steppers/);
+    assert.doesNotMatch(appSource, /scheduleDuration(?:Decrease|Increase)|schedule-duration-steppers/);
+    assert.doesNotMatch(stylesSource, /schedule-duration-steppers/);
+});
+
+test('schedule editor exposes one save-and-apply command', () => {
+    assert.equal((htmlSource.match(/id="saveSchedule"/g) || []).length, 1);
+    assert.match(htmlSource, /<button\b(?=[^>]*id="saveSchedule")(?=[^>]*class="[^"]*\bcontrol-command\b[^"]*\bstart\b[^"]*")[^>]*>\s*保存并立即应用\s*<\/button>/);
+    assert.doesNotMatch(htmlSource, /id="applySchedule"/);
+    assert.doesNotMatch(appSource, /applySchedule/);
+
+    const bindSource = extractFunction('bindScheduleControls');
+    const saveSource = extractFunction('saveSchedule');
+    assert.match(bindSource, /saveSchedule\(true\)/);
+    assert.match(saveSource, /!schedule\.enabled[\s\S]*scheduleEnabled[\s\S]*focus\(\)/);
+    assert.doesNotMatch(bindSource, /saveSchedule\(false\)/);
+    assert.doesNotMatch(bindSource, /applySchedule/);
+});
+
+test('range trigger keeps equal date columns and positions its calendar icon independently', () => {
+    assert.match(stylesSource, /\.schedule-range-trigger[^,{]*\{[^}]*position\s*:\s*relative/);
+    assert.match(stylesSource, /\.schedule-range-trigger[^,{]*\{[^}]*grid-template-columns\s*:\s*(?:minmax\(0,\s*1fr\)|1fr)\s+24px\s+(?:minmax\(0,\s*1fr\)|1fr)/);
+    assert.doesNotMatch(stylesSource, /\.schedule-range-trigger[^,{]*\{[^}]*grid-template-columns[^}]*27px/);
+    assert.match(stylesSource, /\.schedule-range-trigger\s+\.schedule-calendar-icon\s*\{[^}]*position\s*:\s*absolute/);
+
+    const datePickerSource = extractFunction('initDatePicker');
+    assert.match(datePickerSource, /rect\.left\s*\+\s*\(rect\.width\s*-\s*width\)\s*\/\s*2/);
+    assert.match(datePickerSource, /schedule-picker-close/);
+    assert.match(datePickerSource, /openSingle[\s\S]*close\(false\)/);
+    assert.match(datePickerSource, /openRange[\s\S]*close\(false\)/);
+    assert.match(extractFunction('setScheduleConfigExpanded'), /datePickerOpen[\s\S]*schedule-picker-close/);
+    assert.match(stylesSource, /\.gj-calendar-days\s*\{[^}]*row-gap\s*:\s*3px/);
+    assert.match(stylesSource, /button\.in-range\s*\{[^}]*border-radius\s*:\s*0/);
+});
+
 test('schedule payload preserves the backend contract with whole-hour durations', () => {
     const helpers = evaluate(`
         ${extractFunction('schedulePayloadFromValues')}

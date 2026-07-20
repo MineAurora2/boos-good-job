@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260720-schedule-composer-1">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260720-schedule-composer-2">
 </head>
 <body>
     <div class="app-shell">
@@ -129,15 +129,17 @@
 
                     <article id="deliveryScheduleCard" class="control-card control-span-12 delivery-schedule-card">
                         <div class="control-card-head schedule-card-head">
-                            <div><span>定时投递</span><small id="scheduleStatusText">计划默认关闭</small></div>
+                            <div><span>定时投递</span><small id="scheduleStatusText" aria-live="polite">计划默认关闭</small></div>
                             <label class="schedule-toggle">
-                                <input id="scheduleEnabled" type="checkbox" data-schedule-field="enabled">
+                                <input id="scheduleEnabled" type="checkbox" data-schedule-field="enabled" aria-controls="scheduleConfigCollapse" aria-expanded="false">
                                 <span class="schedule-toggle-track" aria-hidden="true"><i></i></span>
                                 <span>启用计划</span>
                             </label>
                         </div>
-                        <div class="schedule-status" id="scheduleStatus" aria-live="polite"><i aria-hidden="true"></i><span>未启用定时计划</span></div>
-                        <div class="schedule-composer">
+                        <div id="scheduleConfigCollapse" class="schedule-config-collapse" aria-hidden="true" inert>
+                            <div class="schedule-config-inner">
+                                <div class="schedule-status" id="scheduleStatus"><i aria-hidden="true"></i><span>未启用定时计划</span></div>
+                                <div class="schedule-composer">
                             <section class="schedule-settings" aria-label="投递计划设置">
                                 <div class="schedule-field-group">
                                     <span class="schedule-field-label">执行周期</span>
@@ -215,20 +217,17 @@
                                     <div class="schedule-dial-center">
                                         <span>持续</span>
                                         <div><strong id="scheduleDurationValue">—</strong><small>小时</small></div>
-                                        <div class="schedule-duration-steppers">
-                                            <button id="scheduleDurationDecrease" type="button" aria-label="减少一小时" title="减少一小时"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14"></path></svg></button>
-                                            <button id="scheduleDurationIncrease" type="button" aria-label="增加一小时" title="增加一小时"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></svg></button>
-                                        </div>
                                     </div>
                                 </div>
                                 <div id="scheduleWindowSummary" class="schedule-window-summary">请选择开始时间和持续时长</div>
                                 <small id="scheduleDurationError" class="schedule-field-error schedule-duration-error" aria-live="polite"></small>
                             </section>
+                                </div>
+                            </div>
                         </div>
-                        <div class="schedule-actions">
-                            <span id="scheduleFeedback" aria-live="polite"></span>
-                            <button id="saveSchedule" type="button" class="control-command subtle">保存计划</button>
-                            <button id="applySchedule" type="button" class="control-command start">保存并立即应用</button>
+                        <span id="scheduleFeedback" class="schedule-feedback" aria-live="polite"></span>
+                        <div class="schedule-actions" hidden aria-hidden="true">
+                            <button id="saveSchedule" type="button" class="control-command start active">保存并立即应用</button>
                         </div>
                     </article>
 
@@ -561,6 +560,6 @@
 
     <div class="toast" id="toast" role="status"></div>
     <script src="/dashboard/vendor/echarts.min.js" defer></script>
-    <script src="/dashboard/app.js?v=20260720-schedule-composer-1" defer></script>
+    <script src="/dashboard/app.js?v=20260720-schedule-composer-2" defer></script>
 </body>
 </html>
