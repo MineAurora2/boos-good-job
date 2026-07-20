@@ -298,7 +298,7 @@ class DeliveryStore:
             # 在读取重复记录和额度前取得写锁，使后续检查与两项写入构成一个原子操作。
             connection.execute('BEGIN IMMEDIATE')
             existing = connection.execute(
-                'SELECT company, title, account_id, status, claimed_at FROM company_deliveries WHERE company_key = ?',
+                'SELECT company, title, account_id, worker_id, status, claimed_at FROM company_deliveries WHERE company_key = ?',
                 (company_key,),
             ).fetchone()
             if existing:

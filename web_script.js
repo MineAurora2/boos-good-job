@@ -19,6 +19,7 @@
     const SCRIPT_VERSION = '2026-07-20-control-short-poll.1';
     const CONTROL_PROTOCOL_VERSION = 1;
     const CONTROL_POLL_INTERVAL_MS = 2000;
+    const DUPLICATE_CARD_RETENTION_MS = 5000;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
     const SCRIPT_COMMAND_KEY = '__goodjobs_script_command';
     const SCRIPT_LIFECYCLE_CHANNEL = '__goodjobs_lifecycle';
@@ -640,6 +641,64 @@
     function searchRejectionAction(rulePassed, aiPassed) {
         if (!aiPassed) return 'job_ai_rejected';
         return rulePassed ? '' : 'job_below_threshold';
+    }
+
+    function createDuplicateDecision(currentDecision = {}, jobInfo = {}, duplicateResult = {}, reason = '') {
+        const base = currentDecision && typeof currentDecision === 'object' ? currentDecision : {};
+        const info = jobInfo && typeof jobInfo === 'object' ? jobInfo : {};
+        const existing = duplicateResult?.delivery || duplicateResult?.existing || {};
+        const company = String(info.company || base.company || existing.company || '').trim();
+        const title = String(info.title || base.title || existing.title || '').trim();
+        const duplicateReason = String(reason || '').trim()
+            || `重复投递（未计数）：公司 [${company}] + 岗位 [${title}] 已领取或投递，已忽略`;
+        return {
+            ...base,
+            company,
+            title,
+            salary: String(info.salary || base.salary || '').trim(),
+            location: String(info.location || base.location || '').trim(),
+            city: String(info.city || base.city || '').trim(),
+            industry: String(info.industry || base.industry || '').trim(),
+            experience: String(info.experience || base.experience || '').trim(),
+            education: String(info.education || base.education || '').trim(),
+            hrActive: String(info.hrActive || base.hrActive || '').trim(),
+            hrActiveLevel: String(info.hrActiveLevel || base.hrActiveLevel || 'unknown').trim() || 'unknown',
+            jobUrl: String(info.jobUrl || info.href || base.jobUrl || '').trim(),
+            decisionState: 'duplicate',
+            decisionReason: duplicateReason,
+            finalPassed: false,
+            duplicateOf: {
+                accountId: String(existing.account_id || existing.accountId || '').trim(),
+                workerId: String(existing.worker_id || existing.workerId || '').trim(),
+                status: String(existing.status || '').trim(),
+            },
+        };
+    }
+
+    function createDuplicateActionPayload(scene, jobInfo, decision, identity = {}, keyword = '') {
+        const info = jobInfo && typeof jobInfo === 'object' ? jobInfo : {};
+        const card = decision && typeof decision === 'object' ? decision : {};
+        const owner = card.duplicateOf && typeof card.duplicateOf === 'object' ? card.duplicateOf : {};
+        return {
+            action: 'company_duplicate_skipped',
+            scene,
+            title: card.title || info.title || '',
+            company: card.company || info.company || '',
+            jobUrl: info.jobUrl || info.href || card.jobUrl || '',
+            salary: info.salary || card.salary || '',
+            location: info.location || card.location || '',
+            city: info.city || card.city || '',
+            industry: info.industry || card.industry || '',
+            experience: info.experience || card.experience || '',
+            education: info.education || card.education || '',
+            keyword,
+            reason: card.decisionReason || '',
+            existingAccountId: owner.accountId || '',
+            existingWorkerId: owner.workerId || '',
+            existingStatus: owner.status || '',
+            accountId: identity.accountId || card.accountId || '',
+            workerId: identity.workerId || card.workerId || '',
+        };
     }
 
     const deliveryFlow = {
@@ -2587,6 +2646,8 @@
                 currentJob: '',
                 currentJobUrl: '',
                 currentDecision: {},
+                duplicateCard: null,
+                duplicateCardUntil: 0,
                 lastError: '',
                 consecutiveFailures: 0,
                 counters: { viewed: 0, queued: 0, sent: 0, failed: 0 },
@@ -2609,29 +2670,53 @@
                 }
             };
 
-            this.controlAgent?.setTelemetryProvider(() => ({
-                role: 'search',
-                phase: runtime.phase,
-                keyword: runtime.keyword,
-                currentJob: runtime.currentJob,
-                currentJobUrl: runtime.currentJobUrl,
-                currentDecision: runtime.currentDecision,
-                queue: jobHrefs.slice(0, 50).map((url, index) => ({
-                    id: url,
-                    url,
-                    status: index === 0 ? 'next' : 'pending',
-                    keyword: currentKeyword,
-                })),
-                counters: runtime.counters,
-                lastError: runtime.lastError,
-                consecutiveFailures: runtime.consecutiveFailures,
-            }));
+            this.controlAgent?.setTelemetryProvider(() => {
+                const duplicateCard = runtime.duplicateCard
+                    && Date.now() < runtime.duplicateCardUntil
+                    ? runtime.duplicateCard
+                    : null;
+                if (!duplicateCard && runtime.duplicateCard) {
+                    runtime.duplicateCard = null;
+                    runtime.duplicateCardUntil = 0;
+                }
+                return {
+                    role: 'search',
+                    phase: duplicateCard?.decisionReason || runtime.phase,
+                    keyword: runtime.keyword,
+                    currentJob: duplicateCard?.title || runtime.currentJob,
+                    currentJobUrl: duplicateCard?.jobUrl || runtime.currentJobUrl,
+                    currentDecision: duplicateCard || runtime.currentDecision,
+                    queue: jobHrefs.slice(0, 50).map((url, index) => ({
+                        id: url,
+                        url,
+                        status: index === 0 ? 'next' : 'pending',
+                        keyword: currentKeyword,
+                    })),
+                    counters: runtime.counters,
+                    lastError: runtime.lastError,
+                    consecutiveFailures: runtime.consecutiveFailures,
+                };
+            });
 
             const sendRuntimeHeartbeat = (statePatch = null, transition = null) => {
                 if (statePatch) Object.assign(runtime, statePatch);
                 const mapped = runtime.state === 'idle' ? 'stopped' : runtime.state;
                 if (EXECUTION_LABELS[mapped]) this.controlAgent?.setExecutionState(mapped, transition?.generation);
                 queueRuntimeHeartbeat(this.controlAgent);
+            };
+
+            const publishDuplicateDecision = (jobInfo, duplicateResult, jobUrl = '') => {
+                const info = { ...(jobInfo || {}), jobUrl };
+                const message = deliveryFlow.duplicateMessage(info.company, info.title);
+                const decision = createDuplicateDecision(runtime.currentDecision, info, duplicateResult, message);
+                runtime.currentDecision = decision;
+                runtime.duplicateCard = decision;
+                runtime.duplicateCardUntil = Date.now() + DUPLICATE_CARD_RETENTION_MS;
+                runtime.currentJob = info.title || runtime.currentJob;
+                runtime.state = 'running';
+                runtime.phase = message;
+                sendRuntimeHeartbeat();
+                return decision;
             };
 
             const transitionIsCurrent = (transition = {}) => (
@@ -2750,6 +2835,13 @@
                         if (data && typeof data === 'object') {
                             if (data.message) logger.add(data.message, data);
                             if (data.currentDecision && typeof data.currentDecision === 'object') {
+                                if (data.currentDecision.decisionState === 'duplicate') {
+                                    runtime.duplicateCard = data.currentDecision;
+                                    runtime.duplicateCardUntil = Date.now() + DUPLICATE_CARD_RETENTION_MS;
+                                } else {
+                                    runtime.duplicateCard = null;
+                                    runtime.duplicateCardUntil = 0;
+                                }
                                 runtime.currentDecision = data.currentDecision;
                                 runtime.currentJob = data.currentJob || data.currentDecision.title || runtime.currentJob;
                                 runtime.state = data.state || runtime.state;
@@ -3278,6 +3370,8 @@
                     const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
                     const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
                     const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                    runtime.duplicateCard = null;
+                    runtime.duplicateCardUntil = 0;
                     runtime.currentDecision = {
                         workerId: identity.workerId,
                         accountId: identity.accountId,
@@ -3383,9 +3477,11 @@
                             return loop();
                         }
                         if (duplicateCheck.greeted) {
-                            const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
+                            const duplicateDecision = publishDuplicateDecision(jobInfo, duplicateCheck, href);
+                            const duplicateMessage = duplicateDecision.decisionReason;
                             logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                             console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
+                            await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
                             return loop();
                         }
                         runtime.state = 'claiming';
@@ -3418,9 +3514,11 @@
                                 logger.add(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}），自动暂停`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
                                 this.pause = true;
                             } else if (isDuplicateJob) {
-                                const duplicateMessage = deliveryFlow.duplicateMessage(jobInfo.company, jobInfo.title);
+                                const duplicateDecision = publishDuplicateDecision(jobInfo, claim, href);
+                                const duplicateMessage = duplicateDecision.decisionReason;
                                 logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                 console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
+                                await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
                                 return loop();
                             } else {
                                 logger.add(`职位 [${jobInfo.title}] 无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
@@ -4243,7 +4341,7 @@
                     entry
                 ).catch(() => null);
             };
-            const publishDecision = (currentJob, currentDecision, phase = '聊天岗位匹配评分') => {
+            const publishDecision = (currentJob, currentDecision, phase = '聊天岗位匹配评分', state = 'evaluating') => {
                 if (runtimeLifecycle.isStopping() || !this.broadcast) return;
                 this.broadcast.send(
                     this.targets.search,
@@ -4251,10 +4349,17 @@
                     {
                         currentJob,
                         currentDecision,
-                        state: 'evaluating',
+                        state,
                         phase,
                     }
                 ).catch(() => null);
+            };
+            const publishDuplicateDecision = (jobInfo, duplicateResult, baseDecision, jobUrl = '') => {
+                const info = { ...(jobInfo || {}), jobUrl };
+                const message = deliveryFlow.duplicateMessage(info.company, info.title);
+                const duplicateDecision = createDuplicateDecision(baseDecision, info, duplicateResult, message);
+                publishDecision(info.title, duplicateDecision, message, 'running');
+                return duplicateDecision;
             };
             // 分割线
             const divider = () => {
@@ -4340,7 +4445,7 @@
                                 const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
                                 const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
                                 const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
-                                publishDecision(jobInfo.title, {
+                                const currentDecision = {
                                     workerId: identity.workerId,
                                     accountId: identity.accountId,
                                     company,
@@ -4366,7 +4471,8 @@
                                         ? `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`
                                         : (!aiPassed ? (decision.aiReason || 'AI 判断未通过') : (!rulePassed ? (decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`) : '')),
                                     greetingMode: '',
-                                });
+                                };
+                                publishDecision(jobInfo.title, currentDecision);
                                 status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
                                 logDecisionDeductions(decision, (message) => status(message, { sender: 'delivery', verbosity: 'detailed' }));
                                 await logAction({
@@ -4408,9 +4514,15 @@
                                         continue;
                                     }
                                     if (duplicateCheck.greeted) {
-                                        const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
+                                        const duplicateDecision = publishDuplicateDecision(
+                                            { ...jobInfo, company },
+                                            duplicateCheck,
+                                            currentDecision,
+                                        );
+                                        const duplicateMessage = duplicateDecision.decisionReason;
                                         status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                         console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
+                                        await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
                                         continue;
                                     }
                                     if (!await antiDetection.delay()) continue;
@@ -4428,9 +4540,15 @@
                                         if (claim.reason === 'daily_limit') {
                                             status(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}）`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
                                         } else if (deliveryFlow.isDuplicate(claim)) {
-                                            const duplicateMessage = deliveryFlow.duplicateMessage(company, jobInfo.title);
+                                            const duplicateDecision = publishDuplicateDecision(
+                                                { ...jobInfo, company },
+                                                claim,
+                                                currentDecision,
+                                            );
+                                            const duplicateMessage = duplicateDecision.decisionReason;
                                             status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
                                             console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
+                                            await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
                                         } else {
                                             status(`无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
                                         }
@@ -4646,6 +4764,8 @@
             createRuntimeActionPayload,
             queueRuntimeHeartbeat,
             searchRejectionAction,
+            createDuplicateDecision,
+            createDuplicateActionPayload,
             normalizeServerOrigin,
             applyFrontendConfig,
             connectionSettings,

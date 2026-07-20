@@ -200,6 +200,73 @@ test('extracts BOSS qualifications from current job header selectors', () => {
     assert.equal(queriedSelectors.includes('meta[name="description"]'), false);
 });
 
+test('keeps a browser instance job card visible when delivery is duplicated', () => {
+    const { hooks } = loadHooks();
+    assert.equal(typeof hooks.createDuplicateDecision, 'function');
+
+    const decision = hooks.createDuplicateDecision(
+        {
+            workerId: 'worker-current',
+            accountId: 'account-current',
+            company: 'Acme',
+            title: 'Backend Engineer',
+            score: 88,
+            deductions: [{ keyword: 'legacy', deductStars: 1 }],
+            decisionState: 'claiming',
+            finalPassed: true,
+        },
+        {
+            company: 'Acme',
+            title: 'Backend Engineer',
+            salary: '20-30K',
+            location: 'Shenzhen',
+            hrActive: 'online',
+            hrActiveLevel: 'online',
+        },
+        {
+            existing: {
+                account_id: 'account-owner',
+                worker_id: 'worker-owner',
+                status: 'sent',
+            },
+        },
+    );
+
+    assert.equal(decision.decisionState, 'duplicate');
+    assert.equal(decision.finalPassed, false);
+    assert.equal(decision.company, 'Acme');
+    assert.equal(decision.title, 'Backend Engineer');
+    assert.equal(decision.salary, '20-30K');
+    assert.equal(decision.location, 'Shenzhen');
+    assert.equal(decision.score, 88);
+    assert.deepEqual(decision.deductions, [{ keyword: 'legacy', deductStars: 1 }]);
+    assert.equal(decision.duplicateOf.workerId, 'worker-owner');
+    assert.equal(decision.duplicateOf.accountId, 'account-owner');
+    assert.match(decision.decisionReason, /Acme/);
+    assert.match(decision.decisionReason, /Backend Engineer/);
+
+    const action = hooks.createDuplicateActionPayload(
+        'search',
+        { ...decision, salary: '20-30K', location: 'Shenzhen' },
+        decision,
+        { accountId: 'account-current', workerId: 'worker-current' },
+        'backend',
+    );
+    assert.equal(action.action, 'company_duplicate_skipped');
+    assert.equal(action.existingWorkerId, 'worker-owner');
+    assert.equal(action.workerId, 'worker-current');
+    assert.equal(action.keyword, 'backend');
+});
+
+test('all duplicate delivery paths publish the preserved decision card', () => {
+    assert.equal((scriptSource.match(/const duplicateDecision = publishDuplicateDecision/g) || []).length, 4);
+    assert.match(scriptSource, /DUPLICATE_CARD_RETENTION_MS/);
+    assert.match(scriptSource, /duplicateCardUntil/);
+    assert.match(scriptSource, /action: 'company_duplicate_skipped'/);
+    assert.match(scriptSource, /const publishDecision = \(currentJob, currentDecision, phase = '聊天岗位匹配评分', state = 'evaluating'\)/);
+    assert.match(scriptSource, /if \(data\.currentDecision\.decisionState === 'duplicate'\) \{[\s\S]*runtime\.duplicateCard = data\.currentDecision;[\s\S]*runtime\.duplicateCardUntil = Date\.now\(\) \+ DUPLICATE_CARD_RETENTION_MS;[\s\S]*\} else \{/);
+});
+
 test('BOSS experience selector supports current and corrected class spellings', () => {
     const { hooks } = loadHooks();
     const queriedSelectors = [];
