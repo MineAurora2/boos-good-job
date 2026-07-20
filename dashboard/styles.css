@@ -187,6 +187,7 @@ html[data-theme="light"] .metric-card, html[data-theme="light"] .panel { backgro
 .monitor-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 10px 0 14px; }
 .monitor-metrics > div { padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.018); }
 .monitor-metrics span, .monitor-metrics small { display: block; }.monitor-metrics span { color: #758e9a; font-size: 9px; }.monitor-metrics strong { display: block; margin: 7px 0 4px; font-size: 22px; }.monitor-metrics small { color: #4e6673; font-size: 8px; }
+.monitor-metrics [hidden] { display: none !important; }
 .monitor-grid { display: grid; grid-template-columns: .9fr 1.35fr; gap: 12px; }
 .client-board, .live-log-board { min-height: 255px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4,12,18,.28); }
 .subpanel-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }

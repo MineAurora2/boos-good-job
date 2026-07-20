@@ -37,6 +37,12 @@ function evaluate(source) {
     return vm.runInNewContext(source, Object.create(null));
 }
 
+test('hidden compatibility metrics stay hidden in the live monitor', () => {
+    assert.match(htmlSource, /id="activeClients" hidden/);
+    assert.match(htmlSource, /id="heartbeatWindowHint" hidden/);
+    assert.match(stylesSource, /\.monitor-metrics \[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important/);
+});
+
 test('schedule editor exposes the accessible dial and styled picker contracts', () => {
     assert.match(htmlSource, /id="scheduleDurationDial"/);
     assert.match(htmlSource, /id="scheduleDurationHandle"[^>]*role="slider"[^>]*aria-valuemin="1"[^>]*aria-valuemax="24"/);
