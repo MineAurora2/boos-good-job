@@ -307,6 +307,8 @@
         randomNoIntroduceRatio: 0, // 随机不带招呼语直接打招呼的百分比（0 表示始终使用招呼语）
         randomDelayMinMs: 0, // 投递前后随机延时下限
         randomDelayMaxMs: 0, // 投递前后随机延时上限
+        detailRandomDelayMinMs: 0, // 获取职位详情前随机延时下限
+        detailRandomDelayMaxMs: 0, // 获取职位详情前随机延时上限
         hrActiveFilterEnabled: false, // 是否按 HR 活跃状态过滤
         hrActiveLevels: null, // 允许的 HR 活跃档位；null 时兼容旧版最低档位配置
         hrActiveMinLevel: 'this_month', // 旧版后端兼容字段
@@ -791,27 +793,43 @@
             return Math.random() * 100 < Math.min(100, percent);
         },
         // 在 [min, max] 毫秒区间取随机延时；区间非法或为 0 时返回 0。
-        randomDelayMs() {
-            const min = Math.max(0, Number(OPTIONS.randomDelayMinMs) || 0);
-            const max = Math.max(min, Number(OPTIONS.randomDelayMaxMs) || 0);
+        randomDelayMs(minValue = OPTIONS.randomDelayMinMs, maxValue = OPTIONS.randomDelayMaxMs) {
+            const min = Math.max(0, Number(minValue) || 0);
+            const max = Math.max(min, Number(maxValue) || 0);
             if (max <= 0) return 0;
             return Math.floor(min + Math.random() * (max - min + 1));
         },
-        // 受总开关约束的可中断随机延时；关闭或区间为 0 时不等待。
-        // 不接收调用方标签，交由 asyncSleep 使用默认的 runtimeLifecycle.signal，保证停止时可中断。
-        async delay(shouldInterrupt = null) {
-            if (!this.enabled()) return true;
-            const ms = this.randomDelayMs();
-            if (ms <= 0) return true;
+        // 受总开关约束的可中断随机延时核心；关闭或区间为 0 时不等待。
+        async delayWithRange(minValue, maxValue, shouldInterrupt = null) {
+            const interrupted = () => typeof shouldInterrupt === 'function' && shouldInterrupt();
+            if (!this.enabled()) return !interrupted();
+            const ms = this.randomDelayMs(minValue, maxValue);
+            if (ms <= 0) return !interrupted();
             let remaining = ms;
             while (remaining > 0) {
                 runtimeLifecycle.guard();
-                if (typeof shouldInterrupt === 'function' && shouldInterrupt()) return false;
+                if (interrupted()) return false;
                 const slice = Math.min(200, remaining);
                 await tools.asyncSleep(slice);
                 remaining -= slice;
             }
-            return !(typeof shouldInterrupt === 'function' && shouldInterrupt());
+            return !interrupted();
+        },
+        // 投递前后使用的随机延时。
+        async delay(shouldInterrupt = null) {
+            return this.delayWithRange(
+                OPTIONS.randomDelayMinMs,
+                OPTIONS.randomDelayMaxMs,
+                shouldInterrupt
+            );
+        },
+        // 获取职位详情前使用的独立随机延时。
+        async detailDelay(shouldInterrupt = null) {
+            return this.delayWithRange(
+                OPTIONS.detailRandomDelayMinMs,
+                OPTIONS.detailRandomDelayMaxMs,
+                shouldInterrupt
+            );
         },
         // 达标岗位是否按概率随机跳过（调用方已确认总开关开启）。
         shouldSkip() {
@@ -3091,6 +3109,8 @@
 
             // 获取职位信息
             const getJobInfo = async (href) => {
+                const detailDelayPassed = await antiDetection.detailDelay(() => control.stopped || this.pause);
+                if (!detailDelayPassed) return { skip: true, skipReason: '获取职位详情前等待被中断' };
                 // 打开窗口
                 const detailWindow = tools.openTabNSetTimestamp(href, this.targets.detail);
                 if (!detailWindow) {
@@ -4430,6 +4450,8 @@
                             if (lastMsg && lastMsg.role === 'assistant') continue;
                             // 如果以前没聊过
                             if (!chatInfo.talked) {
+                                const detailDelayPassed = await antiDetection.detailDelay(() => this.pause);
+                                if (!detailDelayPassed) continue;
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 runtimeLifecycle.guard();
                                 chatInfo.jobEl.click();
@@ -4647,6 +4669,8 @@
                             // 只要对方发来新消息且还没发过简历，就直接发送简历，不再调用大模型聊天
                             if (!chatInfo.resumeSended) {
                                 isChat = false;
+                                const detailDelayPassed = await antiDetection.detailDelay(() => this.pause);
+                                if (!detailDelayPassed) continue;
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 runtimeLifecycle.guard();
                                 chatInfo.jobEl.click();
@@ -4770,6 +4794,8 @@
             applyFrontendConfig,
             connectionSettings,
             deliveryIdentity,
+            antiDetection,
+            tools,
             Api,
             Logger,
             StatusIndicator,

@@ -130,6 +130,8 @@ DEFAULT_USER_CONFIG = {
         # 投递前后附加的随机延时区间（毫秒）。
         'randomDelayMinMs': 0,
         'randomDelayMaxMs': 0,
+        'detailRandomDelayMinMs': 0,
+        'detailRandomDelayMaxMs': 0,
         # HR 活跃筛选：岗位状态命中任一所选档位时放行。
         'hrActiveFilterEnabled': False,
         'hrActiveLevels': list(HR_ACTIVE_LEVELS),

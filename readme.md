@@ -210,6 +210,8 @@ http://127.0.0.1:47999/dashboard
 | 随机不带招呼语 | `frontend.randomNoIntroduceRatio` | `0%`；0–100 | 按概率不发送招呼文本，直接执行打招呼动作；不是跳过岗位。 |
 | 投递随机延时下限 | `frontend.randomDelayMinMs` | `0 ms`；0–600000 | 投递前后随机等待的最短时间。 |
 | 投递随机延时上限 | `frontend.randomDelayMaxMs` | `0 ms`；0–600000 | 投递前后随机等待的最长时间，必须不小于下限。 |
+| 职位详情随机延时下限 | `frontend.detailRandomDelayMinMs` | `0 ms`；0–600000 | 获取职位详情前随机等待的最短时间，覆盖搜索页和聊天页的详情入口；受 `antiDetectionEnabled` 总开关约束。 |
+| 职位详情随机延时上限 | `frontend.detailRandomDelayMaxMs` | `0 ms`；0–600000 | 获取职位详情前随机等待的最长时间，必须不小于下限；受 `antiDetectionEnabled` 总开关约束。 |
 
 #### HR 活跃筛选
 

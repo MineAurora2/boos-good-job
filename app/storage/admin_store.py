@@ -94,10 +94,17 @@ def validate_config(config: dict) -> None:
             raise ValueError(f'{key} 必须是开关值')
     for key in ('randomSkipRatio', 'randomNoIntroduceRatio'):
         _validate_number(frontend, key, 0, 100)
-    for key in ('randomDelayMinMs', 'randomDelayMaxMs'):
+    for key in (
+        'randomDelayMinMs',
+        'randomDelayMaxMs',
+        'detailRandomDelayMinMs',
+        'detailRandomDelayMaxMs',
+    ):
         _validate_number(frontend, key, 0, 600000)
     if frontend['randomDelayMaxMs'] < frontend['randomDelayMinMs']:
         raise ValueError('randomDelayMaxMs 不能小于 randomDelayMinMs')
+    if frontend['detailRandomDelayMaxMs'] < frontend['detailRandomDelayMinMs']:
+        raise ValueError('detailRandomDelayMaxMs 不能小于 detailRandomDelayMinMs')
     if frontend['preloadStableRoundsLimit'] > frontend['preloadMaxRounds']:
         raise ValueError('preloadStableRoundsLimit 不能大于 preloadMaxRounds')
     if not isinstance(frontend.get('hrActiveFilterEnabled'), bool):

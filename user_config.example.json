@@ -40,6 +40,8 @@
     "randomNoIntroduceRatio": 0,
     "randomDelayMinMs": 0,
     "randomDelayMaxMs": 0,
+    "detailRandomDelayMinMs": 0,
+    "detailRandomDelayMaxMs": 0,
     "hrActiveFilterEnabled": false,
     "hrActiveLevels": [
       "online",

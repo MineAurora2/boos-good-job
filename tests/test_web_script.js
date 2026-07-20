@@ -267,6 +267,104 @@ test('all duplicate delivery paths publish the preserved decision card', () => {
     assert.match(scriptSource, /if \(data\.currentDecision\.decisionState === 'duplicate'\) \{[\s\S]*runtime\.duplicateCard = data\.currentDecision;[\s\S]*runtime\.duplicateCardUntil = Date\.now\(\) \+ DUPLICATE_CARD_RETENTION_MS;[\s\S]*\} else \{/);
 });
 
+test('detail delay uses 200ms slices and the dedicated range', async () => {
+    const { hooks } = loadHooks();
+    assert.equal(typeof hooks.antiDetection, 'object');
+    assert.equal(typeof hooks.tools, 'object');
+    hooks.OPTIONS.antiDetectionEnabled = true;
+    hooks.OPTIONS.detailRandomDelayMinMs = 450;
+    hooks.OPTIONS.detailRandomDelayMaxMs = 450;
+    const sleeps = [];
+    hooks.tools.asyncSleep = async (ms) => sleeps.push(ms);
+
+    assert.equal(await hooks.antiDetection.detailDelay(), true);
+    assert.deepEqual(sleeps, [200, 200, 50]);
+});
+
+test('detail delay is disabled by the global switch or a zero detail range', async () => {
+    const { hooks } = loadHooks();
+    const sleeps = [];
+    hooks.tools.asyncSleep = async (ms) => sleeps.push(ms);
+    hooks.OPTIONS.detailRandomDelayMinMs = 450;
+    hooks.OPTIONS.detailRandomDelayMaxMs = 450;
+    hooks.OPTIONS.antiDetectionEnabled = false;
+    assert.equal(await hooks.antiDetection.detailDelay(), true);
+
+    hooks.OPTIONS.antiDetectionEnabled = true;
+    hooks.OPTIONS.detailRandomDelayMinMs = 0;
+    hooks.OPTIONS.detailRandomDelayMaxMs = 0;
+    assert.equal(await hooks.antiDetection.detailDelay(), true);
+    assert.deepEqual(sleeps, []);
+});
+
+test('detail delay honors an interruption callback even when no wait is configured', async () => {
+    const { hooks } = loadHooks();
+    hooks.OPTIONS.antiDetectionEnabled = false;
+    hooks.OPTIONS.detailRandomDelayMinMs = 0;
+    hooks.OPTIONS.detailRandomDelayMaxMs = 0;
+
+    assert.equal(await hooks.antiDetection.detailDelay(() => true), false);
+});
+
+test('detail delay stops between slices when its interrupt callback returns true', async () => {
+    const { hooks } = loadHooks();
+    hooks.OPTIONS.antiDetectionEnabled = true;
+    hooks.OPTIONS.detailRandomDelayMinMs = 450;
+    hooks.OPTIONS.detailRandomDelayMaxMs = 450;
+    const sleeps = [];
+    let checks = 0;
+    hooks.tools.asyncSleep = async (ms) => sleeps.push(ms);
+
+    const result = await hooks.antiDetection.detailDelay(() => ++checks > 1);
+
+    assert.equal(result, false);
+    assert.deepEqual(sleeps, [200]);
+    assert.equal(checks, 2);
+});
+
+test('random delay ranges are closed and delivery/detail ranges stay independent', async () => {
+    const lowMath = Object.create(Math);
+    lowMath.random = () => 0;
+    const { hooks: lowHooks } = loadHooks({ Math: lowMath });
+    assert.equal(lowHooks.antiDetection.randomDelayMs(10, 20), 10);
+
+    const highMath = Object.create(Math);
+    highMath.random = () => 0.999999999;
+    const { hooks: highHooks } = loadHooks({ Math: highMath });
+    assert.equal(highHooks.antiDetection.randomDelayMs(10, 20), 20);
+
+    highHooks.OPTIONS.antiDetectionEnabled = true;
+    highHooks.OPTIONS.randomDelayMinMs = 10;
+    highHooks.OPTIONS.randomDelayMaxMs = 10;
+    highHooks.OPTIONS.detailRandomDelayMinMs = 30;
+    highHooks.OPTIONS.detailRandomDelayMaxMs = 30;
+    const sleeps = [];
+    highHooks.tools.asyncSleep = async (ms) => sleeps.push(ms);
+    assert.equal(await highHooks.antiDetection.delay(), true);
+    assert.equal(await highHooks.antiDetection.detailDelay(), true);
+    assert.deepEqual(sleeps, [10, 30]);
+});
+
+test('detail delay gates one search open and both chat job clicks before timestamps', () => {
+    const searchStart = scriptSource.indexOf('const getJobInfo = async');
+    const searchEnd = scriptSource.indexOf('// 接收职位信息', searchStart);
+    assert.ok(searchStart >= 0 && searchEnd > searchStart);
+    const searchSource = scriptSource.slice(searchStart, searchEnd);
+    assert.equal((searchSource.match(/await antiDetection\.detailDelay\(\(\) => control\.stopped \|\| this\.pause\)/g) || []).length, 1);
+    assert.match(searchSource, /detailDelayPassed\s*=\s*await antiDetection\.detailDelay/);
+    assert.match(searchSource, /if \(!detailDelayPassed\) return \{ skip: true/);
+    assert.ok(searchSource.indexOf('detailDelayPassed') < searchSource.indexOf('tools.openTabNSetTimestamp'));
+
+    const clickMatches = [...scriptSource.matchAll(/chatInfo\.jobEl\.click\(\)/g)];
+    assert.equal(clickMatches.length, 2);
+    for (const match of clickMatches) {
+        const before = scriptSource.slice(Math.max(0, match.index - 500), match.index);
+        assert.match(before, /await antiDetection\.detailDelay\(\(\) => this\.pause\)/);
+        assert.match(before, /if \(!detailDelayPassed\) continue;\s*localStorage\.setItem/);
+        assert.ok(before.lastIndexOf('await antiDetection.detailDelay') < before.lastIndexOf('localStorage.setItem'));
+    }
+});
+
 test('BOSS experience selector supports current and corrected class spellings', () => {
     const { hooks } = loadHooks();
     const queriedSelectors = [];
