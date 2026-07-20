@@ -43,7 +43,7 @@ def extract_city(value: str | None) -> str:
 
 
 def parse_salary_details(salary: str | None) -> dict:
-    """解析月薪上下限、中位数和薪数，返回仪表盘使用的四个标准字段。
+    """解析月薪上下限、统计基准值和薪数，返回仪表盘使用的四个标准字段。
 
     支持 K 制区间、元/月区间和单值 K；无法识别月薪时三个薪资值为 ``None``，
     未注明薪数时按 12 薪展示。该函数无文件或数据库副作用。
@@ -67,7 +67,7 @@ def parse_salary_details(salary: str | None) -> dict:
     return {
         'salaryMinK': minimum,
         'salaryMaxK': maximum,
-        'salaryK': round((minimum + maximum) / 2, 1) if minimum is not None else None,
+        'salaryK': minimum,
         'salaryMonths': int(months_match.group(1)) if months_match else 12,
     }
 
