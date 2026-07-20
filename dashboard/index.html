@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <title>求职雷达 · 投递统计面板</title>
     <script>try { const savedTheme = localStorage.getItem('goodjobs.dashboard.theme'); document.documentElement.dataset.theme = savedTheme === 'light' ? 'light' : 'dark'; } catch (_) { document.documentElement.dataset.theme = 'dark'; }</script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20260720-schedule-composer-2">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=20260720-delivery-gate-v2-2">
 </head>
 <body>
     <div class="app-shell">
@@ -124,6 +124,57 @@
                             <button type="button" class="control-command start active" data-control-scope="global" data-desired-state="running" aria-pressed="false"><span aria-hidden="true">▶</span> 开启全部</button>
                             <button type="button" class="control-command pause active" data-control-scope="global" data-desired-state="paused" aria-pressed="false"><span aria-hidden="true">Ⅱ</span> 暂停全部</button>
                             <button type="button" class="control-command danger active" data-control-scope="global" data-desired-state="stopped" aria-pressed="false"><span aria-hidden="true">■</span> 结束全部</button>
+                        </div>
+                    </article>
+
+                    <article id="deliveryGateCard" class="control-card control-span-12 delivery-gate-card">
+                        <div class="control-card-head delivery-gate-head">
+                            <div><span>投递门禁策略</span><small>服务端策略实时下发到 V2 浏览器实例</small></div>
+                            <span id="deliveryProtocolBadge" class="delivery-protocol-badge" data-state="ready">协议 V2</span>
+                        </div>
+                        <ol id="deliveryStageList" class="delivery-stage-list" aria-label="投递流程阶段">
+                            <li data-delivery-stage="detail"><span>1</span><b>详情</b></li>
+                            <li data-delivery-stage="duplicate"><span>2</span><b>查重</b></li>
+                            <li data-delivery-stage="rules"><span>3</span><b>扣星</b></li>
+                            <li data-delivery-stage="hr"><span>4</span><b>HR</b></li>
+                            <li data-delivery-stage="random"><span>5</span><b>随机跳过</b></li>
+                            <li data-delivery-stage="qualified"><span>6</span><b>资格</b></li>
+                            <li data-delivery-stage="claim"><span>7</span><b>Claim</b></li>
+                            <li data-delivery-stage="ai"><span>8</span><b>AI</b></li>
+                            <li data-delivery-stage="queued"><span>9</span><b>Queued</b></li>
+                            <li data-delivery-stage="sent"><span>10</span><b>Sent</b></li>
+                        </ol>
+                        <div class="delivery-policy-grid">
+                            <fieldset class="delivery-policy-section delivery-policy-switches">
+                                <legend>安全开关</legend>
+                                <label><input id="policyScanOnly" type="checkbox" data-delivery-safety="scanOnly"><span>仅扫描</span></label>
+                                <label><input id="policyScanAiEnabled" type="checkbox" data-delivery-safety="scanAiEnabled"><span>扫描 AI</span></label>
+                                <label><input id="policySendingDisabled" type="checkbox" data-delivery-safety="sendingDisabled"><span>禁止发送</span></label>
+                                <label><input id="policyOpeningDisabled" type="checkbox" data-delivery-safety="openingDisabled"><span>禁止打开</span></label>
+                                <label><input id="policyResumeSendingDisabled" type="checkbox" data-delivery-safety="resumeSendingDisabled"><span>禁止自动发简历</span></label>
+                            </fieldset>
+                            <fieldset class="delivery-policy-section delivery-policy-limits">
+                                <legend>额度与失败</legend>
+                                <label><span>每日目标</span><input id="planDailyTarget" type="number" min="0" max="150" step="1" data-delivery-plan="dailyTarget"></label>
+                                <label><span>小时上限</span><input id="planHourlyLimit" type="number" min="0" max="150" step="1" data-delivery-plan="hourlyLimit"></label>
+                                <label><span>连续失败上限</span><input id="planMaxConsecutiveFailures" type="number" min="1" max="100" step="1" data-delivery-plan="maxConsecutiveFailures"></label>
+                            </fieldset>
+                            <fieldset class="delivery-policy-section delivery-policy-hours">
+                                <legend>运行时段</legend>
+                                <label><span>开始</span><input id="planActiveStart" type="time" data-delivery-plan="activeStart"></label>
+                                <label><span>结束</span><input id="planActiveEnd" type="time" data-delivery-plan="activeEnd"></label>
+                                <label><span>休息开始</span><input id="planBreakStart" type="time" data-delivery-plan="breakStart"></label>
+                                <label><span>休息结束</span><input id="planBreakEnd" type="time" data-delivery-plan="breakEnd"></label>
+                            </fieldset>
+                            <fieldset class="delivery-policy-section delivery-policy-delay">
+                                <legend>节奏随机化</legend>
+                                <label><span>最短间隔 (ms)</span><input id="planMinDelayMs" type="number" min="0" max="3600000" step="100" data-delivery-plan="minDelayMs"></label>
+                                <label><span>最长间隔 (ms)</span><input id="planMaxDelayMs" type="number" min="0" max="3600000" step="100" data-delivery-plan="maxDelayMs"></label>
+                            </fieldset>
+                        </div>
+                        <div class="delivery-policy-actions">
+                            <span id="deliveryPolicyStatus" aria-live="polite">策略已同步</span>
+                            <button id="saveDeliveryPolicy" type="button" class="control-command start active">保存门禁策略</button>
                         </div>
                     </article>
 
@@ -567,6 +618,6 @@
 
     <div class="toast" id="toast" role="status"></div>
     <script src="/dashboard/vendor/echarts.min.js" defer></script>
-    <script src="/dashboard/app.js?v=20260720-schedule-composer-2" defer></script>
+    <script src="/dashboard/app.js?v=20260720-delivery-gate-v2-2" defer></script>
 </body>
 </html>

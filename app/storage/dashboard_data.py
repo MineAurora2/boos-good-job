@@ -227,6 +227,50 @@ def load_dashboard_data(action_log_path: Path, delivery_store: DeliveryStore) ->
             'canDelete': status not in {'reserved', 'queued'},
         })
 
+    visible_tokens = {item['claimToken'] for item in deliveries if item.get('claimToken')}
+    visible_jobs = {
+        delivery_key(item.get('company') or '', item.get('title') or '')
+        for item in deliveries
+    }
+    for token, record in db_by_token.items():
+        job_key = delivery_key(record.get('company') or '', record.get('title') or '')
+        if token in visible_tokens or (job_key and job_key in visible_jobs):
+            continue
+        status = record.get('status') or 'reserved'
+        logged_at = (
+            record.get('completed_at')
+            or record.get('queued_at')
+            or record.get('claimed_at')
+            or ''
+        )
+        deliveries.append({
+            'id': f'db-{token}',
+            'loggedAt': logged_at,
+            'company': (record.get('company') or '未记录公司').strip(),
+            'title': (record.get('title') or '未记录岗位').strip(),
+            'salary': '面议',
+            **parse_salary_details(''),
+            'location': '',
+            'city': '',
+            'industry': '',
+            'experience': '',
+            'education': '',
+            'keyword': '',
+            'hrActive': '',
+            'hrActiveLevel': 'unknown',
+            'greetingMode': '',
+            'status': status,
+            'score': None,
+            'accountId': (record.get('account_id') or '默认账号').strip(),
+            'scene': 'delivery',
+            'claimToken': token,
+            'sourceAction': 'database',
+            'canDelete': False,
+        })
+        visible_tokens.add(token)
+        if job_key:
+            visible_jobs.add(job_key)
+
     deliveries.sort(key=lambda item: item.get('loggedAt') or '', reverse=True)
     action_counts = Counter(record.get('action') for record in actions)
     evaluated_by_date, undated_evaluated = _action_counts_by_date(actions, 'job_decision_consumed')

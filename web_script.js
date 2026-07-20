@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         goodJobs
 // @namespace    http://tampermonkey.net/
-// @version      2026-07-20-control-short-poll.1
+// @version      2026-07-20-delivery-gate-v2.1
 // @description  goodJobs篡改猴插件
 // @match        https://www.zhipin.com/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=zhipin.com
@@ -16,8 +16,9 @@
 (function () {
     'use strict';
 
-    const SCRIPT_VERSION = '2026-07-20-control-short-poll.1';
-    const CONTROL_PROTOCOL_VERSION = 1;
+    const SCRIPT_VERSION = '2026-07-20-delivery-gate-v2.1';
+    const SCRIPT_API_VERSION = 2;
+    const CONTROL_PROTOCOL_VERSION = 2;
     const CONTROL_POLL_INTERVAL_MS = 2000;
     const DUPLICATE_CARD_RETENTION_MS = 5000;
     const SCRIPT_DISABLED_KEY = '__goodjobs_script_disabled';
@@ -28,6 +29,10 @@
     const SESSION_HANDOFF_KEY = '__goodjobs_session_handoff';
     const SESSION_HANDOFF_TTL_MS = 10000;
     const GREET_SESSION_KEY = '__goodjobs_pending_greet_session';
+    const FINAL_MARK_REPLAY_KEY = '__goodjobs_delivery_mark_replay_v2';
+    const FINAL_MARK_REPLAY_PREFIX = `${FINAL_MARK_REPLAY_KEY}:`;
+    const CLAIM_LEASE_RENEW_INTERVAL_MS = 5 * 60 * 1000;
+    const DEFAULT_FIXED_INTRODUCE = '您好，我对这个岗位很感兴趣，希望进一步沟通了解，谢谢。';
     const MANAGED_CHILD_NAMES = ['__zhipin_detail', '__zhipin_chat', '__zhipin_chat_greet'];
 
     function writeChildExecutionPermission(state) {
@@ -300,11 +305,10 @@
         preloadMaxRounds: 30, // 岗位预加载：最多滑动多少轮
         preloadActivateCardEvery: 0, // 预加载时每隔多少轮尝试轻点一次左侧岗位卡片，0 表示关闭
         preloadActivateCardWaitMs: 250, // 轻点岗位卡片后的额外等待时间
-        // 防检测：总开关关闭时下列随机化全部失效，脚本回到确定性行为。
+        // 节奏随机化：总开关关闭时下列随机化全部失效，脚本回到确定性行为。
         antiDetectionEnabled: false,
         shuffleJobOrder: true, // 取岗位前打乱本轮顺序
         randomSkipRatio: 0, // 达标岗位按百分比概率随机跳过（0 表示不跳过）
-        randomNoIntroduceRatio: 0, // 随机不带招呼语直接打招呼的百分比（0 表示始终使用招呼语）
         randomDelayMinMs: 0, // 投递前后随机延时下限
         randomDelayMaxMs: 0, // 投递前后随机延时上限
         detailRandomDelayMinMs: 0, // 获取职位详情前随机延时下限
@@ -645,6 +649,46 @@
         return rulePassed ? '' : 'job_below_threshold';
     }
 
+    function deliveryRejectionStage(reason = '') {
+        const normalized = String(reason || '').trim().toLowerCase();
+        if (['duplicate_job', 'duplicate_company', 'duplicate'].includes(normalized)) return 'duplicate';
+        if (normalized === 'random_skipped') return 'random';
+        if (normalized === 'score_below_threshold' || normalized === 'discarded') return 'rules';
+        if (normalized.startsWith('hr_')) return 'hr';
+        if (['daily_limit', 'daily_target', 'hourly_limit', 'quota_rejected'].includes(normalized)) return 'quota';
+        if (normalized.startsWith('missing_')) return 'fields';
+        if (normalized.startsWith('ai_')) return 'ai';
+        if ([
+            'sending_disabled', 'opening_disabled', 'resume_sending_disabled', 'scan_only',
+            'global_paused', 'outside_active_hours', 'consecutive_failures', 'minimum_interval',
+            'daily_target_reached', 'service_unavailable',
+        ].includes(normalized)) return 'policy';
+        return '';
+    }
+
+    function classifyDeliveryRejection(prepared = {}) {
+        const reason = String(prepared?.reason || 'qualification_rejected').trim();
+        const stage = deliveryRejectionStage(reason)
+            || String(prepared?.stage || '').trim()
+            || 'qualification';
+        const presentations = {
+            duplicate: { decisionState: 'duplicate', action: 'company_duplicate_skipped' },
+            random: { decisionState: 'random_skipped', action: 'job_random_skipped' },
+            rules: { decisionState: 'below_threshold', action: 'job_below_threshold' },
+            hr: { decisionState: 'hr_filtered', action: 'job_hr_filtered' },
+            quota: { decisionState: 'quota_rejected', action: 'job_quota_rejected' },
+            policy: { decisionState: 'policy_blocked', action: 'job_policy_blocked' },
+            fields: { decisionState: 'invalid_fields', action: 'job_invalid_fields' },
+            claim: { decisionState: 'claim_rejected', action: 'job_claim_rejected' },
+            ai: { decisionState: 'ai_rejected', action: 'job_ai_rejected' },
+        };
+        return {
+            reason,
+            stage,
+            ...(presentations[stage] || { decisionState: 'gate_rejected', action: 'job_gate_rejected' }),
+        };
+    }
+
     function createDuplicateDecision(currentDecision = {}, jobInfo = {}, duplicateResult = {}, reason = '') {
         const base = currentDecision && typeof currentDecision === 'object' ? currentDecision : {};
         const info = jobInfo && typeof jobInfo === 'object' ? jobInfo : {};
@@ -703,48 +747,563 @@
         };
     }
 
+    const runtimePolicy = {
+        scanOnly: false,
+        scanAiEnabled: false,
+        sendingDisabled: true,
+        openingDisabled: true,
+        resumeSendingDisabled: true,
+        safety: {},
+        plan: {},
+        account: {},
+        policy: {},
+    };
+    const deliveryHealth = { consecutiveFailures: 0, lastError: '', healthUpdatedAt: 0 };
+
+    function recordDeliveryOutcome(health, success, error = '', now = Date.now()) {
+        const target = health && typeof health === 'object' ? health : deliveryHealth;
+        if (success) {
+            target.consecutiveFailures = 0;
+            target.lastError = '';
+        } else {
+            target.consecutiveFailures = Math.max(0, Number(target.consecutiveFailures) || 0) + 1;
+            target.lastError = String(error || 'platform_effect_failed').slice(0, 1000);
+        }
+        const previousUpdatedAt = Math.max(0, Math.floor(Number(target.healthUpdatedAt) || 0));
+        const requestedUpdatedAt = Math.max(0, Math.floor(Number(now) || 0));
+        target.healthUpdatedAt = Math.max(previousUpdatedAt + 1, requestedUpdatedAt);
+        return target;
+    }
+
+    function syncDeliveryHealth(health, snapshot = {}) {
+        const target = health && typeof health === 'object' ? health : deliveryHealth;
+        const targetUpdatedAt = Math.max(0, Math.floor(Number(target.healthUpdatedAt) || 0));
+        const sourceUpdatedAt = Math.max(0, Math.floor(Number(snapshot.healthUpdatedAt) || 0));
+        if ((targetUpdatedAt > 0 && sourceUpdatedAt === 0) || sourceUpdatedAt < targetUpdatedAt) {
+            return target;
+        }
+        const failures = Math.max(0, Math.floor(Number(snapshot.consecutiveFailures) || 0));
+        target.consecutiveFailures = failures;
+        target.lastError = failures > 0
+            ? String(snapshot.lastError || 'platform_effect_failed').slice(0, 1000)
+            : '';
+        target.healthUpdatedAt = Math.max(targetUpdatedAt, sourceUpdatedAt);
+        return target;
+    }
+
+    function applyRuntimePolicy(control = {}) {
+        const safety = control?.safety && typeof control.safety === 'object' ? control.safety : {};
+        const plan = control?.plan && typeof control.plan === 'object' ? control.plan : {};
+        const account = control?.account && typeof control.account === 'object' ? control.account : {};
+        const policy = control?.policy && typeof control.policy === 'object' ? control.policy : {};
+        runtimePolicy.safety = { ...safety };
+        runtimePolicy.plan = { ...plan };
+        runtimePolicy.account = { ...account };
+        runtimePolicy.policy = { ...policy };
+        runtimePolicy.scanOnly = safety.scanOnly === true;
+        // This value is security-sensitive. Never combine it with local OPTIONS.
+        runtimePolicy.scanAiEnabled = safety.scanAiEnabled === true;
+        runtimePolicy.sendingDisabled = safety.sendingDisabled === true;
+        runtimePolicy.openingDisabled = safety.openingDisabled === true;
+        runtimePolicy.resumeSendingDisabled = safety.resumeSendingDisabled === true;
+        return runtimePolicy;
+    }
+
+    function requireV2ClientConfig(config) {
+        if (!config || Number(config.scriptApiVersion) !== SCRIPT_API_VERSION || config.qualificationRequired !== true) {
+            throw new Error(`脚本/API 版本不兼容：需要 V2（scriptApiVersion=${SCRIPT_API_VERSION}）`);
+        }
+        return config;
+    }
+
+    function pendingFinalMarkStorageKey(claimToken, status) {
+        return `${FINAL_MARK_REPLAY_PREFIX}${encodeURIComponent(String(claimToken))}:${encodeURIComponent(String(status))}`;
+    }
+
+    function pendingFinalMarkKeys() {
+        const keys = [];
+        try {
+            for (let index = 0; index < localStorage.length; index += 1) {
+                const key = localStorage.key(index);
+                if (key && key.startsWith(FINAL_MARK_REPLAY_PREFIX)) keys.push(key);
+            }
+        } catch (_) { /* storage unavailable */ }
+        return keys;
+    }
+
+    function migrateLegacyPendingFinalMarks() {
+        try {
+            const raw = localStorage.getItem(FINAL_MARK_REPLAY_KEY);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                parsed.filter((item) => item?.claimToken && item?.status).forEach((item) => {
+                    const normalized = {
+                        ...item,
+                        entryId: item.entryId || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                        queuedAt: item.queuedAt || Date.now(),
+                    };
+                    localStorage.setItem(
+                        pendingFinalMarkStorageKey(normalized.claimToken, normalized.status),
+                        JSON.stringify(normalized)
+                    );
+                });
+            }
+            localStorage.removeItem(FINAL_MARK_REPLAY_KEY);
+        } catch (_) { /* malformed legacy state is ignored */ }
+    }
+
+    function readPendingFinalMarks() {
+        migrateLegacyPendingFinalMarks();
+        const items = [];
+        pendingFinalMarkKeys().forEach((storageKey) => {
+            try {
+                const item = JSON.parse(localStorage.getItem(storageKey) || 'null');
+                if (item?.claimToken && item?.status) items.push({ ...item, storageKey });
+            } catch (_) { /* malformed entry is ignored */ }
+        });
+        return items.sort((left, right) => Number(left.queuedAt || 0) - Number(right.queuedAt || 0));
+    }
+
+    function removePendingFinalMark(entry) {
+        const storageKey = entry.storageKey
+            || pendingFinalMarkStorageKey(entry.claimToken, entry.status);
+        try {
+            const current = JSON.parse(localStorage.getItem(storageKey) || 'null');
+            if (current && current.entryId === entry.entryId) localStorage.removeItem(storageKey);
+        } catch (_) { /* a newer or malformed entry must not be removed */ }
+    }
+
+    function enqueuePendingFinalMark(entry) {
+        try {
+            const normalized = {
+                ...entry,
+                entryId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                queuedAt: entry.queuedAt || Date.now(),
+            };
+            localStorage.setItem(
+                pendingFinalMarkStorageKey(normalized.claimToken, normalized.status),
+                JSON.stringify(normalized)
+            );
+            readPendingFinalMarks().slice(0, -100).forEach(removePendingFinalMark);
+        } catch (_) { /* storage unavailable: online retries have already been exhausted */ }
+    }
+
+    function createClaimLeaseKeeper(api, claimToken, workerId, options = {}) {
+        const scheduler = options.scheduler || { setInterval, clearInterval };
+        const intervalMs = Math.max(1000, Number(options.intervalMs) || CLAIM_LEASE_RENEW_INTERVAL_MS);
+        let handle = null;
+        let stopped = false;
+        let failure = null;
+        let pendingRenewal = null;
+
+        const stop = () => {
+            if (stopped) return;
+            stopped = true;
+            if (handle !== null) scheduler.clearInterval(handle);
+            handle = null;
+        };
+        const renew = async () => {
+            if (stopped || failure) return false;
+            if (pendingRenewal) return pendingRenewal;
+            pendingRenewal = (async () => {
+                try {
+                    const result = await api.renewDelivery(claimToken, workerId);
+                    if (result?.success !== true) throw new Error(result?.reason || 'claim_renew_failed');
+                    return true;
+                } catch (error) {
+                    failure = error instanceof Error ? error : new Error(String(error));
+                    stop();
+                    return false;
+                } finally {
+                    pendingRenewal = null;
+                }
+            })();
+            return pendingRenewal;
+        };
+
+        handle = scheduler.setInterval(() => renew().catch(() => false), intervalMs);
+        if (handle && typeof handle.unref === 'function') handle.unref();
+        return {
+            renew,
+            stop,
+            assertHealthy() {
+                if (failure) throw failure;
+                return true;
+            },
+        };
+    }
+
     const deliveryFlow = {
+        replayPromise: null,
         isDuplicate(claim) {
-            return ['duplicate_job', 'duplicate_company'].includes(claim?.reason);
+            return ['duplicate_job', 'duplicate_company', 'duplicate'].includes(claim?.reason);
         },
         duplicateMessage(company, title) {
             return `重复投递（未计数）：公司 [${company}] + 岗位 [${title}] 已领取或投递，已忽略`;
         },
-        async precheck(api, company, title) {
+        async qualify(api, identity, job, mode = 'delivery') {
             runtimeLifecycle.guard();
-            try {
-                const result = await api.checkDelivery(company, title);
+            const result = await api.qualifyDelivery(identity, job, mode);
+            runtimeLifecycle.guard();
+            if (result?.success !== true || result?.allowed !== true || !result?.qualificationToken) {
+                return {
+                    ready: false,
+                    reason: result?.reason || 'qualification_rejected',
+                    stage: deliveryRejectionStage(result?.reason) || 'qualification',
+                    qualification: result || {},
+                };
+            }
+            return {
+                ready: true,
+                reason: 'qualified',
+                qualificationToken: result.qualificationToken,
+                qualification: result,
+            };
+        },
+        async claim(api, identity, job, qualificationToken) {
+            let lastError = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
                 runtimeLifecycle.guard();
-                return result;
+                try {
+                    const result = await api.claimDelivery(identity, job, qualificationToken);
+                    if (runtimeLifecycle.isStopping()) {
+                        if (result?.accepted && result.claimToken) {
+                            await api.releaseDelivery(result.claimToken, 'script_stopped_after_claim', { allowDuringStop: true }).catch(() => null);
+                        }
+                        throw new ScriptStoppedError('stopped_after_claim');
+                    }
+                    return result;
+                } catch (error) {
+                    if (isStopError(error)) throw error;
+                    lastError = error;
+                    if (attempt + 1 < 3) await tools.asyncSleep(250 * (attempt + 1));
+                }
+            }
+            throw lastError || new Error('claim_transport_failed');
+        },
+        async callAiTransport(operation, attempts = 3) {
+            let lastError;
+            for (let attempt = 0; attempt < attempts; attempt += 1) {
+                try {
+                    return await operation();
+                } catch (error) {
+                    if (isStopError(error)) throw error;
+                    lastError = error;
+                    if (attempt + 1 < attempts) await tools.asyncSleep(250 * (attempt + 1));
+                }
+            }
+            throw lastError || new Error('AI transport failed');
+        },
+        async runJobFilter(api, payload, workerId = '', leaseKeeper = null) {
+            let result = await this.callAiTransport(() => api.startJobFilter(payload));
+            const deadline = Date.now() + 10 * 60 * 1000;
+            while (result?.status === 'pending' && Date.now() < deadline) {
+                if (!result.evaluationId) throw new Error('AI evaluation missing evaluationId');
+                if (payload.claimToken) leaseKeeper?.assertHealthy();
+                await tools.asyncSleep(1000);
+                result = await this.callAiTransport(() => api.getJobFilterStatus(result.evaluationId));
+            }
+            if (payload.claimToken) leaseKeeper?.assertHealthy();
+            if (result?.status !== 'completed') throw new Error(result?.reason || 'ai_filter_timeout');
+            return result;
+        },
+        async beforeDetailOpen(shouldInterrupt = null) {
+            if (runtimePolicy.openingDisabled) return { allowed: false, reason: 'opening_disabled' };
+            const delayPassed = await antiDetection.detailDelay(() => (
+                runtimePolicy.openingDisabled
+                || (typeof shouldInterrupt === 'function' && shouldInterrupt())
+            ));
+            if (runtimePolicy.openingDisabled) return { allowed: false, reason: 'opening_disabled' };
+            if (!delayPassed) return { allowed: false, reason: 'detail_delay_interrupted' };
+            return { allowed: true, reason: 'ready' };
+        },
+        async prepare(api, identity, job, options = {}) {
+            const mode = options.mode === 'scan' ? 'scan' : 'delivery';
+            let claimToken = '';
+            let claimResult = null;
+            let leaseKeeper = null;
+            try {
+                const qualified = await this.qualify(api, identity, job, mode);
+                if (!qualified.ready) return qualified;
+                const qualification = qualified.qualification;
+                const aiEnabled = qualification.aiFilterEnabled === true;
+                if (typeof options.beforeClaim === 'function' && await options.beforeClaim(qualification)) {
+                    return {
+                        ready: false,
+                        reason: 'random_skipped',
+                        stage: 'random',
+                        aiSkipped: true,
+                        qualificationToken: qualified.qualificationToken,
+                        qualification,
+                        decision: { passed: false, reliable: true, aiSkipped: true },
+                    };
+                }
+                if (mode === 'delivery') {
+                    let claim;
+                    try {
+                        claim = await this.claim(api, identity, job, qualified.qualificationToken);
+                    } catch (error) {
+                        if (isStopError(error)) throw error;
+                        return {
+                            ready: false,
+                            reason: 'claim_transport_failed',
+                            stage: 'claim',
+                            qualification,
+                            error,
+                        };
+                    }
+                    if (claim?.success !== true || claim?.allowed !== true || claim?.accepted !== true || !claim?.claimToken) {
+                        return {
+                            ready: false,
+                            reason: claim?.reason || 'claim_rejected',
+                            stage: deliveryRejectionStage(claim?.reason) || 'claim',
+                            qualification,
+                            claim: claim || {},
+                        };
+                    }
+                    claimToken = claim.claimToken;
+                    claimResult = claim;
+                    leaseKeeper = createClaimLeaseKeeper(api, claimToken, identity.workerId, {
+                        scheduler: options.leaseScheduler,
+                        intervalMs: options.leaseIntervalMs,
+                    });
+                }
+
+                if (!aiEnabled || (mode === 'scan' && options.scanAiEnabled !== true)) {
+                    return {
+                        ready: true,
+                        reason: 'ai_skipped',
+                        stage: 'qualified',
+                        aiSkipped: true,
+                        qualificationToken: qualified.qualificationToken,
+                        claimToken,
+                        qualification,
+                        claim: claimResult,
+                        leaseKeeper,
+                        decision: { passed: true, reliable: true, aiSkipped: true },
+                        resumeIndex: OPTIONS.resumeIndex,
+                    };
+                }
+
+                const filterPayload = {
+                    mode,
+                    qualificationToken: qualified.qualificationToken,
+                    company: String(job.company || '').trim(),
+                    title: String(job.title || '').trim(),
+                    salary: String(job.salary || '').trim(),
+                    detail: String(job.detail || '').trim(),
+                    jobUrl: String(job.jobUrl || job.href || '').trim(),
+                    accountId: identity.accountId,
+                    workerId: identity.workerId,
+                    score: Number(qualification.score || 0),
+                };
+                if (mode === 'delivery') filterPayload.claimToken = claimToken;
+                else filterPayload.scanAiEnabled = true;
+                const decision = await this.runJobFilter(api, filterPayload, identity.workerId, leaseKeeper);
+                const passed = decision?.success === true
+                    && decision?.status === 'completed'
+                    && decision?.allowed === true
+                    && decision?.passed === true
+                    && decision?.reliable !== false;
+                if (!passed) {
+                    if (claimToken) {
+                        leaseKeeper?.stop();
+                        await api.releaseDelivery(claimToken, decision?.reason || 'ai_rejected', { allowDuringStop: true }).catch(() => null);
+                    }
+                    return {
+                        ready: false,
+                        reason: decision?.reason || 'ai_rejected',
+                        stage: 'ai',
+                        qualificationToken: qualified.qualificationToken,
+                        qualification,
+                        decision: decision || {},
+                    };
+                }
+                return {
+                    ready: true,
+                    reason: 'ready',
+                    stage: 'ai',
+                    qualificationToken: qualified.qualificationToken,
+                    claimToken,
+                    claim: claimResult,
+                    leaseKeeper,
+                    qualification,
+                    decision,
+                    resumeIndex: OPTIONS.resumeIndex,
+                };
             } catch (error) {
+                if (claimToken) {
+                    leaseKeeper?.stop();
+                    await api.releaseDelivery(claimToken, 'ai_filter_transport_failed', { allowDuringStop: true }).catch(() => null);
+                }
                 if (isStopError(error)) throw error;
-                return { unavailable: true, error };
+                return { ready: false, reason: 'ai_filter_transport_failed', stage: 'ai', error };
             }
         },
-        async claim(api, identity, job, jobUrl) {
-            runtimeLifecycle.guard();
+        async resolveGreeting(api, claimToken, job, fixedIntroduce, llmEnabled = true) {
+            const fallback = String(fixedIntroduce || '').trim() || DEFAULT_FIXED_INTRODUCE;
+            if (!llmEnabled) return { introduce: fallback, mode: 'fixed', generated: false };
             try {
-                const result = await api.claimDelivery(
-                    identity,
+                const generated = await api.generateIntroduce(
+                    claimToken,
                     job.company,
                     job.title,
-                    jobUrl,
                     job.salary,
-                    job.location
+                    job.detail
                 );
-                if (runtimeLifecycle.isStopping()) {
-                    if (result?.accepted && result.claimToken) {
-                        await api.releaseDelivery(result.claimToken, 'script_stopped_after_claim', { allowDuringStop: true }).catch(() => null);
-                    }
-                    throw new ScriptStoppedError('stopped_after_claim');
-                }
-                return result;
+                const introduce = String(generated?.introduce || '').trim() || fallback;
+                return {
+                    introduce,
+                    mode: generated?.generated && introduce !== fallback ? 'llm' : 'fixed',
+                    generated: Boolean(generated?.generated && introduce !== fallback),
+                };
             } catch (error) {
                 if (isStopError(error)) throw error;
-                return { accepted: false, reason: 'service_unavailable', error };
+                return { introduce: fallback, mode: 'fixed', generated: false, error };
+            }
+        },
+        async markQueued(api, claimToken) {
+            let lastError = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                try {
+                    const result = await api.markDelivery(claimToken, 'queued', '', { allowDuringStop: true });
+                    if (result?.success !== true) {
+                        const error = new Error(result?.reason || 'queued 状态落库失败');
+                        error.businessRejected = true;
+                        throw error;
+                    }
+                    return result;
+                } catch (error) {
+                    if (error?.businessRejected) throw error;
+                    lastError = error;
+                    if (attempt + 1 < 3) await tools.asyncSleep(250 * (attempt + 1));
+                }
+            }
+            throw lastError || new Error('queued 状态落库失败');
+        },
+        async markFinal(api, claimToken, status, error = '') {
+            if (!['sent', 'failed_unknown'].includes(status)) throw new Error(`invalid final status: ${status}`);
+            let lastResult = null;
+            let lastError = null;
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                try {
+                    lastResult = await api.markDelivery(claimToken, status, error, { allowDuringStop: true });
+                    if (lastResult?.success === true) return { ...lastResult, pendingReplay: false };
+                } catch (requestError) {
+                    lastError = requestError;
+                }
+            }
+            enqueuePendingFinalMark({ claimToken, status, error });
+            return {
+                success: false,
+                pendingReplay: true,
+                reason: lastResult?.reason || lastError?.message || 'final_mark_failed',
+            };
+        },
+        async replayPendingMarks(api) {
+            if (this.replayPromise) return this.replayPromise;
+            this.replayPromise = (async () => {
+                const pending = readPendingFinalMarks();
+                let replayed = 0;
+                for (const item of pending) {
+                    try {
+                        const result = await api.markDelivery(
+                            item.claimToken,
+                            item.status,
+                            item.error || '',
+                            { allowDuringStop: true }
+                        );
+                        if (result?.success === true) {
+                            removePendingFinalMark(item);
+                            replayed += 1;
+                        }
+                    } catch (_) { /* keep this independent entry for a later replay */ }
+                }
+                return { replayed, remaining: readPendingFinalMarks().length };
+            })();
+            try {
+                return await this.replayPromise;
+            } finally {
+                this.replayPromise = null;
             }
         },
     };
+
+    async function runQueuedEntrypoint(scene, api, claimToken, platformEffect, options = {}) {
+        try {
+            if (options.leaseKeeper) {
+                const renewed = await options.leaseKeeper.renew();
+                options.leaseKeeper.assertHealthy();
+                if (!renewed) throw new Error('claim_renew_failed');
+            }
+            await deliveryFlow.markQueued(api, claimToken);
+        } catch (error) {
+            error.queuedPersistFailed = true;
+            error.scene = scene;
+            throw error;
+        } finally {
+            options.leaseKeeper?.stop();
+        }
+        try {
+            const value = await platformEffect();
+            if (options.finalize === true) {
+                await deliveryFlow.markFinal(api, claimToken, 'sent');
+                recordDeliveryOutcome(options.health || deliveryHealth, true);
+            }
+            return { success: true, scene, value };
+        } catch (error) {
+            await deliveryFlow.markFinal(api, claimToken, 'failed_unknown', String(error));
+            recordDeliveryOutcome(options.health || deliveryHealth, false, error);
+            error.platformEffectStarted = true;
+            error.scene = scene;
+            throw error;
+        }
+    }
+
+    const deliveryEntrypoints = Object.freeze({
+        search: (api, claimToken, platformEffect, options) => runQueuedEntrypoint(
+            'search', api, claimToken, platformEffect, options
+        ),
+        chatFirstContact: (api, claimToken, platformEffect, options) => runQueuedEntrypoint(
+            'chat_first_contact', api, claimToken, platformEffect, options
+        ),
+        chatAutoResume: (api, claimToken, platformEffect, options) => runQueuedEntrypoint(
+            'chat_auto_resume', api, claimToken, platformEffect, options
+        ),
+    });
+
+    async function waitForJobDetailReady(
+        readInfo,
+        timeoutMs = OPTIONS.detailTimeout,
+        now = () => Date.now(),
+        sleep = (delay) => tools.asyncSleep(delay)
+    ) {
+        const startedAt = now();
+        const deadline = startedAt + Math.max(0, Number(timeoutMs) || 0);
+        let info = {};
+        while (now() <= deadline) {
+            runtimeLifecycle.guard();
+            info = readInfo() || {};
+            const hasCoreFields = Boolean(
+                String(info.title || '').trim()
+                && String(info.company || '').trim()
+                && String(info.detail || '').trim()
+            );
+            const hasCommunicationLinks = Boolean(
+                String(info.chatUrl || '').trim()
+                && String(info.addUrl || '').trim()
+            );
+            if (hasCoreFields && (hasCommunicationLinks || info.skip === true)) return info;
+            if (now() >= deadline) break;
+            await sleep(Math.min(20, Math.max(1, deadline - now())));
+        }
+        return {
+            ...info,
+            skip: true,
+            skipReason: '职位详情 DOM 就绪超时或缺少标题、公司、描述、沟通链接',
+        };
+    }
 
     async function runPeerHeartbeat(broadcast, searchTarget, heartbeatType, payloadFactory = () => ({})) {
         let count = 0;
@@ -758,6 +1317,10 @@
             if (!response?.success || response?.stopped || response?.cancelled) {
                 throw new ScriptStoppedError(response?.cancelled ? 'peer_session_cancelled' : 'peer_stopped');
             }
+            if (Object.prototype.hasOwnProperty.call(response, 'consecutiveFailures')) {
+                syncDeliveryHealth(deliveryHealth, response);
+            }
+            if (response.control) applyRuntimePolicy(response.control);
             await tools.asyncSleep(1000);
         }
     }
@@ -772,7 +1335,7 @@
         }
     }
 
-    // 防检测：仅做行为随机化（岗位顺序、随机跳过、随机延时、随机省略招呼语）。
+    // 节奏随机化：仅做岗位顺序、随机跳过和可中断随机延时。
     // 总开关 OPTIONS.antiDetectionEnabled 关闭时全部失效，脚本回到确定性行为。
     const antiDetection = {
         enabled() {
@@ -800,9 +1363,9 @@
             return Math.floor(min + Math.random() * (max - min + 1));
         },
         // 受总开关约束的可中断随机延时核心；关闭或区间为 0 时不等待。
-        async delayWithRange(minValue, maxValue, shouldInterrupt = null) {
+        async delayWithRange(minValue, maxValue, shouldInterrupt = null, forceEnabled = false) {
             const interrupted = () => typeof shouldInterrupt === 'function' && shouldInterrupt();
-            if (!this.enabled()) return !interrupted();
+            if (!forceEnabled && !this.enabled()) return !interrupted();
             const ms = this.randomDelayMs(minValue, maxValue);
             if (ms <= 0) return !interrupted();
             let remaining = ms;
@@ -817,10 +1380,15 @@
         },
         // 投递前后使用的随机延时。
         async delay(shouldInterrupt = null) {
+            const plan = runtimePolicy.plan || {};
+            const serverMinDelayMs = Math.max(0, Number(plan.minDelayMs) || 0);
+            const serverMaxDelayMs = Math.max(serverMinDelayMs, Number(plan.maxDelayMs) || 0);
+            const hasServerRange = serverMaxDelayMs > 0;
             return this.delayWithRange(
-                OPTIONS.randomDelayMinMs,
-                OPTIONS.randomDelayMaxMs,
-                shouldInterrupt
+                hasServerRange ? serverMinDelayMs : OPTIONS.randomDelayMinMs,
+                hasServerRange ? serverMaxDelayMs : OPTIONS.randomDelayMaxMs,
+                shouldInterrupt,
+                hasServerRange
             );
         },
         // 获取职位详情前使用的独立随机延时。
@@ -834,10 +1402,6 @@
         // 达标岗位是否按概率随机跳过（调用方已确认总开关开启）。
         shouldSkip() {
             return this.roll(OPTIONS.randomSkipRatio);
-        },
-        // 本次是否随机省略招呼语、直接打招呼（调用方已确认总开关开启）。
-        shouldSkipIntroduce() {
-            return this.roll(OPTIONS.randomNoIntroduceRatio);
         },
     };
 
@@ -1391,7 +1955,10 @@
          */
         getJobScore(title, salary, detail) {
             const data = `# 职位名称\n${title}\n\n# 薪资范围\n${salary}\n\n# 职位描述\n${detail}`;
-            return this.__http('/get-job-score', 'POST', JSON.stringify(data));
+            return this.__http('/get-job-score', 'POST', JSON.stringify({
+                scriptApiVersion: SCRIPT_API_VERSION,
+                job: data,
+            }));
         }
 
         /**
@@ -1456,16 +2023,55 @@
             return this.__http('/log-action', 'POST', JSON.stringify(payload), { timeout: 5000 });
         }
 
-        claimDelivery(identity, company, title, jobUrl = '', salary = '', location = '') {
-            return this.__http('/delivery/claim', 'POST', JSON.stringify({
+        qualifyDelivery(identity, job, mode = 'delivery') {
+            return this.__http('/delivery/qualify', 'POST', JSON.stringify({
+                scriptApiVersion: SCRIPT_API_VERSION,
+                mode: mode === 'scan' ? 'scan' : 'delivery',
+                company: String(job.company || '').trim(),
+                title: String(job.title || '').trim(),
+                salary: String(job.salary || '').trim(),
+                detail: String(job.detail || '').trim(),
+                jobUrl: String(job.jobUrl || job.href || '').trim(),
                 accountId: identity.accountId,
                 workerId: identity.workerId,
-                company,
-                title,
-                jobUrl,
-                salary,
-                location,
+                hrActiveLevel: String(job.hrActiveLevel || 'unknown'),
             }));
+        }
+
+        claimDelivery(identity, job, qualificationToken) {
+            return this.__http('/delivery/claim', 'POST', JSON.stringify({
+                scriptApiVersion: SCRIPT_API_VERSION,
+                qualificationToken,
+                accountId: identity.accountId,
+                workerId: identity.workerId,
+                company: String(job.company || '').trim(),
+                title: String(job.title || '').trim(),
+                jobUrl: String(job.jobUrl || job.href || '').trim(),
+            }));
+        }
+
+        renewDelivery(claimToken, workerId) {
+            return this.__http('/delivery/renew', 'POST', JSON.stringify({
+                scriptApiVersion: SCRIPT_API_VERSION,
+                claimToken,
+                workerId,
+            }));
+        }
+
+        startJobFilter(payload) {
+            return this.__http('/job-filter/start', 'POST', JSON.stringify({
+                scriptApiVersion: SCRIPT_API_VERSION,
+                ...payload,
+            }), { timeout: 10000 });
+        }
+
+        getJobFilterStatus(evaluationId) {
+            return this.__http(
+                `/job-filter/status/${encodeURIComponent(evaluationId)}`,
+                'GET',
+                null,
+                { timeout: 10000 }
+            );
         }
 
         markDelivery(claimToken, status, error = '', requestOptions = {}) {
@@ -1476,8 +2082,8 @@
             return this.__http('/delivery/release', 'POST', JSON.stringify({ claimToken, reason }), requestOptions);
         }
 
-        checkDailyLimit(accountId) {
-            return this.__http('/check-daily-limit', 'POST', JSON.stringify({ accountId }));
+        checkDailyLimit(accountId, workerId) {
+            return this.__http('/check-daily-limit', 'POST', JSON.stringify({ accountId, workerId }));
         }
 
         checkDelivery(company, title) {
@@ -1496,6 +2102,7 @@
         pollDesiredControl(identity, cursor = null) {
             const query = [
                 `protocolVersion=${encodeURIComponent(CONTROL_PROTOCOL_VERSION)}`,
+                `scriptApiVersion=${encodeURIComponent(SCRIPT_API_VERSION)}`,
                 `sessionId=${encodeURIComponent(identity.sessionId)}`,
                 `sessionEpoch=${encodeURIComponent(identity.sessionEpoch)}`,
                 'timeoutMs=0',
@@ -2229,6 +2836,7 @@
                     accountId: this.identity.accountId,
                     alias: localStorage.getItem('__goodjobs_worker_alias') || '',
                     scriptVersion: SCRIPT_VERSION,
+                    scriptApiVersion: SCRIPT_API_VERSION,
                     protocolVersion: CONTROL_PROTOCOL_VERSION,
                     sessionId: this.sessionId,
                     sessionEpoch: this.sessionEpoch,
@@ -2274,6 +2882,7 @@
                 this.connectionState = 'connected';
                 this.statusIndicator.update(this.connectionState, this.executionState);
                 if (result.control) this.receiveControl(result.control);
+                deliveryFlow.replayPendingMarks(this.api).catch(() => null);
             } catch (error) {
                 this.logs.unshift(...logs);
                 this.connectionState = 'disconnected';
@@ -2357,6 +2966,7 @@
         }
 
         receiveControl(control) {
+            applyRuntimePolicy(control);
             if (!['running', 'paused', 'stopped'].includes(control?.desiredState)) return;
             this.controlPollCursor = {
                 epoch: control.epoch,
@@ -2550,6 +3160,7 @@
             this.pause = false;
             this.tags = [];
             this.introduce = '';
+            this.llmGreetingEnabled = true;
             runtimeLifecycle.addStopListener((reason) => this.resetExecutor(reason));
         }
 
@@ -2561,6 +3172,7 @@
             this.broadcast = null;
             this.tags = [];
             this.introduce = '';
+            this.llmGreetingEnabled = true;
             this.controlAgent?.setTelemetryProvider(null);
             if (this.controlAgent && !['stopped', 'error'].includes(this.controlAgent.executionState)) {
                 this.controlAgent.setExecutionState('stopped');
@@ -2668,6 +3280,7 @@
                 duplicateCardUntil: 0,
                 lastError: '',
                 consecutiveFailures: 0,
+                healthUpdatedAt: 0,
                 counters: { viewed: 0, queued: 0, sent: 0, failed: 0 },
                 logs: [],
             };
@@ -2970,7 +3583,7 @@
                     page++;
                     logger.add(`开始浏览第 ${page} 页`, { sender: 'queue', verbosity: 'detailed' });
                     if (hrefs.length) {
-                        // 防检测：打乱本页新增岗位顺序，避免固定的从上到下投递节奏。
+                        // 节奏随机化：打乱本页新增岗位顺序，避免固定的从上到下投递节奏。
                         if (antiDetection.enabled() && OPTIONS.shuffleJobOrder) {
                             antiDetection.shuffle(hrefs);
                         }
@@ -2992,6 +3605,7 @@
             let pendingGreetId = '';
             let activeReservedClaimToken = '';
             let activeClaimPhase = '';
+            let activeClaimLeaseKeeper = null;
 
             const clearPendingGreet = () => {
                 if (pendingGreetTimer) {
@@ -3020,26 +3634,28 @@
                 const queuedClaimToken = pendingGreetClaimToken;
                 const activeClaimToken = activeReservedClaimToken;
                 const claimPhase = activeClaimPhase;
+                activeClaimLeaseKeeper?.stop();
+                activeClaimLeaseKeeper = null;
                 clearPendingGreet();
                 this.broadcast?.destroy('search_stopped');
                 activeReservedClaimToken = '';
                 activeClaimPhase = '';
                 const cleanups = [];
                 if (queuedClaimToken) {
-                    cleanups.push(api.markDelivery(
+                    cleanups.push(deliveryFlow.markFinal(
+                        api,
                         queuedClaimToken,
                         'failed_unknown',
-                        'script_stopped_waiting_greet_result',
-                        { allowDuringStop: true, timeout: 2000 }
+                        'script_stopped_waiting_greet_result'
                     ));
                 }
                 if (activeClaimToken && activeClaimToken !== queuedClaimToken) {
                     cleanups.push(claimPhase === 'queued'
-                        ? api.markDelivery(
+                        ? deliveryFlow.markFinal(
+                            api,
                             activeClaimToken,
                             'failed_unknown',
-                            'script_stopped_after_queue_before_greet',
-                            { allowDuringStop: true, timeout: 2000 }
+                            'script_stopped_after_queue_before_greet'
                         )
                         : api.releaseDelivery(
                             activeClaimToken,
@@ -3068,9 +3684,11 @@
                     logger.add(`职位 [${pendingGreetTitle}] 打招呼超时，已跳过`, { sender: 'queue', verbosity: 'concise', level: 'error' });
                     const timedOutClaimToken = pendingGreetClaimToken;
                     if (timedOutClaimToken) {
-                        await api.markDelivery(timedOutClaimToken, 'failed_unknown', 'greet_timeout').catch(() => null);
+                        await deliveryFlow.markFinal(api, timedOutClaimToken, 'failed_unknown', 'greet_timeout');
                     }
+                    recordDeliveryOutcome(runtime, false, 'greet_timeout');
                     clearPendingGreet();
+                    sendRuntimeHeartbeat();
                     loop();
                 }, OPTIONS.greetTimeout);
             };
@@ -3109,8 +3727,15 @@
 
             // 获取职位信息
             const getJobInfo = async (href) => {
-                const detailDelayPassed = await antiDetection.detailDelay(() => control.stopped || this.pause);
-                if (!detailDelayPassed) return { skip: true, skipReason: '获取职位详情前等待被中断' };
+                const opening = await deliveryFlow.beforeDetailOpen(() => control.stopped || this.pause);
+                if (!opening.allowed) {
+                    return {
+                        skip: true,
+                        skipReason: opening.reason === 'opening_disabled'
+                            ? '服务端策略禁止打开职位详情'
+                            : '获取职位详情前等待被中断',
+                    };
+                }
                 // 打开窗口
                 const detailWindow = tools.openTabNSetTimestamp(href, this.targets.detail);
                 if (!detailWindow) {
@@ -3179,19 +3804,16 @@
                             ).catch(() => null);
                             return;
                         }
-                        // 命中防检测随机省略招呼语时发送空串，不回退固定文本；否则按定制/固定招呼语。
-                        const greetIntroduce = pendingGreetDecision?.omitIntroduce
-                            ? ''
-                            : (pendingGreetDecision?.introduce || this.introduce);
-                        logger.add(greetIntroduce
-                            ? `打招呼introduce: ${greetIntroduce.substring(0, 40)}...`
-                            : '打招呼introduce: （防检测随机省略，空手打招呼）', { sender: 'delivery', verbosity: 'detailed' });
+                        const greetIntroduce = String(
+                            pendingGreetDecision?.introduce || this.introduce || DEFAULT_FIXED_INTRODUCE
+                        ).trim() || DEFAULT_FIXED_INTRODUCE;
+                        logger.add(`打招呼introduce: ${greetIntroduce.substring(0, 40)}...`, { sender: 'delivery', verbosity: 'detailed' });
                         await this.broadcast.reply(
                             from,
                             this.bcTypes.SAY_HI,
                             {
                                 introduce: greetIntroduce,
-                                resumeIndex: pendingGreetDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                                resumeIndex: OPTIONS.resumeIndex,
                                 greetId: pendingGreetId,
                                 claimToken: pendingGreetClaimToken,
                             },
@@ -3218,17 +3840,16 @@
                         runtime.currentDecision.decisionState = 'sent';
                         runtime.currentDecision.decisionReason = '';
                         if (finalClaimToken) {
-                            await api.markDelivery(finalClaimToken, 'sent').catch((e) => {
-                                console.log('markDelivery sent failed', e);
-                            });
+                            await deliveryFlow.markFinal(api, finalClaimToken, 'sent');
                         }
+                        recordDeliveryOutcome(runtime, true);
                         await logAction({
                             action: 'greet_sent',
                             scene: 'search',
                             title: finalTitle,
                             company: finalCompany,
                             claimToken: finalClaimToken,
-                            resumeIndex: finalDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                            resumeIndex: OPTIONS.resumeIndex,
                             greetingMode: finalDecision?.greetingMode || 'fixed',
                             hrActive: runtime.currentDecision.hrActive || '',
                             hrActiveLevel: runtime.currentDecision.hrActiveLevel || 'unknown',
@@ -3243,17 +3864,16 @@
                         runtime.currentDecision.decisionState = 'failed';
                         runtime.currentDecision.decisionReason = data.reason || '打招呼失败';
                         if (finalClaimToken) {
-                            await api.markDelivery(finalClaimToken, 'failed_unknown', 'chat_greet_failed').catch((e) => {
-                                console.log('markDelivery failed_unknown failed', e);
-                            });
+                            await deliveryFlow.markFinal(api, finalClaimToken, 'failed_unknown', 'chat_greet_failed');
                         }
+                        recordDeliveryOutcome(runtime, false, data.reason || 'chat_greet_failed');
                         await logAction({
                             action: 'greet_failed',
                             scene: 'search',
                             title: finalTitle,
                             company: finalCompany,
                             claimToken: finalClaimToken,
-                            resumeIndex: finalDecision?.resumeIndex ?? OPTIONS.resumeIndex,
+                            resumeIndex: OPTIONS.resumeIndex,
                             greetingMode: finalDecision?.greetingMode || 'fixed',
                             hrActive: runtime.currentDecision.hrActive || '',
                             hrActiveLevel: runtime.currentDecision.hrActiveLevel || 'unknown',
@@ -3285,6 +3905,12 @@
             // 心跳监听
             const heartBeatListener = () => {
                 this.broadcast.on(this.bcTypes.HEART_BEAT, async (from, data) => {
+                    if ((from === this.targets.chat || from === this.targets.chatGreet)
+                        && data
+                        && Object.prototype.hasOwnProperty.call(data, 'consecutiveFailures')) {
+                        syncDeliveryHealth(runtime, data);
+                        sendRuntimeHeartbeat();
+                    }
                     const sessionCancelled = Boolean(
                         data?.greetId
                         && (!pendingGreetId || data.greetId !== pendingGreetId)
@@ -3296,6 +3922,15 @@
                             success: !control.stopped && !runtimeLifecycle.isStopping() && !sessionCancelled,
                             stopped: control.stopped || runtimeLifecycle.isStopping(),
                             cancelled: sessionCancelled,
+                            consecutiveFailures: runtime.consecutiveFailures,
+                            lastError: runtime.lastError,
+                            healthUpdatedAt: runtime.healthUpdatedAt,
+                            control: {
+                                safety: runtimePolicy.safety,
+                                plan: runtimePolicy.plan,
+                                account: runtimePolicy.account,
+                                policy: runtimePolicy.policy,
+                            },
                         },
                         data.requestId,
                         data.responseType
@@ -3382,14 +4017,42 @@
                         });
                         return loop();
                     }
-                    // 否则发送消息计算匹配度
-                    logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
+                    if (!jobInfo.title || !jobInfo.detail || !jobInfo.addUrl || !jobInfo.chatUrl) {
+                        logger.add('职位详情缺少标题、描述或沟通链接，已在 AI 前终止', { sender: 'delivery', verbosity: 'concise', level: 'warning' });
+                        await logAction({
+                            action: 'job_missing_required_fields', scene: 'search', title: jobInfo.title || '',
+                            company: jobInfo.company, accountId: identity.accountId, workerId: identity.workerId,
+                        });
+                        return loop();
+                    }
+                    logger.add(`开始执行职位 [${jobInfo.title}] 的 V2 资格门禁`, { sender: 'delivery', verbosity: 'detailed' });
                     runtime.state = 'evaluating';
-                    runtime.phase = '岗位匹配评分';
-                    const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
-                    const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
-                    const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
-                    const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                    runtime.phase = '资格门禁';
+                    const deliveryMode = runtimePolicy.scanOnly ? 'scan' : 'delivery';
+                    const prepared = await deliveryFlow.prepare(api, identity, {
+                        ...jobInfo,
+                        jobUrl: href,
+                    }, {
+                        scene: 'search',
+                        mode: deliveryMode,
+                        scanAiEnabled: runtimePolicy.scanAiEnabled,
+                        beforeClaim: () => antiDetection.enabled() && antiDetection.shouldSkip(),
+                    });
+                    if (deliveryMode === 'delivery' && prepared.ready && prepared.claimToken) {
+                        activeReservedClaimToken = prepared.claimToken;
+                        activeClaimPhase = 'reserved';
+                        activeClaimLeaseKeeper = prepared.leaseKeeper || null;
+                    }
+                    const qualification = prepared.qualification || {};
+                    const aiDecision = prepared.decision || {};
+                    const decision = {
+                        ...qualification,
+                        resumeIndex: OPTIONS.resumeIndex,
+                        aiFilterEnabled: qualification.aiFilterEnabled === true,
+                        aiPassed: aiDecision.aiSkipped ? null : aiDecision.passed ?? null,
+                        aiReason: aiDecision.aiReason || prepared.reason || '',
+                    };
+                    const hrActivePassed = !String(prepared.reason || '').startsWith('hr_');
                     runtime.duplicateCard = null;
                     runtime.duplicateCardUntil = 0;
                     runtime.currentDecision = {
@@ -3410,12 +4073,12 @@
                         hrActive: jobInfo.hrActive || '',
                         hrActiveLevel: jobInfo.hrActiveLevel || 'unknown',
                         hrActivePassed,
-                        finalPassed: rulePassed && aiPassed && hrActivePassed,
-                        decisionState: 'evaluating',
+                        finalPassed: prepared.ready,
+                        decisionState: 'qualified',
                         decisionReason: '',
                         greetingMode: '',
                     };
-                    logger.add(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
+                    logger.add(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${OPTIONS.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
                     logDecisionDeductions(decision, (message) => logger.add(message, { sender: 'delivery', verbosity: 'detailed' }));
                     await logAction({
                         action: 'job_decision_consumed',
@@ -3436,258 +4099,146 @@
                         aiPassed: decision.aiPassed ?? null,
                         aiReason: decision.aiReason || '',
                     });
-                    if (!hrActivePassed) {
+                    if (!prepared.ready) {
+                        const reason = prepared.reason || 'qualification_rejected';
+                        const rejection = classifyDeliveryRejection(prepared);
                         runtime.state = 'running';
-                        runtime.phase = 'HR 活跃筛选未通过';
-                        runtime.currentDecision.decisionState = 'hr_filtered';
-                        runtime.currentDecision.decisionReason = `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`;
+                        runtime.phase = '资格门禁未通过';
+                        runtime.currentDecision.decisionState = rejection.decisionState;
+                        runtime.currentDecision.decisionReason = reason;
                         runtime.currentDecision.finalPassed = false;
-                    } else if (!aiPassed) {
-                        runtime.currentDecision.decisionState = 'ai_rejected';
-                        runtime.currentDecision.decisionReason = decision.aiReason || 'AI 判断未通过';
-                        runtime.currentDecision.finalPassed = false;
-                    } else if (!rulePassed) {
-                        runtime.currentDecision.decisionState = 'below_threshold';
-                        runtime.currentDecision.decisionReason = decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`;
-                        runtime.currentDecision.finalPassed = false;
+                        sendRuntimeHeartbeat();
+                        if (deliveryFlow.isDuplicate(prepared)) {
+                            const duplicateDecision = publishDuplicateDecision(jobInfo, prepared.qualification, href);
+                            await logAction(createDuplicateActionPayload(
+                                'search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword
+                            ));
+                        } else {
+                            await logAction({
+                                action: rejection.action,
+                                scene: 'search', title: jobInfo.title, company: jobInfo.company,
+                                reason, score: decision.score, accountId: identity.accountId, workerId: identity.workerId,
+                            });
+                        }
+                        logger.add(`职位 [${jobInfo.title}] 未通过门禁：${reason}`, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                        return loop();
                     }
                     sendRuntimeHeartbeat();
-
-                    if (!hrActivePassed) {
+                    if (deliveryMode === 'scan') {
+                        runtime.state = 'running';
+                        runtime.phase = prepared.aiSkipped ? '仅扫描：规则通过' : '仅扫描：AI 评估完成';
+                        runtime.currentDecision.decisionState = prepared.aiSkipped ? 'qualified' : 'ai_passed';
+                        runtime.currentDecision.finalPassed = true;
                         await logAction({
-                            action: 'job_hr_filtered',
-                            scene: 'search',
-                            title: jobInfo.title,
-                            company: jobInfo.company,
-                            hrActive: jobInfo.hrActive,
-                            hrActiveLevel: jobInfo.hrActiveLevel,
-                            hrActiveLevels: configuredHrActiveLevels(),
-                            accountId: identity.accountId,
-                            workerId: identity.workerId,
+                            action: 'job_scan_completed', scene: 'search', title: jobInfo.title, company: jobInfo.company,
+                            aiPassed: prepared.decision?.passed ?? null, accountId: identity.accountId, workerId: identity.workerId,
                         });
                         return loop();
                     }
-                    // 如果分数达到阈值，打个招呼
-                    if (rulePassed && aiPassed) {
-                        if (control.stopped || this.pause) return;
-                        // 防检测：达标岗位按概率随机跳过，打散固定的“达标即投”节奏。
-                        if (antiDetection.enabled() && antiDetection.shouldSkip()) {
-                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机跳过，本次不投递`, { sender: 'delivery', verbosity: 'normal' });
-                            runtime.currentDecision.decisionState = 'random_skipped';
-                            runtime.currentDecision.decisionReason = '命中随机跳过策略';
-                            runtime.currentDecision.finalPassed = false;
-                            await sendRuntimeHeartbeat();
-                            await logAction({
-                                action: 'job_random_skipped',
-                                scene: 'search',
-                                title: jobInfo.title,
-                                company: jobInfo.company,
-                                keyword: currentKeyword,
-                                score: decision.score,
-                                accountId: identity.accountId,
-                                workerId: identity.workerId,
-                                hrActive: jobInfo.hrActive,
-                                hrActiveLevel: jobInfo.hrActiveLevel,
-                            });
-                            return loop();
-                        }
-                        const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
-                        if (duplicateCheck.unavailable) {
-                            logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                            return loop();
-                        }
-                        if (duplicateCheck.greeted) {
-                            const duplicateDecision = publishDuplicateDecision(jobInfo, duplicateCheck, href);
-                            const duplicateMessage = duplicateDecision.decisionReason;
-                            logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                            console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                            await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
-                            return loop();
-                        }
-                        runtime.state = 'claiming';
-                        runtime.phase = '领取投递权';
-                        runtime.currentDecision.decisionState = 'claiming';
-                        runtime.currentDecision.decisionReason = '';
-                        await sendRuntimeHeartbeat();
-                        // 防检测：投递前随机延时，避免评分完成到领取之间的固定间隔。
-                        const beforeClaimReady = await antiDetection.delay(() => control.stopped || this.pause);
-                        if (!beforeClaimReady) return;
-                        if (control.stopped || this.pause) return;
-                        const claim = await deliveryFlow.claim(api, identity, jobInfo, href);
-                        if (claim.reason === 'service_unavailable') {
-                            logger.add('投递协调服务不可用，为避免重复投递已跳过', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                            await logAction({
-                                action: 'delivery_claim_failed',
-                                scene: 'search',
-                                title: jobInfo.title,
-                                company: jobInfo.company,
-                                reason: String(claim.error),
-                                accountId: identity.accountId,
-                                workerId: identity.workerId,
-                            });
-                            return loop();
-                        }
-
-                        if (!claim.accepted) {
-                            const isDuplicateJob = deliveryFlow.isDuplicate(claim);
-                            if (claim.reason === 'daily_limit') {
-                                logger.add(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}），自动暂停`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
-                                this.pause = true;
-                            } else if (isDuplicateJob) {
-                                const duplicateDecision = publishDuplicateDecision(jobInfo, claim, href);
-                                const duplicateMessage = duplicateDecision.decisionReason;
-                                logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                                console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
-                                await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
-                                return loop();
-                            } else {
-                                logger.add(`职位 [${jobInfo.title}] 无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
-                            }
-                            await logAction({
-                                action: 'delivery_claim_rejected',
-                                scene: 'search',
-                                title: jobInfo.title,
-                                company: jobInfo.company,
-                                reason: claim.reason,
-                                existingTitle: claim.existing?.title || '',
-                                existingStatus: claim.existing?.status || '',
-                                accountId: identity.accountId,
-                                workerId: identity.workerId,
-                                hrActive: jobInfo.hrActive,
-                                hrActiveLevel: jobInfo.hrActiveLevel,
-                            });
-                            if (claim.reason === 'daily_limit') return;
-                            return loop();
-                        }
-
-                        activeReservedClaimToken = claim.claimToken;
-                        activeClaimPhase = 'reserved';
+                    const claim = prepared.claim || { claimToken: prepared.claimToken, accepted: true };
+                    if (runtimePolicy.sendingDisabled || runtimePolicy.openingDisabled || control.stopped || this.pause) {
+                        prepared.leaseKeeper?.stop();
+                        await api.releaseDelivery(claim.claimToken, 'runtime_policy_blocked_before_send', { allowDuringStop: true }).catch(() => null);
+                        activeReservedClaimToken = '';
+                        activeClaimPhase = '';
+                        activeClaimLeaseKeeper = null;
+                        logger.add('服务端策略已禁止发送或打开沟通页，已释放投递权', { sender: 'claim', verbosity: 'concise', level: 'warning' });
+                        return loop();
+                    }
+                    runtime.state = 'claiming';
+                    runtime.phase = '已领取投递权';
+                    runtime.currentDecision.decisionState = 'claiming';
 
                         if (control.stopped || this.pause) {
+                            activeClaimLeaseKeeper?.stop();
                             await api.releaseDelivery(claim.claimToken, 'control_interrupted_before_send').catch(() => null);
                             activeReservedClaimToken = '';
                             activeClaimPhase = '';
+                            activeClaimLeaseKeeper = null;
                             return control.stopped || this.pause ? undefined : loop();
                         }
 
-                        logger.add(`职位 [${jobInfo.title}] 已通过全部筛选条件，准备进入发送队列`, { sender: 'queue', verbosity: 'normal' });
-                        logger.add(`账号 [${identity.accountId}] 今日占用 ${claim.count}/${claim.limit}，剩余 ${claim.remaining} 次`, { sender: 'claim', verbosity: 'normal' });
+                    logger.add(`职位 [${jobInfo.title}] 已通过全部筛选条件，准备进入发送队列`, { sender: 'queue', verbosity: 'normal' });
+                    logger.add(`账号 [${identity.accountId}] 今日占用 ${claim.count ?? 0}/${claim.limit ?? 0}，剩余 ${claim.remaining ?? 0} 次`, { sender: 'claim', verbosity: 'normal' });
 
                         // 领取成功后再随机等待一次，避免领取与 BOSS 沟通动作之间形成固定间隔。
                         const beforeQueueReady = await antiDetection.delay(() => control.stopped || this.pause);
                         if (!beforeQueueReady) {
+                            activeClaimLeaseKeeper?.stop();
                             await api.releaseDelivery(claim.claimToken, 'control_interrupted_before_queue').catch(() => null);
                             activeReservedClaimToken = '';
                             activeClaimPhase = '';
+                            activeClaimLeaseKeeper = null;
                             return;
                         }
 
-                        try {
-                            await addToChatList(jobInfo.addUrl);
-                        } catch (err) {
-                            if (isStopError(err)) {
-                                await api.releaseDelivery(claim.claimToken, 'script_stopped_before_queue', { allowDuringStop: true }).catch(() => null);
-                                activeReservedClaimToken = '';
-                                activeClaimPhase = '';
-                                throw err;
-                            }
-                            const queueError = String(err);
-                            if (queueError.includes('biz_fail:')) {
-                                await api.releaseDelivery(claim.claimToken, queueError).catch(() => null);
-                            } else {
-                                await api.markDelivery(claim.claimToken, 'failed_unknown', queueError).catch(() => null);
-                            }
+                        const greeting = await deliveryFlow.resolveGreeting(
+                            api,
+                            claim.claimToken,
+                            jobInfo,
+                            this.introduce,
+                            this.llmGreetingEnabled
+                        );
+                        decision.introduce = greeting.introduce;
+                        decision.introduceGenerated = greeting.generated;
+                        decision.greetingMode = greeting.mode;
+                        runtime.currentDecision.greetingMode = greeting.mode;
+                        logger.add(`最终招呼语: ${greeting.introduce.substring(0, 60)}...`, { sender: 'delivery', verbosity: 'detailed' });
+
+                        if (runtimePolicy.sendingDisabled || runtimePolicy.openingDisabled || control.stopped || this.pause) {
+                            activeClaimLeaseKeeper?.stop();
+                            await api.releaseDelivery(claim.claimToken, 'runtime_policy_blocked_before_queue', { allowDuringStop: true }).catch(() => null);
                             activeReservedClaimToken = '';
                             activeClaimPhase = '';
-                            await logAction({
-                                action: 'greet_queue_failed',
-                                scene: 'search',
-                                title: jobInfo.title,
-                                resumeIndex: decision.resumeIndex,
-                                addUrl: jobInfo.addUrl,
-                                chatUrl: jobInfo.chatUrl,
-                                reason: queueError,
-                                accountId: identity.accountId,
-                                workerId: identity.workerId,
-                                claimToken: claim.claimToken,
-                                hrActive: jobInfo.hrActive,
-                                hrActiveLevel: jobInfo.hrActiveLevel,
-                            });
-                            clearPendingGreet();
+                            activeClaimLeaseKeeper = null;
+                            logger.add('服务端策略在 queued 前发生变化，已释放投递权', { sender: 'claim', verbosity: 'concise', level: 'warning' });
                             return loop();
                         }
 
-                        await api.markDelivery(claim.claimToken, 'queued', '', { allowDuringStop: true }).catch(async (err) => {
+                        try {
+                            await deliveryEntrypoints.search(
+                                api,
+                                claim.claimToken,
+                                () => addToChatList(jobInfo.addUrl),
+                                { finalize: false, health: runtime, leaseKeeper: activeClaimLeaseKeeper }
+                            );
+                        } catch (entryError) {
+                            if (entryError.queuedPersistFailed) {
+                                await api.releaseDelivery(claim.claimToken, 'queued_persist_failed', { allowDuringStop: true }).catch(() => null);
+                            }
+                            activeReservedClaimToken = '';
+                            activeClaimPhase = '';
+                            activeClaimLeaseKeeper = null;
                             await logAction({
-                                action: 'delivery_mark_queued_failed',
-                                scene: 'search',
-                                title: jobInfo.title,
-                                company: jobInfo.company,
-                                reason: String(err),
-                                accountId: identity.accountId,
-                                workerId: identity.workerId,
-                                claimToken: claim.claimToken,
+                                action: entryError.queuedPersistFailed ? 'delivery_mark_queued_failed' : 'greet_queue_failed',
+                                scene: 'search', title: jobInfo.title,
+                                company: jobInfo.company, reason: String(entryError), accountId: identity.accountId,
+                                workerId: identity.workerId, claimToken: claim.claimToken,
                             });
-                        });
+                            logger.add(entryError.queuedPersistFailed
+                                ? 'queued 状态未成功落库，已阻断平台沟通动作'
+                                : '平台沟通动作失败，已记录 failed_unknown',
+                            { sender: 'queue', verbosity: 'concise', level: 'error' });
+                            if (isStopError(entryError)) throw entryError;
+                            return loop();
+                        }
                         activeClaimPhase = 'queued';
+                        activeClaimLeaseKeeper = null;
                         runtime.counters.queued += 1;
                         runtime.state = 'queued';
                         runtime.phase = '已进入投递队列';
                         runtime.currentDecision.decisionState = 'queued';
                         runtime.currentDecision.decisionReason = '';
                         await logAction({
-                            action: 'greet_queued',
-                            scene: 'search',
-                            title: jobInfo.title,
-                            company: jobInfo.company,
-                            salary: jobInfo.salary,
-                            location: jobInfo.location,
-                            city: jobInfo.city,
-                            industry: jobInfo.industry,
-                            experience: jobInfo.experience,
-                            education: jobInfo.education,
-                            keyword: currentKeyword,
-                            resumeIndex: decision.resumeIndex,
-                            score: decision.score,
-                            accountId: identity.accountId,
-                            workerId: identity.workerId,
-                            claimToken: claim.claimToken,
-                            hrActive: jobInfo.hrActive,
-                            hrActiveLevel: jobInfo.hrActiveLevel,
+                            action: 'greet_queued', scene: 'search', title: jobInfo.title, company: jobInfo.company,
+                            salary: jobInfo.salary, location: jobInfo.location, city: jobInfo.city,
+                            industry: jobInfo.industry, experience: jobInfo.experience, education: jobInfo.education,
+                            keyword: currentKeyword, resumeIndex: OPTIONS.resumeIndex, score: decision.score,
+                            accountId: identity.accountId, workerId: identity.workerId, claimToken: claim.claimToken,
+                            hrActive: jobInfo.hrActive, hrActiveLevel: jobInfo.hrActiveLevel,
                         });
 
-                        // 防检测：按概率随机不带招呼语直接打招呼，模拟真人偶尔空手打招呼的行为。
-                        const skipIntroduce = antiDetection.enabled() && antiDetection.shouldSkipIntroduce();
-                        if (skipIntroduce) {
-                            decision.introduce = '';
-                            decision.introduceGenerated = false;
-                            decision.omitIntroduce = true;
-                            decision.greetingMode = 'none';
-                            logger.add(`职位 [${jobInfo.title}] 命中防检测随机策略，本次不携带招呼语`, { sender: 'delivery', verbosity: 'normal' });
-                        } else {
-                            logger.add(`所有条件已通过，最后生成职位 [${jobInfo.title}] 的招呼语`, { sender: 'delivery', verbosity: 'normal' });
-                            try {
-                                const generated = await api.generateIntroduce(
-                                    claim.claimToken,
-                                    jobInfo.company,
-                                    jobInfo.title,
-                                    jobInfo.salary,
-                                    jobInfo.detail
-                                );
-                                decision.introduce = generated.introduce || this.introduce;
-                                decision.introduceGenerated = Boolean(generated.generated);
-                                decision.greetingMode = generated.generated ? 'llm' : 'fixed';
-                            } catch (err) {
-                                if (isStopError(err)) throw err;
-                                decision.introduce = this.introduce;
-                                decision.introduceGenerated = false;
-                                decision.greetingMode = 'fixed';
-                                logger.add(`定制招呼语生成失败，使用固定招呼语: ${err}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
-                            }
-                        }
-                        runtime.currentDecision.greetingMode = decision.greetingMode || 'fixed';
-                        await sendRuntimeHeartbeat();
-                        logger.add(`最终招呼语: ${(decision.introduce || '（空，直接打招呼）').substring(0, 60)}...`, { sender: 'delivery', verbosity: 'detailed' });
+                        sendRuntimeHeartbeat();
                         try {
                             await logAction({
                                 action: 'chat_open_requested',
@@ -3709,8 +4260,8 @@
                             activeClaimPhase = '';
                             return;
                         } catch (err) {
-                            if (isStopError(err)) throw err;
-                            await api.markDelivery(claim.claimToken, 'failed_unknown', String(err), { allowDuringStop: true }).catch(() => null);
+                            await deliveryFlow.markFinal(api, claim.claimToken, 'failed_unknown', String(err));
+                            recordDeliveryOutcome(runtime, false, err);
                             activeReservedClaimToken = '';
                             activeClaimPhase = '';
                             await logAction({
@@ -3726,27 +4277,9 @@
                                 claimToken: claim.claimToken,
                             });
                             clearPendingGreet();
+                            if (isStopError(err)) throw err;
                             return loop();
                         }
-                    }
-                    // 否则下一轮
-                    else {
-                        runtime.state = 'running';
-                        runtime.phase = '继续扫描';
-                        await logAction({
-                            action: searchRejectionAction(rulePassed, aiPassed),
-                            scene: 'search',
-                            title: jobInfo.title,
-                            salary: jobInfo.salary,
-                            score: decision.score,
-                            threshold: OPTIONS.thread,
-                            resumeIndex: decision.resumeIndex,
-                            hrActive: jobInfo.hrActive,
-                            hrActiveLevel: jobInfo.hrActiveLevel,
-                            ...(aiPassed ? {} : { aiReason: decision.aiReason || 'AI 判断未通过' }),
-                        });
-                        loop();
-                    }
                 } catch (e) {
                     if (isStopError(e) || runtimeLifecycle.isStopping()) return;
                     console.log(e);
@@ -3895,12 +4428,8 @@
                 // 开始广播
                 startBroadcast();
                 // 获取统一配置
-                const clientConfig = await api.getClientConfig().catch((e) => {
-                    if (isStopError(e)) throw e;
-                    logger.add('获取统一配置失败，将回退旧接口', { sender: 'system', verbosity: 'concise', level: 'error' });
-                    return null;
-                });
-                if (clientConfig && clientConfig.frontend) {
+                const clientConfig = requireV2ClientConfig(await api.getClientConfig());
+                if (clientConfig.frontend) {
                     applyFrontendConfig(clientConfig.frontend);
                     logger.add('获取前端配置成功', { sender: 'system', verbosity: 'detailed' });
                 }
@@ -3908,25 +4437,24 @@
                 logger.add(`当前账号标识: ${identity.accountId}`, { sender: 'system', verbosity: 'detailed' });
                 logger.add(`脚本版本: ${SCRIPT_VERSION}`, { sender: 'system', verbosity: 'detailed' });
                 sendRuntimeHeartbeat();
-                if (clientConfig && Array.isArray(clientConfig.tags) && clientConfig.tags.length) {
+                if (Array.isArray(clientConfig.tags) && clientConfig.tags.length) {
                     this.tags = clientConfig.tags;
                     logger.add('获取标签成功: ' + this.tags.join('、'), { sender: 'system', verbosity: 'detailed' });
                 } else {
-                    this.tags = await api.getTags();
-                    logger.add('获取标签成功(旧接口): ' + this.tags.join('、'), { sender: 'system', verbosity: 'detailed' });
+                    throw new Error('V2 客户端配置缺少搜索标签');
                 }
                 if (typeof tagIdx === 'number' && this.tags.length) {
                     currentTagIdx = ((tagIdx % this.tags.length) + this.tags.length) % this.tags.length - 1;
                 }
-                if (clientConfig && typeof clientConfig.introduce === 'string' && clientConfig.introduce) {
+                if (typeof clientConfig.introduce === 'string' && clientConfig.introduce.trim()) {
                     this.introduce = clientConfig.introduce;
                     logger.add('获取自我介绍成功', { sender: 'system', verbosity: 'detailed' });
                 } else {
-                    this.introduce = await api.getIntroduce();
-                    logger.add('获取自我介绍成功(旧接口)', { sender: 'system', verbosity: 'detailed' });
+                    this.introduce = DEFAULT_FIXED_INTRODUCE;
                 }
+                this.llmGreetingEnabled = clientConfig.llmGreetingEnabled !== false;
                 try {
-                    const daily = await api.checkDailyLimit(identity.accountId);
+                    const daily = await api.checkDailyLimit(identity.accountId, identity.workerId);
                     logger.add(`今日已打招呼 ${daily.count}/${daily.limit}，剩余 ${daily.remaining} 次`, { sender: 'claim', verbosity: 'normal' });
                     if (daily.reached) {
                         logger.add('今日打招呼已达上限，暂停运行', { sender: 'claim', verbosity: 'concise', level: 'warning' });
@@ -3939,6 +4467,11 @@
                 } catch (e) {
                     if (isStopError(e)) throw e;
                     logger.add('每日限制检查失败', { sender: 'claim', verbosity: 'concise', level: 'error' });
+                    this.pause = true;
+                    runtime.state = 'paused';
+                    runtime.phase = '每日限制检查失败';
+                    started = true;
+                    return;
                 }
                 started = true;
             };
@@ -4010,16 +4543,14 @@
                     talked: chatBtn && chatBtn.dataset.isfriend === 'true',
                 };
             };
-            const jobInfo = getJobInfo();
-
             // 来自搜索页
-            const fromSearchPage = () => {
+            const fromSearchPage = (jobInfo) => {
                 // 把职位信息发送给搜索页
                 this.broadcast.send(this.targets.search, this.bcTypes.GET_JOB_INFO, jobInfo).catch(() => null);
             };
 
             // 来自聊天页
-            const fromChatPage = () => {
+            const fromChatPage = (jobInfo) => {
                 // 把职位信息发送给聊天页
                 this.broadcast.send(
                     this.targets.chat,
@@ -4031,19 +4562,23 @@
             };
 
             // 主函数
-            const main = () => {
+            const main = async () => {
                 // 判断来源
                 const now = new Date().getTime();
                 const isFromSearch = now - tools.getTimestamp(this.targets.detail) < OPTIONS.timestampTimeout && window.name === this.targets.detail;
                 const isFromChat = now - tools.getTimestamp(this.targets.chat) < OPTIONS.timestampTimeout;
+                const jobInfo = await waitForJobDetailReady(
+                    getJobInfo,
+                    Math.max(500, OPTIONS.detailTimeout - 500)
+                );
 
                 if (isFromSearch) {
-                    fromSearchPage();
+                    fromSearchPage(jobInfo);
                 } else if (isFromChat) {
-                    fromChatPage();
+                    fromChatPage(jobInfo);
                 }
             };
-            main();
+            main().catch(() => null);
         }
 
         // 聊天页
@@ -4145,11 +4680,34 @@
                     return;
                 }
 
+                const initialPeerState = await this.broadcast.sendAndReceive(
+                    this.targets.search,
+                    this.bcTypes.HEART_BEAT,
+                    {
+                        greetId: session.greetId,
+                        claimToken: session.claimToken,
+                        startup: true,
+                        consecutiveFailures: deliveryHealth.consecutiveFailures,
+                        lastError: deliveryHealth.lastError,
+                        healthUpdatedAt: deliveryHealth.healthUpdatedAt,
+                    },
+                    5000
+                );
+                if (!initialPeerState?.success) throw new ScriptStoppedError('greet_startup_precheck_failed');
+                syncDeliveryHealth(deliveryHealth, initialPeerState);
+                if (initialPeerState.control) applyRuntimePolicy(initialPeerState.control);
+                if (runtimePolicy.sendingDisabled) throw new ScriptStoppedError('greet_sending_disabled');
                 runPeerHeartbeat(
                     this.broadcast,
                     this.targets.search,
                     this.bcTypes.HEART_BEAT,
-                    () => ({ greetId: session.greetId, claimToken: session.claimToken })
+                    () => ({
+                        greetId: session.greetId,
+                        claimToken: session.claimToken,
+                        consecutiveFailures: deliveryHealth.consecutiveFailures,
+                        lastError: deliveryHealth.lastError,
+                        healthUpdatedAt: deliveryHealth.healthUpdatedAt,
+                    })
                 ).catch((error) => {
                     if (!runtimeLifecycle.isStopping()) {
                         runtimeLifecycle.stop(error?.reason || 'greet_peer_lost')
@@ -4164,13 +4722,9 @@
                         { greetId: session.greetId, claimToken: session.claimToken }
                     );
                     if (greetDecision?.cancelled) throw new ScriptStoppedError('greet_session_cancelled');
-                    const introduce = greetDecision.introduce;
-                    // “不使用回复语”表示只保留此前已完成的立即沟通动作，不向输入框发送空字符串。
-                    if (introduce) {
-                        await sendMsg(introduce, (msg) => console.log('[sayHi]', msg));
-                    } else {
-                        console.log('[sayHi] 已按随机策略省略招呼语文本');
-                    }
+                    const introduce = String(greetDecision.introduce || DEFAULT_FIXED_INTRODUCE).trim()
+                        || DEFAULT_FIXED_INTRODUCE;
+                    await sendMsg(introduce, (msg) => console.log('[sayHi]', msg));
                     await this.broadcast.send(this.targets.search, this.bcTypes.SAY_HI, {
                         success: true,
                         greetId: session.greetId,
@@ -4330,16 +4884,22 @@
             let logger = null;
             let activeChatClaimToken = '';
             let activeChatMessageStarted = false;
+            let activeChatClaimPhase = '';
+            let activeChatLeaseKeeper = null;
             runtimeLifecycle.addCleanup(() => {
                 this.broadcast?.destroy('chat_stopped');
                 logger?.remove();
                 const claimToken = activeChatClaimToken;
                 const messageStarted = activeChatMessageStarted;
+                const claimPhase = activeChatClaimPhase;
+                activeChatLeaseKeeper?.stop();
+                activeChatLeaseKeeper = null;
                 activeChatClaimToken = '';
                 activeChatMessageStarted = false;
+                activeChatClaimPhase = '';
                 if (claimToken) {
-                    const cleanupRequest = messageStarted
-                        ? chatApi.markDelivery(claimToken, 'failed_unknown', 'chat_script_stopped_during_send', { allowDuringStop: true, timeout: 2000 })
+                    const cleanupRequest = messageStarted || claimPhase === 'queued'
+                        ? deliveryFlow.markFinal(chatApi, claimToken, 'failed_unknown', 'chat_script_stopped_during_send')
                         : chatApi.releaseDelivery(claimToken, 'chat_script_stopped_before_send', { allowDuringStop: true, timeout: 2000 });
                     return cleanupRequest.catch(() => null);
                 }
@@ -4394,17 +4954,36 @@
                 const identity = deliveryIdentity.get();
                 // 开始广播
                 startBroadcast(this.targets.chat);
-                const clientConfig = await api.getClientConfig().catch(() => null);
-                if (clientConfig?.frontend) applyFrontendConfig(clientConfig.frontend);
+                const clientConfig = requireV2ClientConfig(await api.getClientConfig());
+                if (clientConfig.frontend) applyFrontendConfig(clientConfig.frontend);
                 // 获取默认自我介绍（兜底）
-                const defaultIntroduce = (await this.broadcast.sendAndReceive(
+                const defaultIntroduce = String((await this.broadcast.sendAndReceive(
                     this.targets.search,
                     this.bcTypes.INTRODUCE,
-                )).introduce;
+                )).introduce || clientConfig.introduce || '').trim() || DEFAULT_FIXED_INTRODUCE;
+                const initialPeerState = await this.broadcast.sendAndReceive(
+                    this.targets.search,
+                    this.bcTypes.HEART_BEAT,
+                    {
+                        startup: true,
+                        consecutiveFailures: deliveryHealth.consecutiveFailures,
+                        lastError: deliveryHealth.lastError,
+                        healthUpdatedAt: deliveryHealth.healthUpdatedAt,
+                    },
+                    5000
+                );
+                if (!initialPeerState?.success) throw new ScriptStoppedError('chat_startup_precheck_failed');
+                syncDeliveryHealth(deliveryHealth, initialPeerState);
+                if (initialPeerState.control) applyRuntimePolicy(initialPeerState.control);
                 runPeerHeartbeat(
                     this.broadcast,
                     this.targets.search,
-                    this.bcTypes.HEART_BEAT
+                    this.bcTypes.HEART_BEAT,
+                    () => ({
+                        consecutiveFailures: deliveryHealth.consecutiveFailures,
+                        lastError: deliveryHealth.lastError,
+                        healthUpdatedAt: deliveryHealth.healthUpdatedAt,
+                    })
                 ).catch((error) => {
                     if (!runtimeLifecycle.isStopping()) {
                         runtimeLifecycle.stop(error?.reason || 'chat_peer_lost')
@@ -4450,23 +5029,60 @@
                             if (lastMsg && lastMsg.role === 'assistant') continue;
                             // 如果以前没聊过
                             if (!chatInfo.talked) {
-                                const detailDelayPassed = await antiDetection.detailDelay(() => this.pause);
-                                if (!detailDelayPassed) continue;
+                                const opening = await deliveryFlow.beforeDetailOpen(() => this.pause);
+                                if (!opening.allowed) {
+                                    status(opening.reason === 'opening_disabled'
+                                        ? '服务端策略已禁止打开职位详情'
+                                        : '获取职位详情前等待被中断',
+                                    { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                                    continue;
+                                }
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 runtimeLifecycle.guard();
                                 chatInfo.jobEl.click();
                                 status(`正在获取职位详情`, { sender: 'delivery', verbosity: 'detailed' });
-                                const jobInfo = await this.broadcast.receive(this.targets.detail, this.bcTypes.GET_JOB_INFO);
+                                const jobInfo = await this.broadcast.receive(
+                                    this.targets.detail,
+                                    this.bcTypes.GET_JOB_INFO,
+                                    OPTIONS.detailTimeout
+                                );
                                 if (!company) {
                                     status(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`);
                                     continue;
                                 }
-                                // 获取职位匹配度
-                                status(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
-                                const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
-                                const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
-                                const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
-                                const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                                if (!jobInfo.title || !jobInfo.detail || !jobInfo.chatUrl || !jobInfo.addUrl) {
+                                    status('职位详情缺少标题、描述或沟通链接，已在 AI 前终止', { sender: 'delivery', verbosity: 'concise', level: 'warning' });
+                                    continue;
+                                }
+                                status(`开始执行职位 [${jobInfo.title}] 的 V2 资格门禁`, { sender: 'delivery', verbosity: 'detailed' });
+                                const deliveryMode = runtimePolicy.scanOnly ? 'scan' : 'delivery';
+                                const prepared = await deliveryFlow.prepare(api, identity, {
+                                    ...jobInfo,
+                                    company,
+                                    jobUrl: window.location.href,
+                                }, {
+                                    scene: 'chat_first_contact',
+                                    mode: deliveryMode,
+                                    scanAiEnabled: runtimePolicy.scanAiEnabled,
+                                    beforeClaim: () => antiDetection.enabled() && antiDetection.shouldSkip(),
+                                });
+                                if (deliveryMode === 'delivery' && prepared.ready && prepared.claimToken) {
+                                    activeChatClaimToken = prepared.claimToken;
+                                    activeChatMessageStarted = false;
+                                    activeChatClaimPhase = 'reserved';
+                                    activeChatLeaseKeeper = prepared.leaseKeeper || null;
+                                }
+                                const qualification = prepared.qualification || {};
+                                const aiDecision = prepared.decision || {};
+                                const decision = {
+                                    ...qualification,
+                                    resumeIndex: OPTIONS.resumeIndex,
+                                    aiFilterEnabled: qualification.aiFilterEnabled === true,
+                                    aiPassed: aiDecision.aiSkipped ? null : aiDecision.passed ?? null,
+                                    aiReason: aiDecision.aiReason || prepared.reason || '',
+                                };
+                                const rejection = prepared.ready ? null : classifyDeliveryRejection(prepared);
+                                const hrActivePassed = rejection?.stage !== 'hr';
                                 const currentDecision = {
                                     workerId: identity.workerId,
                                     accountId: identity.accountId,
@@ -4485,17 +5101,13 @@
                                     hrActive: jobInfo.hrActive || '',
                                     hrActiveLevel: jobInfo.hrActiveLevel || 'unknown',
                                     hrActivePassed,
-                                    finalPassed: rulePassed && aiPassed && hrActivePassed,
-                                    decisionState: !hrActivePassed
-                                        ? 'hr_filtered'
-                                        : (!aiPassed ? 'ai_rejected' : (!rulePassed ? 'below_threshold' : 'evaluating')),
-                                    decisionReason: !hrActivePassed
-                                        ? `HR 活跃状态未匹配所选项：${hrActiveSelectionLabel()}`
-                                        : (!aiPassed ? (decision.aiReason || 'AI 判断未通过') : (!rulePassed ? (decision.reason || `岗位分数低于阈值 ${OPTIONS.thread}`) : '')),
+                                    finalPassed: prepared.ready,
+                                    decisionState: rejection?.decisionState || 'qualified',
+                                    decisionReason: rejection?.reason || '',
                                     greetingMode: '',
                                 };
                                 publishDecision(jobInfo.title, currentDecision);
-                                status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${decision.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
+                                status(`岗位星级: ${decision.stars ?? decision.score / 20}/5 | 扣星: ${decision.deductedStars ?? 0} | 简历索引: ${OPTIONS.resumeIndex}`, { sender: 'delivery', verbosity: 'normal' });
                                 logDecisionDeductions(decision, (message) => status(message, { sender: 'delivery', verbosity: 'detailed' }));
                                 await logAction({
                                     action: 'job_decision_consumed',
@@ -4515,102 +5127,81 @@
                                     aiPassed: decision.aiPassed ?? null,
                                     aiReason: decision.aiReason || '',
                                 });
-                                if (!hrActivePassed) {
-                                    status(`HR 活跃状态 [${jobInfo.hrActive || '未知'}] 未匹配所选项`);
+                                if (!prepared.ready) {
+                                    status(`职位 [${jobInfo.title}] 未通过门禁：${prepared.reason}`, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                                    if (rejection.stage === 'duplicate') {
+                                        const duplicateDecision = publishDuplicateDecision(
+                                            { ...jobInfo, company }, prepared.qualification, currentDecision, window.location.href
+                                        );
+                                        await logAction(createDuplicateActionPayload(
+                                            'chat_first_contact', { ...jobInfo, company, jobUrl: window.location.href },
+                                            duplicateDecision, identity
+                                        ));
+                                    } else {
+                                        await logAction({
+                                            action: rejection.action,
+                                            scene: 'chat_first_contact', title: jobInfo.title, company, reason: prepared.reason,
+                                            accountId: identity.accountId, workerId: identity.workerId,
+                                        });
+                                    }
                                     continue;
                                 }
-                                // 如果分数达到阈值并且未聊过天，打个招呼
-                                if (rulePassed && aiPassed && !chatInfo.msgs.length) {
-                                    if (antiDetection.enabled() && antiDetection.shouldSkip()) {
-                                        status(`职位 [${jobInfo.title}] 命中随机跳过策略`);
-                                        await logAction({
-                                            action: 'job_random_skipped', scene: 'chat', title: jobInfo.title, company,
-                                            score: decision.score, accountId: identity.accountId, workerId: identity.workerId,
-                                            hrActive: jobInfo.hrActive, hrActiveLevel: jobInfo.hrActiveLevel,
-                                        });
-                                        continue;
-                                    }
-                                    const duplicateCheck = await deliveryFlow.precheck(api, company, jobInfo.title);
-                                    if (duplicateCheck.unavailable) {
-                                        status('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                                        continue;
-                                    }
-                                    if (duplicateCheck.greeted) {
-                                        const duplicateDecision = publishDuplicateDecision(
-                                            { ...jobInfo, company },
-                                            duplicateCheck,
-                                            currentDecision,
-                                        );
-                                        const duplicateMessage = duplicateDecision.decisionReason;
-                                        status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                                        console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                                        await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
-                                        continue;
-                                    }
-                                    if (!await antiDetection.delay()) continue;
-                                    const claim = await deliveryFlow.claim(
-                                        api,
-                                        identity,
-                                        { ...jobInfo, company },
-                                        window.location.href
-                                    );
-                                    if (claim.reason === 'service_unavailable') {
-                                        status('投递协调服务不可用，为避免重复投递已跳过', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                                        continue;
-                                    }
-                                    if (!claim.accepted) {
-                                        if (claim.reason === 'daily_limit') {
-                                            status(`账号 [${identity.accountId}] 今日已达上限（${claim.count}/${claim.limit}）`, { sender: 'claim', verbosity: 'concise', level: 'warning' });
-                                        } else if (deliveryFlow.isDuplicate(claim)) {
-                                            const duplicateDecision = publishDuplicateDecision(
-                                                { ...jobInfo, company },
-                                                claim,
-                                                currentDecision,
-                                            );
-                                            const duplicateMessage = duplicateDecision.decisionReason;
-                                            status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                                            console.log(`[goodJobs] ${duplicateMessage}`, claim.existing || {});
-                                            await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
-                                        } else {
-                                            status(`无法领取投递权：${claim.reason}`, { sender: 'claim', verbosity: 'concise', level: 'error' });
-                                        }
-                                        continue;
-                                    }
-                                    activeChatClaimToken = claim.claimToken;
+                                if (deliveryMode === 'scan') {
+                                    status(`仅扫描完成：职位 [${jobInfo.title}] 不执行平台动作`, { sender: 'delivery', verbosity: 'normal' });
+                                    continue;
+                                }
+                                const claim = prepared.claim || { claimToken: prepared.claimToken, accepted: true };
+                                if (runtimePolicy.sendingDisabled || runtimePolicy.openingDisabled || chatInfo.msgs.length) {
+                                    prepared.leaseKeeper?.stop();
+                                    await api.releaseDelivery(claim.claimToken, 'chat_policy_blocked_before_send', { allowDuringStop: true }).catch(() => null);
+                                    activeChatClaimToken = '';
                                     activeChatMessageStarted = false;
-                                    if (!await antiDetection.delay()) continue;
-                                    const omitIntroduce = antiDetection.enabled() && antiDetection.shouldSkipIntroduce();
-                                    status(omitIntroduce
-                                        ? `职位 [${jobInfo.title}] 命中随机省略回复语策略`
-                                        : `职位 [${jobInfo.title}] 已通过全部条件，最后生成招呼语`, { sender: 'queue', verbosity: 'normal' });
-                                    let finalIntroduce = defaultIntroduce;
-                                    let greetingMode = omitIntroduce ? 'none' : 'fixed';
-                                    try {
-                                        if (omitIntroduce) {
-                                            finalIntroduce = '';
-                                        } else {
-                                        const generated = await api.generateIntroduce(
-                                            claim.claimToken,
-                                            company,
-                                            jobInfo.title,
-                                            jobInfo.salary,
-                                            jobInfo.detail
-                                        );
-                                        finalIntroduce = generated.introduce || defaultIntroduce;
-                                        greetingMode = generated.generated ? 'llm' : 'fixed';
-                                        }
-                                    } catch (e) {
-                                        if (isStopError(e)) throw e;
-                                        status(`定制招呼语生成失败，使用固定招呼语: ${e}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
+                                    activeChatClaimPhase = '';
+                                    activeChatLeaseKeeper = null;
+                                    status('服务端策略或聊天状态阻止首次联系，已释放投递权', { sender: 'claim', verbosity: 'concise', level: 'warning' });
+                                    continue;
+                                }
+                                    if (!await antiDetection.delay(() => this.pause)) {
+                                        activeChatLeaseKeeper?.stop();
+                                        await api.releaseDelivery(claim.claimToken, 'chat_delay_interrupted', { allowDuringStop: true }).catch(() => null);
+                                        activeChatClaimToken = '';
+                                        activeChatClaimPhase = '';
+                                        activeChatLeaseKeeper = null;
+                                        continue;
+                                    }
+                                    const greeting = await deliveryFlow.resolveGreeting(
+                                        api,
+                                        claim.claimToken,
+                                        { ...jobInfo, company },
+                                        defaultIntroduce,
+                                        clientConfig.llmGreetingEnabled !== false
+                                    );
+                                    const finalIntroduce = greeting.introduce;
+                                    const greetingMode = greeting.mode;
+                                    if (runtimePolicy.sendingDisabled || runtimePolicy.openingDisabled || chatInfo.msgs.length || this.pause) {
+                                        activeChatLeaseKeeper?.stop();
+                                        await api.releaseDelivery(claim.claimToken, 'chat_policy_blocked_before_queue', { allowDuringStop: true }).catch(() => null);
+                                        activeChatClaimToken = '';
+                                        activeChatClaimPhase = '';
+                                        activeChatLeaseKeeper = null;
+                                        status('服务端策略或聊天状态在 queued 前发生变化，已释放投递权', { sender: 'claim', verbosity: 'concise', level: 'warning' });
+                                        continue;
                                     }
                                     try {
-                                        if (finalIntroduce) {
-                                            activeChatMessageStarted = true;
-                                            await sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`, { sender: 'delivery', verbosity: 'detailed' }));
-                                        }
-                                        await api.markDelivery(claim.claimToken, 'sent', '', { allowDuringStop: true });
+                                        await deliveryEntrypoints.chatFirstContact(
+                                            api,
+                                            claim.claimToken,
+                                            async () => {
+                                                activeChatClaimPhase = 'queued';
+                                                activeChatMessageStarted = true;
+                                                return sendMsg(finalIntroduce, (msg) => status(`[sendMsg] ${msg}`, { sender: 'delivery', verbosity: 'detailed' }));
+                                            },
+                                            { finalize: true, health: deliveryHealth, leaseKeeper: activeChatLeaseKeeper }
+                                        );
                                         activeChatClaimToken = '';
                                         activeChatMessageStarted = false;
+                                        activeChatClaimPhase = '';
+                                        activeChatLeaseKeeper = null;
                                         await logAction({
                                             action: 'chat_greet_sent',
                                             scene: 'chat',
@@ -4622,7 +5213,7 @@
                                             industry: jobInfo.industry,
                                             experience: jobInfo.experience,
                                             education: jobInfo.education,
-                                            resumeIndex: decision.resumeIndex,
+                                            resumeIndex: OPTIONS.resumeIndex,
                                             accountId: identity.accountId,
                                             workerId: identity.workerId,
                                             claimToken: claim.claimToken,
@@ -4633,62 +5224,139 @@
                                         status(`打招呼成功`, { sender: 'delivery', verbosity: 'concise' });
                                         await antiDetection.delay();
                                     } catch (e) {
-                                        await api.markDelivery(claim.claimToken, 'failed_unknown', String(e), { allowDuringStop: true }).catch(() => null);
+                                        if (e.queuedPersistFailed) {
+                                            await api.releaseDelivery(claim.claimToken, 'chat_queued_persist_failed', { allowDuringStop: true }).catch(() => null);
+                                        }
                                         activeChatClaimToken = '';
                                         activeChatMessageStarted = false;
+                                        activeChatClaimPhase = '';
+                                        activeChatLeaseKeeper = null;
                                         if (isStopError(e)) throw e;
                                         await logAction({
                                             action: 'chat_greet_failed',
                                             scene: 'chat',
                                             title: jobInfo.title,
-                                            resumeIndex: decision.resumeIndex,
+                                            resumeIndex: OPTIONS.resumeIndex,
                                             reason: String(e),
                                             accountId: identity.accountId,
                                             workerId: identity.workerId,
                                             claimToken: claim.claimToken,
                                         });
-                                        status(`打招呼失败: ${e}`, { sender: 'delivery', verbosity: 'concise', level: 'error' });
+                                        status(e.queuedPersistFailed
+                                            ? 'queued 状态未成功落库，已阻断首次联系'
+                                            : `打招呼失败: ${e}`,
+                                        { sender: e.queuedPersistFailed ? 'queue' : 'delivery', verbosity: 'concise', level: 'error' });
                                     }
                                     continue;
-                                }
-                                // 未达到阈值，直接下一个
-                                else if (!rulePassed || !aiPassed) {
-                                    await logAction({
-                                        action: 'chat_rejected_below_threshold',
-                                        scene: 'chat',
-                                        title: jobInfo.title,
-                                        score: decision.score,
-                                        threshold: OPTIONS.thread,
-                                        resumeIndex: decision.resumeIndex,
-                                    });
-                                    await sendMsg('不好意思，不太合适哈，祝早日找到合适的人选。', (msg) => status(`[sendMsg] ${msg}`, { sender: 'delivery', verbosity: 'detailed' }))
-                                    continue;
-                                }
                             }
                             let isChat = true;
                             // 只要对方发来新消息且还没发过简历，就直接发送简历，不再调用大模型聊天
                             if (!chatInfo.resumeSended) {
                                 isChat = false;
-                                const detailDelayPassed = await antiDetection.detailDelay(() => this.pause);
-                                if (!detailDelayPassed) continue;
+                                if (runtimePolicy.scanOnly || runtimePolicy.resumeSendingDisabled || runtimePolicy.openingDisabled) {
+                                    status('服务端策略已禁止自动发简历或打开详情', { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                                    continue;
+                                }
+                                const opening = await deliveryFlow.beforeDetailOpen(() => this.pause);
+                                if (!opening.allowed) {
+                                    status(opening.reason === 'opening_disabled'
+                                        ? '服务端策略已禁止打开职位详情'
+                                        : '获取职位详情前等待被中断',
+                                    { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                                    continue;
+                                }
                                 localStorage.setItem(this.targets.chat, new Date().getTime());
                                 runtimeLifecycle.guard();
                                 chatInfo.jobEl.click();
                                 status(`正在获取职位详情（用于确定简历）`);
-                                const jobInfo = await this.broadcast.receive(this.targets.detail, this.bcTypes.GET_JOB_INFO);
-                                const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
-                                status(`检测到新消息，直接发送简历（简历索引 ${decision.resumeIndex}）`);
-                                const resumeResult = await sendResume(decision.resumeIndex);
-                                await logAction({
-                                    action: 'resume_sent',
-                                    scene: 'chat',
-                                    title: jobInfo.title,
-                                    salary: jobInfo.salary,
-                                    requestedResumeIndex: decision.resumeIndex,
-                                    selectedResumeIndex: resumeResult?.selectedResumeIndex ?? decision.resumeIndex,
-                                    sendMode: resumeResult?.mode || 'unknown',
+                                const jobInfo = await this.broadcast.receive(
+                                    this.targets.detail,
+                                    this.bcTypes.GET_JOB_INFO,
+                                    OPTIONS.detailTimeout
+                                );
+                                if (!company || !jobInfo.title || !jobInfo.detail || !jobInfo.chatUrl || !jobInfo.addUrl) {
+                                    status('自动发简历缺少公司、标题、描述或沟通链接，已在 AI 前终止', { sender: 'delivery', verbosity: 'concise', level: 'warning' });
+                                    continue;
+                                }
+                                const preparedResume = await deliveryFlow.prepare(api, identity, {
+                                    ...jobInfo,
+                                    company,
+                                    jobUrl: window.location.href,
+                                }, {
+                                    scene: 'chat_auto_resume',
+                                    mode: 'delivery',
+                                    scanAiEnabled: false,
+                                    beforeClaim: () => antiDetection.enabled() && antiDetection.shouldSkip(),
                                 });
-                                status('发送成功');
+                                if (!preparedResume.ready) {
+                                    status(`自动发简历门禁未通过：${preparedResume.reason}`, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                                    continue;
+                                }
+                                const resumeClaimToken = preparedResume.claimToken;
+                                activeChatClaimToken = resumeClaimToken;
+                                activeChatMessageStarted = false;
+                                activeChatClaimPhase = 'reserved';
+                                activeChatLeaseKeeper = preparedResume.leaseKeeper || null;
+                                if (!await antiDetection.delay(() => this.pause)) {
+                                    activeChatLeaseKeeper?.stop();
+                                    await api.releaseDelivery(resumeClaimToken, 'resume_delay_interrupted', { allowDuringStop: true }).catch(() => null);
+                                    activeChatClaimToken = '';
+                                    activeChatClaimPhase = '';
+                                    activeChatLeaseKeeper = null;
+                                    continue;
+                                }
+                                if (runtimePolicy.scanOnly || runtimePolicy.sendingDisabled
+                                    || runtimePolicy.resumeSendingDisabled || runtimePolicy.openingDisabled || this.pause) {
+                                    activeChatLeaseKeeper?.stop();
+                                    await api.releaseDelivery(resumeClaimToken, 'resume_policy_blocked_before_queue', { allowDuringStop: true }).catch(() => null);
+                                    activeChatClaimToken = '';
+                                    activeChatClaimPhase = '';
+                                    activeChatLeaseKeeper = null;
+                                    status('服务端策略在 queued 前禁止自动发简历，已释放投递权', { sender: 'claim', verbosity: 'concise', level: 'warning' });
+                                    continue;
+                                }
+                                try {
+                                    const entryResult = await deliveryEntrypoints.chatAutoResume(
+                                        api,
+                                        resumeClaimToken,
+                                        async () => {
+                                            activeChatClaimPhase = 'queued';
+                                            status(`检测到新消息，发送客户端配置的第 ${OPTIONS.resumeIndex + 1} 份简历`);
+                                            activeChatMessageStarted = true;
+                                            return sendResume(OPTIONS.resumeIndex);
+                                        },
+                                        { finalize: true, health: deliveryHealth, leaseKeeper: activeChatLeaseKeeper }
+                                    );
+                                    const resumeResult = entryResult.value;
+                                    activeChatClaimToken = '';
+                                    activeChatMessageStarted = false;
+                                    activeChatClaimPhase = '';
+                                    activeChatLeaseKeeper = null;
+                                    await logAction({
+                                        action: 'resume_sent',
+                                        scene: 'chat_auto_resume',
+                                        title: jobInfo.title,
+                                        salary: jobInfo.salary,
+                                        requestedResumeIndex: OPTIONS.resumeIndex,
+                                        selectedResumeIndex: resumeResult?.selectedResumeIndex ?? OPTIONS.resumeIndex,
+                                        sendMode: resumeResult?.mode || 'unknown',
+                                        claimToken: resumeClaimToken,
+                                    });
+                                    status('发送成功');
+                                } catch (resumeError) {
+                                    if (resumeError.queuedPersistFailed) {
+                                        await api.releaseDelivery(resumeClaimToken, 'resume_queued_persist_failed', { allowDuringStop: true }).catch(() => null);
+                                    }
+                                    activeChatClaimToken = '';
+                                    activeChatMessageStarted = false;
+                                    activeChatClaimPhase = '';
+                                    activeChatLeaseKeeper = null;
+                                    if (isStopError(resumeError)) throw resumeError;
+                                    status(resumeError.queuedPersistFailed
+                                        ? 'queued 状态未成功落库，已阻断自动发简历'
+                                        : `自动发简历失败：${resumeError}`,
+                                    { sender: resumeError.queuedPersistFailed ? 'queue' : 'delivery', verbosity: 'concise', level: 'error' });
+                                }
                             }
                             // 是否需要作品集（当前关闭自动发送，仅保留原入口）
                             if (chatInfo.needWorks && !chatInfo.worksSended) {
@@ -4788,12 +5456,24 @@
             createRuntimeActionPayload,
             queueRuntimeHeartbeat,
             searchRejectionAction,
+            classifyDeliveryRejection,
             createDuplicateDecision,
             createDuplicateActionPayload,
             normalizeServerOrigin,
             applyFrontendConfig,
+            requireV2ClientConfig,
+            applyRuntimePolicy,
+            runtimePolicy,
             connectionSettings,
             deliveryIdentity,
+            deliveryFlow,
+            deliveryEntrypoints,
+            deliveryHealth,
+            recordDeliveryOutcome,
+            syncDeliveryHealth,
+            waitForJobDetailReady,
+            FINAL_MARK_REPLAY_KEY,
+            readPendingFinalMarks,
             antiDetection,
             tools,
             Api,

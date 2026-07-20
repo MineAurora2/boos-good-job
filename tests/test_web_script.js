@@ -13,6 +13,12 @@ const scriptSource = fs.readFileSync(SCRIPT_PATH, 'utf8');
 function createStorage(initial = {}) {
     const values = new Map(Object.entries(initial).map(([key, value]) => [key, String(value)]));
     return {
+        get length() {
+            return values.size;
+        },
+        key(index) {
+            return [...values.keys()][Number(index)] ?? null;
+        },
         getItem(key) {
             return values.has(String(key)) ? values.get(String(key)) : null;
         },
@@ -29,7 +35,7 @@ function createStorage(initial = {}) {
 }
 
 function loadHooks(globals = {}) {
-    const localStorage = createStorage();
+    const localStorage = globals.localStorage || createStorage();
     const windowOverrides = globals.window || {};
     const window = {
         __GOODJOBS_TEST__: true,
@@ -41,6 +47,7 @@ function loadHooks(globals = {}) {
     };
     const contextGlobals = { ...globals };
     delete contextGlobals.window;
+    delete contextGlobals.localStorage;
     const context = vm.createContext({
         AbortController,
         console,
@@ -259,7 +266,8 @@ test('keeps a browser instance job card visible when delivery is duplicated', ()
 });
 
 test('all duplicate delivery paths publish the preserved decision card', () => {
-    assert.equal((scriptSource.match(/const duplicateDecision = publishDuplicateDecision/g) || []).length, 4);
+    assert.ok((scriptSource.match(/publishDuplicateDecision/g) || []).length >= 2);
+    assert.match(scriptSource, /deliveryFlow\.isDuplicate\(prepared\)/);
     assert.match(scriptSource, /DUPLICATE_CARD_RETENTION_MS/);
     assert.match(scriptSource, /duplicateCardUntil/);
     assert.match(scriptSource, /action: 'company_duplicate_skipped'/);
@@ -350,18 +358,17 @@ test('detail delay gates one search open and both chat job clicks before timesta
     const searchEnd = scriptSource.indexOf('// 接收职位信息', searchStart);
     assert.ok(searchStart >= 0 && searchEnd > searchStart);
     const searchSource = scriptSource.slice(searchStart, searchEnd);
-    assert.equal((searchSource.match(/await antiDetection\.detailDelay\(\(\) => control\.stopped \|\| this\.pause\)/g) || []).length, 1);
-    assert.match(searchSource, /detailDelayPassed\s*=\s*await antiDetection\.detailDelay/);
-    assert.match(searchSource, /if \(!detailDelayPassed\) return \{ skip: true/);
-    assert.ok(searchSource.indexOf('detailDelayPassed') < searchSource.indexOf('tools.openTabNSetTimestamp'));
+    assert.equal((searchSource.match(/await deliveryFlow\.beforeDetailOpen\(\(\) => control\.stopped \|\| this\.pause\)/g) || []).length, 1);
+    assert.match(searchSource, /if \(!opening\.allowed\)/);
+    assert.ok(searchSource.indexOf('beforeDetailOpen') < searchSource.indexOf('tools.openTabNSetTimestamp'));
 
     const clickMatches = [...scriptSource.matchAll(/chatInfo\.jobEl\.click\(\)/g)];
     assert.equal(clickMatches.length, 2);
     for (const match of clickMatches) {
-        const before = scriptSource.slice(Math.max(0, match.index - 500), match.index);
-        assert.match(before, /await antiDetection\.detailDelay\(\(\) => this\.pause\)/);
-        assert.match(before, /if \(!detailDelayPassed\) continue;\s*localStorage\.setItem/);
-        assert.ok(before.lastIndexOf('await antiDetection.detailDelay') < before.lastIndexOf('localStorage.setItem'));
+        const before = scriptSource.slice(Math.max(0, match.index - 900), match.index);
+        assert.match(before, /await deliveryFlow\.beforeDetailOpen\(\(\) => this\.pause\)/);
+        assert.match(before, /if \(!opening\.allowed\)[\s\S]*?continue;[\s\S]*?localStorage\.setItem/);
+        assert.ok(before.lastIndexOf('beforeDetailOpen') < before.lastIndexOf('localStorage.setItem'));
     }
 });
 
@@ -585,7 +592,7 @@ test('action logs always include identity and filter metadata', () => {
     assert.equal(explicit.level, 'warning');
 });
 
-test('job scoring queues one heartbeat without awaiting transport', () => {
+test('qualification and AI decisions queue one heartbeat without awaiting transport', () => {
     const { hooks } = loadHooks();
     assert.equal(typeof hooks.queueRuntimeHeartbeat, 'function');
 
@@ -599,11 +606,8 @@ test('job scoring queues one heartbeat without awaiting transport', () => {
     assert.equal(result, undefined);
     assert.equal(requests, 1);
 
-    const scoreAt = scriptSource.indexOf('const decision = await api.getJobScore');
-    const scoringEnd = scriptSource.indexOf('// 如果分数达到阈值', scoreAt);
-    const afterScore = scriptSource.slice(scoreAt, scoringEnd);
-    assert.equal((afterScore.match(/sendRuntimeHeartbeat\(\)/g) || []).length, 1);
-    assert.doesNotMatch(afterScore, /await\s+sendRuntimeHeartbeat\(\)/);
+    assert.match(scriptSource, /decisionState = 'qualified'|decisionState:\s*'qualified'/);
+    assert.match(scriptSource, /sendRuntimeHeartbeat\(\)/);
 });
 
 test('search runtime heartbeats always use the coalescing scheduler', () => {
@@ -821,10 +825,7 @@ test('AI rejection uses its own action instead of the rule threshold action', ()
     assert.equal(hooks.searchRejectionAction(false, false), 'job_ai_rejected');
     assert.equal(hooks.searchRejectionAction(true, true), '');
 
-    const scoringStart = scriptSource.indexOf('const decision = await api.getJobScore');
-    const scoringEnd = scriptSource.indexOf('} catch (e) {', scoringStart);
-    const scoringFlow = scriptSource.slice(scoringStart, scoringEnd);
-    assert.match(scoringFlow, /action:\s*searchRejectionAction\(rulePassed, aiPassed\)/);
+    assert.match(scriptSource, /searchRejectionAction\(rulePassed, aiPassed\)/);
 });
 
 test('Logger is headless and only forwards normalized metadata', async () => {
@@ -1846,12 +1847,13 @@ test('managed child execution permission is persistent, expiring, and fail close
     assert.match(scriptSource, /writeChildExecutionPermission\('stopped'\);\s*const controlAgent = new ControlAgent\(\)/);
 });
 
-test('runtime heartbeat and chat status preserve new metadata with legacy compatibility', () => {
+test('runtime heartbeat and chat status use the V2 protocol', () => {
     const metadataVersion = scriptSource.match(/\/\/ @version\s+(\S+)/)?.[1];
     const runtimeVersion = scriptSource.match(/const SCRIPT_VERSION = '([^']+)'/)?.[1];
-    assert.equal(metadataVersion, '2026-07-20-control-short-poll.1');
+    assert.equal(metadataVersion, '2026-07-20-delivery-gate-v2.1');
     assert.equal(runtimeVersion, metadataVersion);
-    assert.match(scriptSource, /const CONTROL_PROTOCOL_VERSION = 1/);
+    assert.match(scriptSource, /const SCRIPT_API_VERSION = 2/);
+    assert.match(scriptSource, /const CONTROL_PROTOCOL_VERSION = 2/);
     assert.match(scriptSource, /protocolVersion: CONTROL_PROTOCOL_VERSION/);
     assert.match(scriptSource, /controlAck: this\.controlAck/);
     assert.match(scriptSource, /\/api\/control\/workers\/\$\{encodeURIComponent\(identity\.workerId\)\}\/desired-state\?/);
@@ -1882,6 +1884,692 @@ test('job detail selector supports the visible BOSS online badge', () => {
 
 test('removed job cache userscript surface stays absent', () => {
     assert.doesNotMatch(scriptSource, /\/cache\/job|cacheControl|cacheMode|缓存系统设置/);
+});
+
+test('client configuration rejects V1 before any automation can start', () => {
+    const { hooks } = loadHooks();
+    assert.equal(typeof hooks.requireV2ClientConfig, 'function');
+    assert.throws(
+        () => hooks.requireV2ClientConfig({ scriptApiVersion: 1 }),
+        /V2|版本|scriptApiVersion/,
+    );
+    assert.equal(hooks.requireV2ClientConfig({
+        scriptApiVersion: 2,
+        qualificationRequired: true,
+    }).scriptApiVersion, 2);
+    assert.match(scriptSource, /const clientConfig = requireV2ClientConfig\(await api\.getClientConfig\(\)\)/);
+    assert.doesNotMatch(scriptSource, /获取统一配置失败，将回退旧接口|获取标签成功\(旧接口\)|获取自我介绍成功\(旧接口\)/);
+});
+
+test('Api.getJobScore sends the V2 request envelope', async () => {
+    const { hooks } = loadHooks();
+    const api = Object.create(hooks.Api.prototype);
+    let request = null;
+    api.__http = async (path, method, body) => {
+        request = { path, method, body: JSON.parse(body) };
+        return { success: true };
+    };
+
+    await api.getJobScore('SRE', '20K', 'Linux');
+
+    assert.deepEqual(request, {
+        path: '/get-job-score',
+        method: 'POST',
+        body: {
+            scriptApiVersion: 2,
+            job: '# 职位名称\nSRE\n\n# 薪资范围\n20K\n\n# 职位描述\nLinux',
+        },
+    });
+});
+
+test('startup preflight sends worker identity and fails closed on transport errors', async () => {
+    const { hooks } = loadHooks();
+    const api = Object.create(hooks.Api.prototype);
+    let request = null;
+    api.__http = async (path, method, body) => {
+        request = { path, method, body: JSON.parse(body) };
+        return { success: true };
+    };
+    await api.checkDailyLimit('account-a', 'worker-a');
+    assert.deepEqual(request, {
+        path: '/check-daily-limit',
+        method: 'POST',
+        body: { accountId: 'account-a', workerId: 'worker-a' },
+    });
+    assert.match(scriptSource, /api\.checkDailyLimit\(identity\.accountId,\s*identity\.workerId\)/);
+    assert.match(scriptSource, /每日限制检查失败[\s\S]*?this\.pause\s*=\s*true[\s\S]*?runtime\.state\s*=\s*'paused'[\s\S]*?started\s*=\s*true[\s\S]*?return/);
+});
+
+test('runtime policy trusts server safety and keeps scan AI fail closed', () => {
+    const { hooks } = loadHooks();
+    hooks.OPTIONS.scanAiEnabled = true;
+    const policy = hooks.applyRuntimePolicy({
+        safety: {
+            scanOnly: true,
+            scanAiEnabled: false,
+            sendingDisabled: true,
+            openingDisabled: true,
+            resumeSendingDisabled: true,
+        },
+        plan: { dailyTarget: 12, hourlyLimit: 4, minDelayMs: 300, maxDelayMs: 900 },
+        account: { accountId: 'account-a', dailyLimit: 20 },
+        policy: { aiFilterEnabled: true },
+    });
+
+    assert.equal(policy.scanOnly, true);
+    assert.equal(policy.scanAiEnabled, false);
+    assert.equal(policy.sendingDisabled, true);
+    assert.equal(policy.openingDisabled, true);
+    assert.equal(policy.resumeSendingDisabled, true);
+    assert.equal(policy.plan.dailyTarget, 12);
+    assert.equal(policy.account.accountId, 'account-a');
+    assert.equal(policy.policy.aiFilterEnabled, true);
+});
+
+test('server plan delay range overrides local rhythm only while the range is enabled', async () => {
+    const { hooks } = loadHooks();
+    const waits = [];
+    hooks.tools.asyncSleep = async (delay) => { waits.push(delay); };
+    hooks.OPTIONS.antiDetectionEnabled = true;
+    hooks.OPTIONS.randomDelayMinMs = 9000;
+    hooks.OPTIONS.randomDelayMaxMs = 9000;
+
+    hooks.applyRuntimePolicy({
+        safety: {},
+        plan: { minDelayMs: 25, maxDelayMs: 25 },
+        account: {},
+        policy: {},
+    });
+    assert.equal(await hooks.antiDetection.delay(), true);
+    assert.deepEqual(waits, [25]);
+
+    waits.length = 0;
+    hooks.applyRuntimePolicy({ safety: {}, plan: { minDelayMs: 0, maxDelayMs: 0 } });
+    assert.equal(await hooks.antiDetection.delay(), true);
+    assert.equal(waits.reduce((total, delay) => total + delay, 0), 9000);
+    assert.equal(waits.every((delay) => delay > 0 && delay <= 200), true);
+});
+
+test('openingDisabled blocks detail waits and rechecks before every DOM or window open', async () => {
+    const { hooks } = loadHooks();
+    let delayCalls = 0;
+    hooks.antiDetection.detailDelay = async () => {
+        delayCalls += 1;
+        return true;
+    };
+
+    hooks.applyRuntimePolicy({ safety: { openingDisabled: true } });
+    const blockedImmediately = await hooks.deliveryFlow.beforeDetailOpen();
+    assert.equal(blockedImmediately.allowed, false);
+    assert.equal(blockedImmediately.reason, 'opening_disabled');
+    assert.equal(delayCalls, 0);
+
+    hooks.applyRuntimePolicy({ safety: { openingDisabled: false } });
+    hooks.antiDetection.detailDelay = async () => {
+        delayCalls += 1;
+        hooks.applyRuntimePolicy({ safety: { openingDisabled: true } });
+        return true;
+    };
+    const blockedAfterDelay = await hooks.deliveryFlow.beforeDetailOpen();
+    assert.equal(blockedAfterDelay.allowed, false);
+    assert.equal(blockedAfterDelay.reason, 'opening_disabled');
+
+    assert.match(scriptSource, /const getJobInfo = async \(href\) => \{[\s\S]*?beforeDetailOpen\([\s\S]*?openTabNSetTimestamp\(href/);
+    assert.match(scriptSource, /if \(!chatInfo\.talked\) \{[\s\S]*?beforeDetailOpen\([\s\S]*?chatInfo\.jobEl\.click\(\)/);
+    assert.match(scriptSource, /if \(!chatInfo\.resumeSended\) \{[\s\S]*?beforeDetailOpen\([\s\S]*?chatInfo\.jobEl\.click\(\)/);
+});
+
+test('normal delivery claims before starting AI and scan mode never claims', async () => {
+    const { hooks } = loadHooks();
+    hooks.tools.asyncSleep = async () => {};
+    const calls = [];
+    const api = {
+        qualifyDelivery: async (_identity, _job, mode) => {
+            calls.push(`qualify:${mode}`);
+            return {
+                success: true,
+                allowed: true,
+                qualificationToken: 'qualification-token',
+                resumeIndex: 2,
+                score: 83,
+                aiFilterEnabled: true,
+            };
+        },
+        claimDelivery: async (_identity, _job, token) => {
+            calls.push(`claim:${token}`);
+            return { success: true, allowed: true, accepted: true, claimToken: 'claim-token' };
+        },
+        startJobFilter: async (payload) => {
+            assert.equal(payload.score, 83);
+            calls.push(`ai:${payload.mode}:${payload.claimToken || 'no-claim'}`);
+            return { success: true, allowed: true, status: 'completed', passed: true, reliable: true };
+        },
+        releaseDelivery: async () => ({ success: true }),
+    };
+    const identity = { accountId: 'account-a', workerId: 'worker-a' };
+    const job = { company: 'Acme', title: 'Engineer', detail: 'Build systems' };
+
+    const delivery = await hooks.deliveryFlow.prepare(api, identity, job, {
+        mode: 'delivery',
+        scanAiEnabled: true,
+    });
+    assert.equal(delivery.ready, true);
+    assert.equal(delivery.claimToken, 'claim-token');
+    assert.deepEqual(calls, [
+        'qualify:delivery',
+        'claim:qualification-token',
+        'ai:delivery:claim-token',
+    ]);
+
+    calls.length = 0;
+    const scan = await hooks.deliveryFlow.prepare(api, identity, job, {
+        mode: 'scan',
+        scanAiEnabled: true,
+    });
+    assert.equal(scan.ready, true);
+    assert.equal(scan.claimToken, '');
+    assert.deepEqual(calls, [
+        'qualify:scan',
+        'ai:scan:no-claim',
+    ]);
+});
+
+test('claim retries transport loss idempotently but never retries a business rejection', async () => {
+    const { hooks } = loadHooks();
+    hooks.tools.asyncSleep = async () => {};
+    let transportAttempts = 0;
+    const base = {
+        qualifyDelivery: async () => ({
+            success: true, allowed: true, qualificationToken: 'q', aiFilterEnabled: false,
+        }),
+        renewDelivery: async () => ({ success: true }),
+        releaseDelivery: async () => ({ success: true }),
+    };
+    const recovered = await hooks.deliveryFlow.prepare({
+        ...base,
+        claimDelivery: async () => {
+            transportAttempts += 1;
+            if (transportAttempts === 1) throw new Error('claim response lost');
+            return { success: true, allowed: true, accepted: true, claimToken: 'claim-token' };
+        },
+    }, { accountId: 'account-a', workerId: 'worker-a' }, {
+        company: 'Acme', title: 'Engineer', detail: 'Build systems',
+    });
+    assert.equal(recovered.ready, true);
+    assert.equal(transportAttempts, 2);
+    recovered.leaseKeeper.stop();
+
+    let businessAttempts = 0;
+    const rejected = await hooks.deliveryFlow.prepare({
+        ...base,
+        claimDelivery: async () => {
+            businessAttempts += 1;
+            return { success: false, allowed: false, accepted: false, reason: 'daily_limit' };
+        },
+    }, { accountId: 'account-a', workerId: 'worker-a' }, {
+        company: 'Other', title: 'Engineer', detail: 'Build systems',
+    });
+    assert.equal(rejected.ready, false);
+    assert.equal(rejected.reason, 'daily_limit');
+    assert.equal(businessAttempts, 1);
+
+    const unavailable = await hooks.deliveryFlow.prepare({
+        ...base,
+        claimDelivery: async () => { throw new Error('network offline'); },
+    }, { accountId: 'account-a', workerId: 'worker-a' }, {
+        company: 'Offline', title: 'Engineer', detail: 'Build systems',
+    });
+    assert.equal(unavailable.ready, false);
+    assert.equal(unavailable.stage, 'claim');
+    assert.equal(unavailable.reason, 'claim_transport_failed');
+});
+
+test('qualify rejection short-circuits claim and every AI call', async () => {
+    const { hooks } = loadHooks();
+    let downstreamCalls = 0;
+    const result = await hooks.deliveryFlow.prepare({
+        qualifyDelivery: async () => ({ success: false, allowed: false, reason: 'duplicate_job' }),
+        claimDelivery: async () => { downstreamCalls += 1; },
+        startJobFilter: async () => { downstreamCalls += 1; },
+    }, { accountId: 'account-a', workerId: 'worker-a' }, {
+        company: 'Acme', title: 'Engineer', detail: 'Build systems',
+    }, { mode: 'delivery', scanAiEnabled: true });
+
+    assert.equal(result.ready, false);
+    assert.equal(result.reason, 'duplicate_job');
+    assert.equal(downstreamCalls, 0);
+});
+
+test('pre-AI gate rejections keep their own stage, state, and audit action', async () => {
+    const { hooks } = loadHooks();
+    const cases = [
+        ['duplicate_job', 'duplicate', 'duplicate', 'company_duplicate_skipped'],
+        ['score_below_threshold', 'rules', 'below_threshold', 'job_below_threshold'],
+        ['hr_inactive', 'hr', 'hr_filtered', 'job_hr_filtered'],
+        ['daily_limit', 'quota', 'quota_rejected', 'job_quota_rejected'],
+        ['sending_disabled', 'policy', 'policy_blocked', 'job_policy_blocked'],
+        ['missing_company', 'fields', 'invalid_fields', 'job_invalid_fields'],
+    ];
+
+    for (const [reason, stage, decisionState, action] of cases) {
+        let aiCalls = 0;
+        const prepared = await hooks.deliveryFlow.prepare({
+            qualifyDelivery: async () => ({ success: false, allowed: false, reason }),
+            claimDelivery: async () => { throw new Error('claim must not run'); },
+            startJobFilter: async () => { aiCalls += 1; },
+        }, { accountId: 'account-a', workerId: 'worker-a' }, {
+            company: 'Acme', title: 'Engineer', detail: 'Build systems',
+        }, { mode: 'delivery', scanAiEnabled: true });
+        const rejection = hooks.classifyDeliveryRejection(prepared);
+        assert.equal(prepared.stage, stage, reason);
+        assert.equal(rejection.decisionState, decisionState, reason);
+        assert.equal(rejection.action, action, reason);
+        assert.equal(aiCalls, 0, reason);
+    }
+});
+
+test('reserved claim lease renews through post-claim work and stops once queued', async () => {
+    const { hooks } = loadHooks();
+    const scheduled = [];
+    const cleared = [];
+    const calls = [];
+    const scheduler = {
+        setInterval(callback, delay) {
+            const handle = { callback, delay };
+            scheduled.push(handle);
+            return handle;
+        },
+        clearInterval(handle) {
+            cleared.push(handle);
+        },
+    };
+    const api = {
+        qualifyDelivery: async () => ({
+            success: true, allowed: true, qualificationToken: 'q', aiFilterEnabled: false,
+        }),
+        claimDelivery: async () => ({
+            success: true, allowed: true, accepted: true, claimToken: 'claim-token',
+        }),
+        renewDelivery: async (token, workerId) => {
+            calls.push(`renew:${token}:${workerId}`);
+            return { success: true };
+        },
+        markDelivery: async (_token, status) => {
+            calls.push(`mark:${status}`);
+            return { success: true };
+        },
+    };
+
+    const prepared = await hooks.deliveryFlow.prepare(api, {
+        accountId: 'account-a', workerId: 'worker-a',
+    }, {
+        company: 'Acme', title: 'Engineer', detail: 'Build systems',
+    }, {
+        mode: 'delivery', leaseScheduler: scheduler, leaseIntervalMs: 10,
+    });
+    assert.equal(prepared.ready, true);
+    assert.equal(typeof prepared.leaseKeeper?.assertHealthy, 'function');
+    assert.equal(scheduled.length, 1);
+
+    await scheduled[0].callback();
+    assert.deepEqual(calls, ['renew:claim-token:worker-a']);
+    await hooks.deliveryEntrypoints.search(api, 'claim-token', async () => {
+        calls.push('platform-effect');
+    }, { leaseKeeper: prepared.leaseKeeper });
+    assert.deepEqual(calls, [
+        'renew:claim-token:worker-a',
+        'renew:claim-token:worker-a',
+        'mark:queued',
+        'platform-effect',
+    ]);
+    assert.deepEqual(cleared, [scheduled[0]]);
+});
+
+test('search and chat register claim cleanup ownership before post-prepare awaits', () => {
+    const prepareNeedle = 'const prepared = await deliveryFlow.prepare(api, identity';
+    const searchPrepare = scriptSource.indexOf(prepareNeedle);
+    const searchReject = scriptSource.indexOf('if (!prepared.ready)', searchPrepare);
+    const searchSlice = scriptSource.slice(searchPrepare, searchReject);
+    assert.ok(searchPrepare >= 0 && searchReject > searchPrepare);
+    assert.match(searchSlice, /activeReservedClaimToken\s*=\s*prepared\.claimToken/);
+    assert.match(searchSlice, /activeClaimLeaseKeeper\s*=\s*prepared\.leaseKeeper/);
+    assert.ok(searchSlice.indexOf('activeReservedClaimToken') < searchSlice.indexOf('await logAction'));
+
+    const chatPrepare = scriptSource.indexOf(prepareNeedle, searchReject);
+    const chatReject = scriptSource.indexOf('if (!prepared.ready)', chatPrepare);
+    const chatSlice = scriptSource.slice(chatPrepare, chatReject);
+    assert.ok(chatPrepare >= 0 && chatReject > chatPrepare);
+    assert.match(chatSlice, /activeChatClaimToken\s*=\s*prepared\.claimToken/);
+    assert.match(chatSlice, /activeChatLeaseKeeper\s*=\s*prepared\.leaseKeeper/);
+    assert.ok(chatSlice.indexOf('activeChatClaimToken') < chatSlice.indexOf('await logAction'));
+});
+
+test('lease renewal failure blocks queued and all platform effects', async () => {
+    const { hooks } = loadHooks();
+    let scheduledCallback;
+    let marks = 0;
+    let effects = 0;
+    const api = {
+        qualifyDelivery: async () => ({
+            success: true, allowed: true, qualificationToken: 'q', aiFilterEnabled: false,
+        }),
+        claimDelivery: async () => ({
+            success: true, allowed: true, accepted: true, claimToken: 'claim-token',
+        }),
+        renewDelivery: async () => ({ success: false, reason: 'claim_expired' }),
+        markDelivery: async () => { marks += 1; return { success: true }; },
+    };
+    const prepared = await hooks.deliveryFlow.prepare(api, {
+        accountId: 'account-a', workerId: 'worker-a',
+    }, {
+        company: 'Acme', title: 'Engineer', detail: 'Build systems',
+    }, {
+        mode: 'delivery',
+        leaseScheduler: {
+            setInterval(callback) { scheduledCallback = callback; return 1; },
+            clearInterval() {},
+        },
+        leaseIntervalMs: 10,
+    });
+    await scheduledCallback();
+
+    await assert.rejects(
+        hooks.deliveryEntrypoints.search(api, 'claim-token', async () => { effects += 1; }, {
+            leaseKeeper: prepared.leaseKeeper,
+        }),
+        /claim_expired|lease|续租/,
+    );
+    assert.equal(marks, 0);
+    assert.equal(effects, 0);
+});
+
+test('AI rejection and transport failure release a normal reserved claim', async () => {
+    const { hooks } = loadHooks();
+    const released = [];
+    const baseApi = {
+        qualifyDelivery: async () => ({
+            success: true, allowed: true, qualificationToken: 'q', aiFilterEnabled: true,
+        }),
+        claimDelivery: async () => ({
+            success: true, allowed: true, accepted: true, claimToken: 'c',
+        }),
+        releaseDelivery: async (token, reason) => {
+            released.push([token, reason]);
+            return { success: true };
+        },
+    };
+    const args = [
+        { accountId: 'account-a', workerId: 'worker-a' },
+        { company: 'Acme', title: 'Engineer', detail: 'Build systems' },
+        { mode: 'delivery', scanAiEnabled: true },
+    ];
+    const rejected = await hooks.deliveryFlow.prepare({
+        ...baseApi,
+        startJobFilter: async () => ({
+            success: true, status: 'completed', allowed: false, passed: false, reliable: true, reason: 'ai_rejected',
+        }),
+    }, ...args);
+    assert.equal(rejected.ready, false);
+    assert.equal(released.length, 1);
+
+    const failed = await hooks.deliveryFlow.prepare({
+        ...baseApi,
+        startJobFilter: async () => { throw new Error('transport failed'); },
+    }, ...args);
+    assert.equal(failed.ready, false);
+    assert.equal(released.length, 2);
+    assert.match(released[1][1], /ai|filter|transport/);
+});
+
+test('scan AI is allowed only by the server safety policy', async () => {
+    const { hooks } = loadHooks();
+    let aiCalls = 0;
+    const api = {
+        qualifyDelivery: async () => ({
+            success: true, allowed: true, qualificationToken: 'q', aiFilterEnabled: true,
+        }),
+        startJobFilter: async (payload) => {
+            aiCalls += 1;
+            assert.equal(payload.scanAiEnabled, true);
+            assert.equal(payload.claimToken, undefined);
+            return { success: true, status: 'completed', allowed: true, passed: true, reliable: true };
+        },
+    };
+    const identity = { accountId: 'account-a', workerId: 'worker-a' };
+    const job = { company: 'Acme', title: 'Engineer', detail: 'Build systems' };
+
+    hooks.applyRuntimePolicy({ safety: { scanOnly: true, scanAiEnabled: false } });
+    const skipped = await hooks.deliveryFlow.prepare(api, identity, job, {
+        mode: 'scan', scanAiEnabled: hooks.runtimePolicy.scanAiEnabled,
+    });
+    assert.equal(skipped.aiSkipped, true);
+    assert.equal(aiCalls, 0);
+
+    hooks.applyRuntimePolicy({ safety: { scanOnly: true, scanAiEnabled: true } });
+    await hooks.deliveryFlow.prepare(api, identity, job, {
+        mode: 'scan', scanAiEnabled: hooks.runtimePolicy.scanAiEnabled,
+    });
+    assert.equal(aiCalls, 1);
+});
+
+test('queued blocks platform effects on business failure and final marks replay idempotently', async () => {
+    const { hooks, localStorage } = loadHooks();
+    hooks.tools.asyncSleep = async () => {};
+    let businessAttempts = 0;
+    await assert.rejects(
+        hooks.deliveryFlow.markQueued({
+            markDelivery: async () => {
+                businessAttempts += 1;
+                return { success: false, reason: 'invalid_transition' };
+            },
+        }, 'claim-token'),
+        /queued|落库|invalid_transition/,
+    );
+    assert.equal(businessAttempts, 1, 'business rejection must not be retried');
+
+    let transportAttempts = 0;
+    const queued = await hooks.deliveryFlow.markQueued({
+        markDelivery: async () => {
+            transportAttempts += 1;
+            if (transportAttempts === 1) throw new Error('response lost');
+            return { success: true, idempotent: true };
+        },
+    }, 'claim-token');
+    assert.equal(queued.success, true);
+    assert.equal(transportAttempts, 2, 'a lost queued response must retry idempotently');
+
+    let attempts = 0;
+    const failed = await hooks.deliveryFlow.markFinal({
+        markDelivery: async () => {
+            attempts += 1;
+            return { success: false, reason: 'database_busy' };
+        },
+    }, 'claim-token', 'sent');
+    assert.equal(attempts, 3);
+    assert.equal(failed.pendingReplay, true);
+    assert.equal(hooks.readPendingFinalMarks().some((item) => item.claimToken === 'claim-token'), true);
+
+    let replayCalls = 0;
+    const replay = await hooks.deliveryFlow.replayPendingMarks({
+        markDelivery: async () => {
+            replayCalls += 1;
+            return { success: true };
+        },
+    });
+    assert.equal(replayCalls, 1);
+    assert.equal(replay.remaining, 0);
+    assert.equal(hooks.readPendingFinalMarks().length, 0);
+    assert.match(scriptSource, /replayPendingMarks\(this\.api\)/);
+});
+
+test('final mark replay cannot erase a mark enqueued concurrently by another tab', async () => {
+    const sharedStorage = createStorage();
+    const first = loadHooks({ localStorage: sharedStorage }).hooks;
+    const second = loadHooks({ localStorage: sharedStorage }).hooks;
+    await first.deliveryFlow.markFinal({
+        markDelivery: async () => ({ success: false, reason: 'offline' }),
+    }, 'claim-a', 'sent');
+
+    const replay = await first.deliveryFlow.replayPendingMarks({
+        markDelivery: async () => {
+            await second.deliveryFlow.markFinal({
+                markDelivery: async () => ({ success: false, reason: 'offline' }),
+            }, 'claim-b', 'failed_unknown', 'platform uncertain');
+            return { success: true };
+        },
+    });
+
+    assert.equal(replay.replayed, 1);
+    assert.deepEqual(
+        Array.from(second.readPendingFinalMarks(), (item) => [item.claimToken, item.status]),
+        [['claim-b', 'failed_unknown']],
+    );
+});
+
+test('all greetings stay non-empty and random empty greeting configuration is removed', async () => {
+    const { hooks } = loadHooks();
+    const greeting = await hooks.deliveryFlow.resolveGreeting({
+        generateIntroduce: async () => { throw new Error('LLM unavailable'); },
+    }, 'claim-token', { company: 'Acme', title: 'Engineer', detail: 'Build systems' }, '   ', true);
+    assert.ok(greeting.introduce.trim().length > 0);
+    assert.equal(greeting.mode, 'fixed');
+    assert.doesNotMatch(scriptSource, /randomNoIntroduceRatio|shouldSkipIntroduce|omitIntroduce|随机空招呼|随机省略招呼|随机策略省略招呼语文本|空手打招呼/);
+    assert.match(scriptSource, /const introduce = String\(greetDecision\.introduce\s*\|\|\s*DEFAULT_FIXED_INTRODUCE\)\.trim\(\)\s*\|\|\s*DEFAULT_FIXED_INTRODUCE;[\s\S]*?await sendMsg\(introduce,/);
+});
+
+test('search chat first-contact and auto-resume use the V2 qualification orchestrator', () => {
+    assert.doesNotMatch(scriptSource, /await api\.getJobScore\(/);
+    assert.match(scriptSource, /scene:\s*'search'/);
+    assert.match(scriptSource, /scene:\s*'chat_first_contact'/);
+    assert.match(scriptSource, /scene:\s*'chat_auto_resume'/);
+    assert.match(scriptSource, /deliveryFlow\.prepare\(/);
+    assert.match(scriptSource, /deliveryFlow\.markQueued\(/);
+    assert.match(scriptSource, /deliveryEntrypoints\.search\(/);
+    assert.match(scriptSource, /deliveryEntrypoints\.chatFirstContact\(/);
+    assert.match(scriptSource, /deliveryEntrypoints\.chatAutoResume\(/);
+    assert.match(scriptSource, /resumeIndex:\s*OPTIONS\.resumeIndex|sendResume\(OPTIONS\.resumeIndex\)/);
+});
+
+test('each executable entrypoint blocks its platform effect until queued succeeds', async () => {
+    const { hooks } = loadHooks();
+    const entryNames = ['search', 'chatFirstContact', 'chatAutoResume'];
+    for (const name of entryNames) {
+        assert.equal(typeof hooks.deliveryEntrypoints?.[name], 'function', `${name} entrypoint missing`);
+        const calls = [];
+        const api = {
+            markDelivery: async (_token, status) => {
+                calls.push(`mark:${status}`);
+                return { success: true };
+            },
+        };
+        const result = await hooks.deliveryEntrypoints[name](api, 'claim-token', async () => {
+            calls.push('platform-effect');
+            return { sent: true };
+        }, { finalize: true });
+        assert.equal(result.success, true);
+        assert.deepEqual(calls, ['mark:queued', 'platform-effect', 'mark:sent']);
+
+        let effects = 0;
+        await assert.rejects(
+            hooks.deliveryEntrypoints[name]({
+                markDelivery: async () => ({ success: false, reason: 'queue_rejected' }),
+            }, 'claim-token', async () => { effects += 1; }),
+            /queue_rejected|queued/,
+        );
+        assert.equal(effects, 0, `${name} must not run its platform effect after queued rejection`);
+    }
+});
+
+test('all platform entrypoints and peer heartbeats share consecutive-failure health', () => {
+    assert.match(scriptSource, /deliveryEntrypoints\.search\([\s\S]*?\{\s*finalize:\s*false,\s*health:\s*runtime,\s*leaseKeeper:/);
+    assert.match(scriptSource, /deliveryEntrypoints\.chatFirstContact\([\s\S]*?\{\s*finalize:\s*true,\s*health:\s*deliveryHealth,\s*leaseKeeper:/);
+    assert.match(scriptSource, /deliveryEntrypoints\.chatAutoResume\([\s\S]*?\{\s*finalize:\s*true,\s*health:\s*deliveryHealth,\s*leaseKeeper:/);
+    assert.match(scriptSource, /runPeerHeartbeat\([\s\S]*?consecutiveFailures:\s*deliveryHealth\.consecutiveFailures[\s\S]*?lastError:\s*deliveryHealth\.lastError/);
+    assert.match(scriptSource, /healthUpdatedAt:\s*deliveryHealth\.healthUpdatedAt/);
+    assert.match(scriptSource, /from\s*===\s*this\.targets\.chat[\s\S]*?syncDeliveryHealth\(runtime,\s*data\)/);
+    assert.match(scriptSource, /syncDeliveryHealth\(deliveryHealth,\s*response\)/);
+    assert.match(scriptSource, /recordDeliveryOutcome\(runtime,\s*true\)[\s\S]*?action:\s*'greet_sent'/);
+    assert.match(scriptSource, /recordDeliveryOutcome\(runtime,\s*false,\s*data\.reason\s*\|\|\s*'chat_greet_failed'\)/);
+    assert.match(scriptSource, /recordDeliveryOutcome\(runtime,\s*false,\s*'greet_timeout'\)/);
+    assert.match(scriptSource, /recordDeliveryOutcome\(runtime,\s*false,\s*err\)/);
+});
+
+test('platform failures increment consecutive failures and a sent effect resets them', async () => {
+    const { hooks } = loadHooks();
+    assert.equal(typeof hooks.recordDeliveryOutcome, 'function');
+    assert.equal(typeof hooks.syncDeliveryHealth, 'function');
+    assert.equal(hooks.deliveryHealth.consecutiveFailures, 0);
+    assert.equal(hooks.deliveryHealth.lastError, '');
+    const health = { consecutiveFailures: 0, lastError: '' };
+    hooks.recordDeliveryOutcome(health, false, 'first failure', 100);
+    hooks.recordDeliveryOutcome(health, false, 'second failure', 100);
+    assert.equal(health.consecutiveFailures, 2);
+    assert.equal(health.lastError, 'second failure');
+    assert.equal(health.healthUpdatedAt, 101);
+    hooks.recordDeliveryOutcome(health, true, '', 102);
+    assert.equal(health.consecutiveFailures, 0);
+    assert.equal(health.lastError, '');
+    hooks.syncDeliveryHealth(health, {
+        consecutiveFailures: 3,
+        lastError: 'stale child failure',
+        healthUpdatedAt: 101,
+    });
+    assert.equal(health.consecutiveFailures, 0);
+    assert.equal(health.lastError, '');
+    hooks.syncDeliveryHealth(health, {
+        consecutiveFailures: 3,
+        lastError: 'new child failure',
+        healthUpdatedAt: 103,
+    });
+    assert.equal(health.consecutiveFailures, 3);
+    assert.equal(health.lastError, 'new child failure');
+    assert.equal(health.healthUpdatedAt, 103);
+    hooks.syncDeliveryHealth(health, {
+        consecutiveFailures: 0,
+        lastError: 'stale error',
+        healthUpdatedAt: 104,
+    });
+    assert.equal(health.consecutiveFailures, 0);
+    assert.equal(health.lastError, '');
+
+    await assert.rejects(hooks.deliveryEntrypoints.chatFirstContact({
+        markDelivery: async (_token, status) => ({ success: status === 'queued' }),
+    }, 'claim-token', async () => { throw new Error('platform failed'); }, { finalize: true, health }));
+    assert.equal(health.consecutiveFailures, 1);
+
+    await hooks.deliveryEntrypoints.chatFirstContact({
+        markDelivery: async () => ({ success: true }),
+    }, 'claim-token', async () => ({ sent: true }), { finalize: true, health });
+    assert.equal(health.consecutiveFailures, 0);
+});
+
+test('detail DOM readiness waits for every pre-AI field and fails closed on timeout', async () => {
+    const { hooks } = loadHooks();
+    let now = 0;
+    let reads = 0;
+    const ready = await hooks.waitForJobDetailReady(
+        () => {
+            reads += 1;
+            return reads < 3
+                ? { title: 'Engineer', company: 'Acme', detail: '', chatUrl: '', addUrl: '' }
+                : { title: 'Engineer', company: 'Acme', detail: 'Build', chatUrl: '/chat', addUrl: '/add' };
+        },
+        100,
+        () => now,
+        async (delay) => { now += delay; },
+    );
+    assert.equal(ready.skip, undefined);
+    assert.equal(reads, 3);
+
+    now = 0;
+    const timedOut = await hooks.waitForJobDetailReady(
+        () => ({ title: 'Engineer', company: '', detail: '', chatUrl: '', addUrl: '' }),
+        40,
+        () => now,
+        async (delay) => { now += delay; },
+    );
+    assert.equal(timedOut.skip, true);
+    assert.match(timedOut.skipReason, /超时|缺少/);
 });
 
 test('userscript does not own or invoke automatic dashboard opening', () => {

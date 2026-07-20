@@ -37,7 +37,6 @@
     "antiDetectionEnabled": false,
     "shuffleJobOrder": true,
     "randomSkipRatio": 0,
-    "randomNoIntroduceRatio": 0,
     "randomDelayMinMs": 0,
     "randomDelayMaxMs": 0,
     "detailRandomDelayMinMs": 0,

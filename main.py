@@ -11,6 +11,7 @@ import webbrowser
 from fastapi import FastAPI
 
 from app.llm.manager import LLM_MANAGER
+from app.protocol import CONTROL_PROTOCOL_VERSION, SCRIPT_API_VERSION
 from app.security import HybridAuthMiddleware, SecurityPolicy
 from app.runtime import RUNTIME_MONITOR
 from app.state import STATE
@@ -49,7 +50,8 @@ def create_app() -> FastAPI:
             'ok': True,
             'connected': True,
             'status': 'ok',
-            'scriptApiVersion': 1,
+            'scriptApiVersion': SCRIPT_API_VERSION,
+            'protocolVersion': CONTROL_PROTOCOL_VERSION,
             'serverTime': datetime.now(timezone.utc).isoformat(),
         }
 

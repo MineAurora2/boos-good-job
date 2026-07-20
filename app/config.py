@@ -125,8 +125,6 @@ DEFAULT_USER_CONFIG = {
         'shuffleJobOrder': True,
         # 达标岗位按百分比概率随机跳过（0 表示不跳过）。
         'randomSkipRatio': 0,
-        # 随机不带招呼语直接打招呼的百分比概率（0 表示始终使用招呼语）。
-        'randomNoIntroduceRatio': 0,
         # 投递前后附加的随机延时区间（毫秒）。
         'randomDelayMinMs': 0,
         'randomDelayMaxMs': 0,
@@ -304,6 +302,7 @@ def load_user_config() -> dict:
     if isinstance(user_config.get('frontend'), dict):
         # Removed in remote-control.3: searching now enters preload immediately.
         user_config['frontend'].pop('manualFilterWaitMs', None)
+        user_config['frontend'].pop('randomNoIntroduceRatio', None)
         migrate_hr_active_settings(user_config['frontend'])
     for key in _REMOVED_SCORE_DELAY_FIELDS:
         user_config.pop(key, None)
@@ -351,7 +350,13 @@ class Config:
     @classmethod
     def get_client_config(cls) -> dict:
         """Return the subset that the browser automation client may read."""
+        from app.protocol import SCRIPT_API_VERSION
+
         return {
+            'scriptApiVersion': SCRIPT_API_VERSION,
+            'qualificationRequired': True,
+            'scoringEnabled': cls.scoring_enabled,
+            'llmGreetingEnabled': cls.llm_greeting_enabled,
             'introduce': cls.introduce,
             'character': cls.character,
             'tags': cls.tags,

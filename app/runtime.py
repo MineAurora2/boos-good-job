@@ -17,6 +17,7 @@ import threading
 import time
 
 from app import paths
+from app.protocol import CONTROL_PROTOCOL_VERSION, SCRIPT_API_VERSION
 from app.scheduling import (
     DEFAULT_SCHEDULE,
     next_schedule_start,
@@ -29,6 +30,7 @@ from app.storage.io import atomic_write_text
 DEFAULT_SAFETY = {
     'globalPaused': False,
     'scanOnly': False,
+    'scanAiEnabled': False,
     'sendingDisabled': False,
     'openingDisabled': False,
     'resumeSendingDisabled': False,
@@ -58,7 +60,6 @@ EXECUTION_STATES = frozenset({
     'starting', 'running', 'pausing', 'paused', 'stopping', 'stopped', 'error',
 })
 CONTROL_ACK_STATUSES = frozenset({'applying', 'applied', 'failed'})
-CONTROL_PROTOCOL_VERSION = 1
 ACCOUNT_DAILY_LIMIT_MIN = 0
 ACCOUNT_DAILY_LIMIT_MAX = 150
 
@@ -218,6 +219,7 @@ class RuntimeMonitor:
                     'alias': self._clean_text(raw_worker.get('alias'), 120),
                     'role': self._clean_text(raw_worker.get('role'), 40),
                     'scriptVersion': self._clean_text(raw_worker.get('scriptVersion'), 80),
+                    'scriptApiVersion': 0,
                     'registeredAt': self._clean_text(raw_worker.get('registeredAt'), 40) or self._now_iso(),
                     'updatedAt': self._clean_text(raw_worker.get('updatedAt'), 40) or self._now_iso(),
                     'desiredState': desired_state,
@@ -231,10 +233,12 @@ class RuntimeMonitor:
                 }
                 try:
                     worker['protocolVersion'] = max(0, int(raw_worker.get('protocolVersion') or 0))
+                    worker['scriptApiVersion'] = max(0, int(raw_worker.get('scriptApiVersion') or 0))
                     worker['sessionEpoch'] = max(0, int(raw_worker.get('sessionEpoch') or 0))
                     worker['sequence'] = max(0, int(raw_worker.get('sequence') or 0))
                 except (TypeError, ValueError):
                     worker['protocolVersion'] = 0
+                    worker['scriptApiVersion'] = 0
                     worker['sessionEpoch'] = 0
                     worker['sequence'] = 0
                 worker['sessionId'] = self._clean_text(raw_worker.get('sessionId'), 160)
@@ -523,11 +527,25 @@ class RuntimeMonitor:
 
     def _control_for_worker_locked(self, worker_id: str) -> dict:
         worker = self._workers[worker_id]
+        account_id = worker.get('accountId') or ''
+        account = {
+            'accountId': account_id,
+            **deepcopy(self._account_policies.get(account_id, {})),
+        }
+        safety = deepcopy(self._safety)
+        plan = deepcopy(self._plan)
+        failures = max(0, int((self._clients.get(worker_id) or {}).get('consecutiveFailures') or 0))
         return {
             'epoch': self._control_epoch,
             'revision': worker['revision'],
             'operationId': worker.get('operationId'),
             'desiredState': worker['desiredState'],
+            'scriptApiVersion': int(worker.get('scriptApiVersion') or 0),
+            'consecutiveFailures': failures,
+            'safety': safety,
+            'plan': plan,
+            'account': account,
+            'policy': {**safety, **plan, **account, 'consecutiveFailures': failures},
         }
 
     def _refresh_client_liveness_locked(self, worker_id: str) -> None:
@@ -700,6 +718,14 @@ class RuntimeMonitor:
             raise ValueError('invalid_protocol_version') from error
         if protocol_version < 0:
             raise ValueError('invalid_protocol_version')
+        if protocol_version != CONTROL_PROTOCOL_VERSION:
+            raise ValueError('unsupported_protocol_version')
+        try:
+            script_api_version = int(payload.get('scriptApiVersion') or 0)
+        except (TypeError, ValueError) as error:
+            raise ValueError('invalid_script_api_version') from error
+        if script_api_version != SCRIPT_API_VERSION:
+            raise ValueError('unsupported_script_api_version')
         if protocol_version >= CONTROL_PROTOCOL_VERSION:
             session_id = self._clean_text(payload.get('sessionId'), 160)
             if not session_id:
@@ -722,6 +748,7 @@ class RuntimeMonitor:
             'accountId': self._clean_text(payload.get('accountId') or '未命名账号', 120),
             'alias': self._clean_text(payload.get('alias'), 120),
             'scriptVersion': self._clean_text(payload.get('scriptVersion') or 'unknown', 80),
+            'scriptApiVersion': script_api_version,
             'role': self._clean_text(payload.get('role') or 'unknown', 40),
             'state': self._clean_text(payload.get('state') or 'online', 40),
             'executionState': execution_state,
@@ -769,6 +796,7 @@ class RuntimeMonitor:
                     'alias': safe_client['alias'],
                     'role': safe_client['role'],
                     'scriptVersion': safe_client['scriptVersion'],
+                    'scriptApiVersion': script_api_version,
                     'registeredAt': safe_client['lastSeen'],
                     'updatedAt': safe_client['lastSeen'],
                     'desiredState': 'stopped',
@@ -809,7 +837,7 @@ class RuntimeMonitor:
                         'updatedAt': safe_client['lastSeen'],
                     })
                 workers_changed = True
-            for field in ('accountId', 'alias', 'role', 'scriptVersion'):
+            for field in ('accountId', 'alias', 'role', 'scriptVersion', 'scriptApiVersion'):
                 if worker.get(field) != safe_client[field]:
                     worker[field] = safe_client[field]
                     worker['updatedAt'] = safe_client['lastSeen']
@@ -817,6 +845,7 @@ class RuntimeMonitor:
             if protocol_version >= CONTROL_PROTOCOL_VERSION:
                 session_values = {
                     'protocolVersion': protocol_version,
+                    'scriptApiVersion': script_api_version,
                     'sessionId': session_id,
                     'sessionEpoch': session_epoch,
                     'sequence': sequence,
@@ -1331,11 +1360,19 @@ class RuntimeMonitor:
     def effective_control(self, worker_id: str, account_id: str) -> dict:
         """合并全局与账号策略，返回工作器当前应采用的只读控制快照。"""
         with self._condition:
-            account = deepcopy(self._account_policies.get(account_id, {}))
+            account = {
+                'accountId': account_id,
+                **deepcopy(self._account_policies.get(account_id, {})),
+            }
+            safety = deepcopy(self._safety)
+            plan = deepcopy(self._plan)
+            failures = max(0, int((self._clients.get(worker_id) or {}).get('consecutiveFailures') or 0))
             return {
-                'safety': deepcopy(self._safety),
-                'plan': deepcopy(self._plan),
+                'safety': safety,
+                'plan': plan,
                 'account': account,
+                'policy': {**safety, **plan, **account, 'consecutiveFailures': failures},
+                'consecutiveFailures': failures,
                 'shouldPause': bool(self._safety['globalPaused'] or account.get('paused')),
                 'workerId': worker_id,
             }

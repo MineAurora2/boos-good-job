@@ -92,8 +92,7 @@ def validate_config(config: dict) -> None:
     for key in ('antiDetectionEnabled', 'shuffleJobOrder'):
         if not isinstance(frontend.get(key), bool):
             raise ValueError(f'{key} 必须是开关值')
-    for key in ('randomSkipRatio', 'randomNoIntroduceRatio'):
-        _validate_number(frontend, key, 0, 100)
+    _validate_number(frontend, 'randomSkipRatio', 0, 100)
     for key in (
         'randomDelayMinMs',
         'randomDelayMaxMs',
@@ -189,6 +188,7 @@ def save_config(payload: dict) -> dict:
     # 旧版前端可能不提交新增的防检测字段，用默认值补齐后再校验，避免误判为缺字段。
     if isinstance(merged.get('frontend'), dict):
         merged['frontend'].pop('manualFilterWaitMs', None)
+        merged['frontend'].pop('randomNoIntroduceRatio', None)
         legacy_hr_level = merged['frontend'].get('hrActiveMinLevel')
         if (
             ('hrActiveLevels' not in merged['frontend'] or merged['frontend'].get('hrActiveLevels') is None)

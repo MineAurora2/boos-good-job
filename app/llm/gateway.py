@@ -413,7 +413,14 @@ class LLMGateway:
         attempt_observer: Callable | None = None,
     ) -> dict:
         """返回聊天补全结果，并合并同一事件循环中的相同在途请求。"""
-        cache_ttl = self._float(config, 'cache_ttl_seconds', 1800)
+        # Job-filter responses are parsed by the domain layer. Caching a
+        # syntactically successful but malformed response here would make the
+        # format-correction path replay the same bad payload indefinitely.
+        cache_ttl = (
+            0.0
+            if str(purpose or '').startswith('job_filter')
+            else self._float(config, 'cache_ttl_seconds', 1800)
+        )
         cache_key = self._cache_key(config, payload, purpose)
         cached = self._get_cached(cache_key, cache_ttl)
         if cached is not None:

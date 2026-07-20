@@ -346,14 +346,16 @@ async def generate_custom_introduce(
         return result(Config.introduce, False, str(error))
 
 
-async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, str]:
-    """调用 LLM 判断岗位是否适合求职者，返回是否通过及原因。"""
-    if not LLM_MANAGER.job_filter_enabled or not LLM_MANAGER.available():
-        return True, '未启用AI筛选'
+async def strict_llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, str, bool]:
+    """Return a fail-closed verdict and whether it is reliable enough to cache."""
+    if not LLM_MANAGER.job_filter_enabled:
+        return True, '未启用AI筛选', False
+    if not LLM_MANAGER.available():
+        return False, 'ai_unavailable', False
 
     resume = load_resume()
     if not resume:
-        return True, '无简历'
+        return False, 'missing_resume', False
 
     prompt = prompts.JOB_FILTER.format(
         resume=resume,
@@ -381,6 +383,14 @@ async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, st
         finish_reason = str(choice.get('finish_reason') or '')
         return content, reasoning, finish_reason
 
+    def reliable_verdict(content: str, finish_reason: str) -> tuple[bool | None, str]:
+        passed, reason = _parse_job_filter_response(content)
+        if finish_reason.strip().lower() not in {'stop', 'end_turn'}:
+            return None, ''
+        if passed is not None and reason == 'AI未提供理由':
+            return None, ''
+        return passed, reason
+
     log_title = re.sub(r'\s+', ' ', str(title or '')).strip()[:80] or '未命名岗位'
 
     try:
@@ -397,7 +407,7 @@ async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, st
             passed, reason = None, ''
         else:
             content, reasoning, finish_reason = extract_filter_response(data)
-            passed, reason = _parse_job_filter_response(content)
+            passed, reason = reliable_verdict(content, finish_reason)
 
         if passed is None:
             print(
@@ -427,31 +437,42 @@ async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, st
                 if not _is_empty_llm_response_error(error):
                     raise
                 print(
-                    f'[LLM] 岗位筛选重试仍为空，默认通过: title={log_title} | '
+                    f'[LLM] 岗位筛选重试仍为空，拒绝当前岗位: title={log_title} | '
                     'finish_reason=unknown | content=无 | reasoning=无',
                     flush=True,
                 )
-                return True, 'AI响应格式不明确，默认通过'
+                return False, 'ai_unreliable_format', False
             content, reasoning, finish_reason = extract_filter_response(data)
-            passed, reason = _parse_job_filter_response(content)
+            passed, reason = reliable_verdict(content, finish_reason)
 
         if passed is None:
             print(
-                f'[LLM] 岗位筛选响应仍不明确，默认通过: title={log_title} | '
+                f'[LLM] 岗位筛选响应仍不明确，拒绝当前岗位: title={log_title} | '
                 f'finish_reason={finish_reason or "unknown"} | '
                 f'content={"有" if content else "无"} | reasoning={"有" if reasoning else "无"}',
                 flush=True,
             )
-            return True, 'AI响应格式不明确，默认通过'
+            return False, 'ai_unreliable_format', False
 
         print(
             f'[LLM] 岗位筛选: {title} → {"通过" if passed else "不通过"} | 原因: {reason}',
             flush=True,
         )
-        return passed, reason
+        return passed, reason, True
     except Exception as error:
-        _log_llm_fallback('岗位筛选', error, '默认通过')
-        return True, f'筛选异常: {str(error)[:200]}'
+        _log_llm_fallback('岗位筛选', error, '拒绝当前岗位')
+        return False, f'ai_transport_failure: {str(error)[:200]}', False
 
 
-__all__ = ['generate_custom_introduce', 'llm_job_filter', 'load_resume']
+async def llm_job_filter(title: str, salary: str, detail: str) -> tuple[bool, str]:
+    """Compatibility wrapper retaining the old two-value return shape."""
+    passed, reason, _reliable = await strict_llm_job_filter(title, salary, detail)
+    return passed, reason
+
+
+__all__ = [
+    'generate_custom_introduce',
+    'llm_job_filter',
+    'strict_llm_job_filter',
+    'load_resume',
+]

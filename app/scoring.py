@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from app.config import Config
 
@@ -57,28 +58,43 @@ def parse_job_fields(job: str) -> tuple[str, str, str]:
     return title, salary, detail
 
 
-def _find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str, int]]:
-    """返回互不重叠的关键词及扣星值，优先保留更具体的长关键词。"""
-    normalized = text.lower()
-    candidates = []
-    for keyword, score in keyword_scores.items():
-        needle = keyword.lower()
-        start = normalized.find(needle)
-        while needle and start >= 0:
-            candidates.append((start, start + len(needle), keyword, score))
-            start = normalized.find(needle, start + 1)
+def _normalize_match_text(value: object) -> str:
+    """Normalize compatibility characters, case and whitespace for rule matching."""
+    normalized = unicodedata.normalize('NFKC', str(value or '')).casefold()
+    return re.sub(r'\s+', ' ', normalized).strip()
 
-    accepted = []
-    occupied = []
-    for start, end, keyword, score in sorted(
-        candidates,
-        key=lambda item: (-(item[1] - item[0]), item[0]),
-    ):
-        if any(start < used_end and end > used_start for used_start, used_end in occupied):
+
+def _keyword_span(text: str, keyword: str) -> tuple[int, int] | None:
+    if not keyword:
+        return None
+    # Keywords made entirely from ASCII words use boundaries so ``java`` does
+    # not match ``javascript``. Chinese and other scripts retain substring
+    # semantics, which is what users expect from compact job titles.
+    if keyword.isascii() and re.search(r'[a-z0-9]', keyword):
+        match = re.search(
+            rf'(?<![a-z0-9_]){re.escape(keyword)}(?![a-z0-9_])',
+            text,
+        )
+        return match.span() if match else None
+    start = text.find(keyword)
+    return (start, start + len(keyword)) if start >= 0 else None
+
+
+def _find_matches(text: str, keyword_scores: dict[str, int]) -> list[tuple[str, int]]:
+    """Return every distinct keyword deduction, at most once per field."""
+    normalized = _normalize_match_text(text)
+    candidates = []
+    seen_needles = set()
+    for keyword, score in keyword_scores.items():
+        needle = _normalize_match_text(keyword)
+        if not needle or needle in seen_needles:
             continue
-        occupied.append((start, end))
-        accepted.append((keyword, score))
-    return accepted
+        seen_needles.add(needle)
+        span = _keyword_span(normalized, needle)
+        if span:
+            candidates.append((*span, keyword, score))
+
+    return [(keyword, score) for _start, _end, keyword, score in candidates]
 
 
 def _unscored_result(title: str, salary: str, detail: str) -> dict:

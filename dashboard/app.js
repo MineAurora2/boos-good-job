@@ -55,6 +55,8 @@ const state = {
     scheduleDraft: null,
     scheduleSaving: false,
     scheduleFeedback: '',
+    deliveryPolicyDirty: false,
+    deliveryPolicySaving: false,
     accountLimitDrafts: new Map(),
     accountLimitPending: new Map(),
     expandedDecisions: new Set(),
@@ -78,7 +80,7 @@ const state = {
 const COLORS = ['var(--cyan)', 'var(--violet)', 'var(--orange)', 'var(--green)', 'var(--red)', 'var(--blue)'];
 const STATUS_LABELS = { sent: '已投递', queued: '进行中', reserved: '待发送', duplicate: '重复投递', failed_unknown: '异常' };
 const HR_ACTIVE_LABELS = { online: '当前在线', just_now: '刚刚活跃', today: '今日活跃', within_3_days: '3 日内活跃', this_week: '本周活跃', within_2_weeks: '2 周内活跃', this_month: '本月活跃', within_2_months: '2 月内活跃', within_3_months: '3 月内活跃', within_4_months: '4 月内活跃', within_5_months: '5 月内活跃', within_half_year: '近半年活跃', half_year_ago: '半年前活跃', unknown: '未知' };
-const DECISION_STATE_LABELS = { evaluating: '正在评估', hr_filtered: 'HR 活跃未达标', below_threshold: '低于投递阈值', ai_rejected: 'AI 未通过', random_skipped: '随机跳过', claiming: '正在领取投递权', queued: '等待投递', sent: '已投递', duplicate: '重复投递', failed: '处理失败' };
+const DECISION_STATE_LABELS = { evaluating: '正在评估', invalid_fields: '字段不完整', hr_filtered: 'HR 活跃未达标', below_threshold: '低于投递阈值', quota_rejected: '额度门禁未通过', policy_blocked: '运行策略已阻止', claim_rejected: '投递权领取失败', gate_rejected: '资格门禁未通过', ai_rejected: 'AI 未通过', random_skipped: '随机跳过', claiming: '正在领取投递权', queued: '等待投递', sent: '已投递', duplicate: '重复投递', failed: '处理失败' };
 const GREETING_MODE_LABELS = { none: '仅立即沟通', fixed: '固定招呼语', llm: 'AI 招呼语' };
 const LOG_SENDER_LABELS = { system: '系统', delivery: '投递', claim: '领取投递', queue: '投递等待' };
 const LOG_VERBOSITY_RANK = { concise: 0, normal: 1, detailed: 2 };
@@ -93,6 +95,14 @@ const CONTROL_DELIVERY_POLL_INTERVAL_MS = 150;
 const CONTROL_DELIVERY_TIMEOUT_MS = 6000;
 const LLM_USAGE_POLL_INTERVAL_MS = 30000;
 const TODAY_TARGET_FALLBACK = 20;
+const DELIVERY_STAGES = ['detail', 'duplicate', 'rules', 'hr', 'random', 'qualified', 'claim', 'ai', 'queued', 'sent'];
+const DELIVERY_STAGE_BY_STATE = {
+    detail: 'detail', invalid_fields: 'detail', evaluating: 'rules', below_threshold: 'rules', duplicate: 'duplicate',
+    hr_filtered: 'hr', random_skipped: 'random', qualified: 'qualified', claiming: 'claim',
+    quota_rejected: 'qualified', policy_blocked: 'qualified', gate_rejected: 'qualified', claim_rejected: 'claim',
+    ai_passed: 'ai', ai_rejected: 'ai', queued: 'queued', sent: 'sent', failed: 'queued',
+    failed_unknown: 'queued',
+};
 const GEOMETRY_PATH_CACHE = new WeakMap();
 const MAP_MAX_SCALE = 20;
 const CITY_DETAIL_ENTER_SCALE = 2.7;
@@ -1802,6 +1812,9 @@ function normalizedControlState() {
     return {
         global,
         task,
+        safety: data.safety || global,
+        plan: data.plan || task,
+        policy: data.policy || {},
         instances,
         registeredWorkerCount: Number(data.registeredWorkerCount ?? data.registeredClientCount ?? instances.length),
         connectedClientCount: Number(data.connectedClientCount ?? data.activeClientCount ?? instances.filter((item) => item.online !== false).length),
@@ -2279,9 +2292,116 @@ function renderControlInstances(instances, accounts) {
     });
 }
 
+function currentDeliveryStage(instances) {
+    let stage = '';
+    let stageIndex = -1;
+    instances.filter((item) => item.online !== false).forEach((item) => {
+        const decisionState = String(item.currentDecision?.decisionState || item.state || '').trim();
+        const candidate = DELIVERY_STAGE_BY_STATE[decisionState] || '';
+        const candidateIndex = DELIVERY_STAGES.indexOf(candidate);
+        if (candidateIndex > stageIndex) {
+            stage = candidate;
+            stageIndex = candidateIndex;
+        }
+    });
+    return stage;
+}
+
+function renderDeliveryPolicy(data = normalizedControlState()) {
+    const card = $('#deliveryGateCard');
+    if (!card) return;
+    const incompatible = data.instances.filter((item) => item.online !== false).filter((item) => (
+        Number(item.protocolVersion || 0) !== 2 || Number(item.scriptApiVersion || 0) !== 2
+    ));
+    const badge = $('#deliveryProtocolBadge');
+    badge.dataset.state = incompatible.length ? 'warning' : 'ready';
+    badge.textContent = incompatible.length ? `V2 协议 · ${incompatible.length} 个旧脚本` : '协议 V2';
+
+    const activeStage = currentDeliveryStage(data.instances);
+    const activeIndex = DELIVERY_STAGES.indexOf(activeStage);
+    $$('#deliveryStageList [data-delivery-stage]').forEach((item) => {
+        const index = DELIVERY_STAGES.indexOf(item.dataset.deliveryStage);
+        item.classList.toggle('is-current', index === activeIndex);
+        item.classList.toggle('is-complete', activeIndex >= 0 && index < activeIndex);
+    });
+
+    if (!state.deliveryPolicyDirty) {
+        $$('[data-delivery-safety]').forEach((input) => {
+            input.checked = data.safety?.[input.dataset.deliverySafety] === true;
+        });
+        $$('[data-delivery-plan]').forEach((input) => {
+            const value = data.plan?.[input.dataset.deliveryPlan];
+            input.value = value == null ? '' : String(value);
+        });
+    }
+    card.classList.toggle('delivery-policy-dirty', state.deliveryPolicyDirty);
+    $('#saveDeliveryPolicy').disabled = state.deliveryPolicySaving || !state.deliveryPolicyDirty;
+    $('#saveDeliveryPolicy').setAttribute('aria-busy', String(state.deliveryPolicySaving));
+    $('#deliveryPolicyStatus').textContent = state.deliveryPolicySaving
+        ? '正在保存策略…'
+        : (state.deliveryPolicyDirty ? '有未保存修改' : '策略已同步');
+}
+
+function deliverySafetyPayload() {
+    const current = normalizedControlState().safety || {};
+    const payload = { ...current };
+    $$('[data-delivery-safety]').forEach((input) => {
+        payload[input.dataset.deliverySafety] = Boolean(input.checked);
+    });
+    return payload;
+}
+
+function deliveryPlanPayload() {
+    const current = normalizedControlState().plan || {};
+    const payload = { ...current };
+    const integerFields = new Set(['dailyTarget', 'hourlyLimit', 'maxConsecutiveFailures', 'minDelayMs', 'maxDelayMs']);
+    $$('[data-delivery-plan]').forEach((input) => {
+        const key = input.dataset.deliveryPlan;
+        payload[key] = integerFields.has(key)
+            ? Math.max(0, Number.parseInt(input.value, 10) || 0)
+            : String(input.value || '').trim();
+    });
+    if (payload.maxDelayMs < payload.minDelayMs) throw new Error('最长间隔不能小于最短间隔');
+    payload.schedule = current.schedule || normalizedControlState().schedule || SCHEDULE_DEFAULT;
+    return payload;
+}
+
+function markDeliveryPolicyDirty() {
+    state.deliveryPolicyDirty = true;
+    renderDeliveryPolicy();
+}
+
+async function saveDeliveryPolicy() {
+    if (state.deliveryPolicySaving) return;
+    let safety;
+    let plan;
+    try {
+        safety = deliverySafetyPayload();
+        plan = deliveryPlanPayload();
+    } catch (error) {
+        showToast(error.message);
+        return;
+    }
+    state.deliveryPolicySaving = true;
+    renderDeliveryPolicy();
+    try {
+        await apiJson('/api/control/safety', { method: 'PUT', body: JSON.stringify(safety) });
+        await apiJson('/api/control/plan', { method: 'PUT', body: JSON.stringify({ ...plan, applyNow: false }) });
+        state.deliveryPolicyDirty = false;
+        showToast('投递门禁策略已保存');
+        await loadControlState();
+    } catch (error) {
+        showToast(`保存失败：${error.message}`);
+    } finally {
+        state.deliveryPolicySaving = false;
+        renderDeliveryPolicy();
+    }
+}
+
 function renderControlCenter() {
     const data = normalizedControlState();
     renderGlobalLifecycle(data);
+    renderDeliveryPolicy(data);
     renderSchedulePanel(data);
     renderControlInstances(data.instances, data.accounts); renderControlMonitorCounts();
     renderDailyGoal();
@@ -2543,7 +2663,7 @@ const CONFIG_LABELS = {
     llm_greeting_enabled: '使用 LLM 生成打招呼语', scoring_enabled: '启用岗位扣星规则', introduce: '固定打招呼语', character: '回复风格', tags: '搜索关键词',
     backend: '后端参数', daily_greet_limit: '每日投递上限', delivery_db_path: '投递数据库文件',
     frontend: '浏览器脚本参数', resumeIndex: 'BOSS 发送简历序号', thread: '匹配阈值', timestampTimeout: '页面通信有效期（ms）', onlyGreet: '仅自动打招呼', roundRestartDelayMs: '轮次重启等待（ms）', maxEmptyRounds: '最大连续空轮', detailTimeout: '职位详情超时（ms）', greetTimeout: '打招呼超时（ms）', preloadScrollPixels: '预加载滚动距离（px）', preloadScrollWaitMs: '预加载滚动等待（ms）', preloadStableRoundsLimit: '预加载稳定轮数', preloadMaxRounds: '预加载最大轮数', preloadActivateCardEvery: '每隔几轮激活岗位卡', preloadActivateCardWaitMs: '激活岗位卡等待（ms）',
-    antiDetectionEnabled: '启用防检测随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomNoIntroduceRatio: '随机不带招呼语（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）', detailRandomDelayMinMs: '职位详情随机延时下限（ms）', detailRandomDelayMaxMs: '职位详情随机延时上限（ms）',
+    antiDetectionEnabled: '启用节奏随机化', shuffleJobOrder: '打乱岗位投递顺序', randomSkipRatio: '随机跳过达标岗位（%）', randomDelayMinMs: '投递随机延时下限（ms）', randomDelayMaxMs: '投递随机延时上限（ms）', detailRandomDelayMinMs: '职位详情随机延时下限（ms）', detailRandomDelayMaxMs: '职位详情随机延时上限（ms）',
     hrActiveFilterEnabled: '启用 HR 活跃筛选', hrActiveLevels: 'HR 活跃状态',
     scoring: '岗位扣星规则', title_deduction_keywords: '职位名称扣星词', detail_deduction_keywords: '职位描述扣星词'
 };
@@ -3446,6 +3566,9 @@ function bindEvents() {
         card.dataset[kind === 'key' ? 'keyDirty' : 'proxyDirty'] = '1'; input.value = ''; input.type = 'password'; input.placeholder = '保存后清除'; markLlmDirty(card);
     });
     $('#refreshControl').addEventListener('click', loadControlState);
+    $('#deliveryGateCard').addEventListener('input', markDeliveryPolicyDirty);
+    $('#deliveryGateCard').addEventListener('change', markDeliveryPolicyDirty);
+    $('#saveDeliveryPolicy').addEventListener('click', saveDeliveryPolicy);
     $('#controlSection').addEventListener('click', async (event) => {
         const decisionSummary = event.target.closest('summary.instance-decision-summary');
         if (decisionSummary) {
