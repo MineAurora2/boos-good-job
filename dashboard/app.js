@@ -1884,11 +1884,12 @@ function durationHoursFromDialAngle(startTime, angleDegrees) {
 }
 
 function adjustScheduleDurationByKey(currentHours, key) {
-    const current = Math.max(1, Math.min(24, Number.parseInt(currentHours, 10) || 1));
+    const parsed = Number.parseInt(currentHours, 10);
+    const current = Number.isInteger(parsed) && parsed > 0 ? Math.min(24, parsed) : 0;
     if (key === 'Home') return 1;
     if (key === 'End') return 24;
-    if (key === 'ArrowUp' || key === 'ArrowRight') return Math.min(24, current + 1);
-    if (key === 'ArrowDown' || key === 'ArrowLeft') return Math.max(1, current - 1);
+    if (key === 'ArrowUp' || key === 'ArrowRight') return current ? Math.min(24, current + 1) : 1;
+    if (key === 'ArrowDown' || key === 'ArrowLeft') return current ? Math.max(1, current - 1) : 1;
     return null;
 }
 
@@ -1988,9 +1989,19 @@ function scheduleDraftFromForm() {
     return { ...payload, durationHours: Math.max(0, Math.min(24, Number.parseInt(values.durationHours, 10) || 0)) };
 }
 
+function scheduleDraftStatus(schedule, hasDraft, saving) {
+    if (saving) return { tone: 'saving', text: '正在保存计划…', buttonLabel: '保存中…' };
+    if (!hasDraft) return { tone: 'synced', text: schedule.enabled ? '设置已同步' : '', buttonLabel: '保存并立即应用' };
+    if (!schedule.enabled) return { tone: 'closing', text: '计划将关闭，尚未保存', buttonLabel: '保存并立即应用' };
+    return { tone: 'dirty', text: '有未保存的更改', buttonLabel: '保存并立即应用' };
+}
+
 function clearScheduleErrors() {
     $$('.schedule-field-error').forEach((element) => { element.textContent = ''; });
-    $$('.schedule-field-invalid').forEach((element) => element.classList.remove('schedule-field-invalid'));
+    $$('#deliveryScheduleCard .schedule-field-invalid, #deliveryScheduleCard [aria-invalid="true"]').forEach((element) => {
+        element.classList.remove('schedule-field-invalid');
+        element.removeAttribute('aria-invalid');
+    });
 }
 
 function setScheduleConfigExpanded(expanded) {
@@ -2030,11 +2041,12 @@ function showScheduleValidationError(message) {
                 ? ['#scheduleWeekdaysError', '#scheduleWeekdays']
                 : message.includes('日期范围')
                     ? ['#scheduleDateRangeError', '#scheduleDateTrigger']
-                    : [null, '#scheduleMode'];
+                    : ['#scheduleModeError', '#scheduleModeSegments'];
     if (target[0]) $(target[0]).textContent = message;
     const control = $(target[1]);
     control?.classList.add('schedule-field-invalid');
     const focusTarget = control?.matches('button,[tabindex],input,select') ? control : control?.querySelector('button,input,[tabindex]');
+    (focusTarget || control)?.setAttribute('aria-invalid', 'true');
     focusTarget?.focus();
 }
 
@@ -2042,9 +2054,11 @@ function renderSchedulePanel(data = normalizedControlState()) {
     const card = $('#deliveryScheduleCard');
     if (!card) return;
     const schedule = state.scheduleDraft || data.schedule || SCHEDULE_DEFAULT;
+    const hasDraft = Boolean(state.scheduleDraft);
     const status = data.scheduleStatus || {};
     const setValue = (selector, value) => { const element = $(selector); if (element) element.value = value ?? ''; };
     const setChecked = (selector, value) => { const element = $(selector); if (element) element.checked = Boolean(value); };
+    const setText = (selector, value) => { const element = $(selector); if (element && element.textContent !== value) element.textContent = value; };
     const durationHours = schedule.durationHours === undefined
         ? durationHoursFromMinutes(schedule.durationMinutes)
         : Math.max(0, Math.min(24, Number(schedule.durationHours) || 0));
@@ -2067,15 +2081,22 @@ function renderSchedulePanel(data = normalizedControlState()) {
     $('#schedulePlanSummary').textContent = schedulePlanSummary(schedule, durationHours);
     renderScheduleDial(schedule.startTime, durationHours);
     const text = scheduleStatusLabel(status);
-    $('#scheduleStatusText').textContent = text;
+    setText('#scheduleStatusText', text);
     const statusNode = $('#scheduleStatus');
-    statusNode.querySelector('span').textContent = text;
+    const statusLabel = statusNode.querySelector('span');
+    if (statusLabel.textContent !== text) statusLabel.textContent = text;
     statusNode.classList.toggle('running', status.state === 'running');
     statusNode.classList.toggle('waiting', Boolean(status.enabled && status.state !== 'running'));
-    $('#scheduleFeedback').textContent = state.scheduleFeedback || '';
+    setText('#scheduleFeedback', state.scheduleFeedback || '');
+    const draftStatus = scheduleDraftStatus(schedule, hasDraft, state.scheduleSaving);
+    const draftState = $('#scheduleDraftState');
+    if (draftState) {
+        if (draftState.textContent !== draftStatus.text) draftState.textContent = draftStatus.text;
+        draftState.dataset.tone = draftStatus.tone;
+    }
     setScheduleConfigExpanded(schedule.enabled);
     const actions = $('.schedule-actions');
-    const showActions = Boolean(schedule.enabled || state.scheduleDraft);
+    const showActions = Boolean(schedule.enabled || hasDraft);
     if (actions) {
         if (!showActions && actions.contains(document.activeElement)) $('#scheduleEnabled')?.focus();
         actions.hidden = !showActions;
@@ -2083,9 +2104,15 @@ function renderSchedulePanel(data = normalizedControlState()) {
     }
     const button = $('#saveSchedule');
     if (button) {
+        button.textContent = draftStatus.buttonLabel;
         button.disabled = state.scheduleSaving;
         button.setAttribute('aria-busy', String(state.scheduleSaving));
     }
+    card.toggleAttribute('aria-busy', state.scheduleSaving);
+    card.querySelectorAll('button, input').forEach((control) => {
+        if (control === button) return;
+        control.disabled = state.scheduleSaving;
+    });
 }
 
 function scheduleFormValues() {
@@ -2119,6 +2146,7 @@ async function saveSchedule(applyNow) {
         state.scheduleDraft = null;
         state.scheduleFeedback = applyNow ? '计划已保存并立即应用' : '计划已保存';
         state.scheduleSaving = false;
+        renderSchedulePanel();
         await loadControlState();
         return result;
     } catch (error) {
@@ -2133,8 +2161,14 @@ function bindScheduleControls() {
     const card = $('#deliveryScheduleCard');
     if (!card || card.dataset.bound === '1') return;
     card.dataset.bound = '1';
-    const updateDraft = () => { state.scheduleDraft = scheduleDraftFromForm(); renderSchedulePanel(); };
+    const updateDraft = () => {
+        if (state.scheduleSaving) return;
+        state.scheduleDraft = scheduleDraftFromForm();
+        state.scheduleFeedback = '';
+        renderSchedulePanel();
+    };
     card.addEventListener('click', (event) => {
+        if (state.scheduleSaving) return;
         const modeButton = event.target.closest('[data-schedule-mode]');
         if (modeButton) {
             $('#scheduleMode').value = modeButton.dataset.scheduleMode;
@@ -2152,6 +2186,7 @@ function bindScheduleControls() {
         updateDraft();
     });
     const setDuration = (hours) => {
+        if (state.scheduleSaving) return;
         const input = $('#scheduleDurationHours');
         input.value = Math.max(1, Math.min(24, Number(hours) || 1));
         input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2166,16 +2201,18 @@ function bindScheduleControls() {
     };
     let draggingDial = false;
     dialSvg.addEventListener('pointerdown', (event) => {
+        if (state.scheduleSaving) return;
         draggingDial = true;
         dialSvg.setPointerCapture?.(event.pointerId);
         $('#scheduleDurationHandle').focus();
         durationFromPointer(event);
     });
-    dialSvg.addEventListener('pointermove', (event) => { if (draggingDial) durationFromPointer(event); });
+    dialSvg.addEventListener('pointermove', (event) => { if (draggingDial && !state.scheduleSaving) durationFromPointer(event); });
     const stopDragging = () => { draggingDial = false; };
     dialSvg.addEventListener('pointerup', stopDragging);
     dialSvg.addEventListener('pointercancel', stopDragging);
     $('#scheduleDurationHandle').addEventListener('keydown', (event) => {
+        if (state.scheduleSaving) return;
         const next = adjustScheduleDurationByKey($('#scheduleDurationHours').value, event.key);
         if (next === null) return;
         event.preventDefault();

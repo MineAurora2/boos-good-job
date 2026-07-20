@@ -91,6 +91,37 @@ test('schedule editor exposes one save-and-apply command', () => {
     assert.doesNotMatch(bindSource, /applySchedule/);
 });
 
+test('schedule command console keeps one master toggle and a flat workspace', () => {
+    const cardStart = htmlSource.indexOf('id="deliveryScheduleCard"');
+    const card = htmlSource.slice(cardStart, htmlSource.indexOf('</article>', cardStart));
+    assert.equal((card.match(/class="schedule-toggle"/g) || []).length, 1);
+    assert.match(card, /class="schedule-composer schedule-workspace"/);
+    assert.match(card, /class="schedule-setting-row"/);
+    assert.match(card, /id="scheduleDailyHint"[^>]*data-schedule-section="daily"/);
+    assert.match(card, /id="scheduleDraftState"/);
+    assert.doesNotMatch(card, /<details\b|scheduleDuration(?:Decrease|Increase)/);
+    assert.match(card, /id="scheduleTimeTrigger"[^>]*aria-describedby="scheduleStartTimeError"/);
+    assert.match(card, /id="scheduleDateTrigger"[^>]*aria-describedby="scheduleDateRangeError"/);
+    assert.match(card, /id="scheduleDurationHandle"[^>]*aria-describedby="scheduleDurationError"/);
+    assert.match(stylesSource, /\.schedule-duration-dial[^,{]*\{[^}]*width\s*:\s*min\(266px,\s*100%\)/);
+    assert.match(stylesSource, /\.schedule-settings[^,{]*\{[^}]*min-height\s*:\s*0/);
+});
+
+test('schedule draft status exposes synced, dirty, closing, and saving states', () => {
+    const source = extractFunction('scheduleDraftStatus');
+    const helper = evaluate(`${source}\n({ scheduleDraftStatus });`);
+    assert.equal(JSON.stringify(helper.scheduleDraftStatus({ enabled: false }, false, false)), JSON.stringify({ tone: 'synced', text: '', buttonLabel: '保存并立即应用' }));
+    assert.equal(JSON.stringify(helper.scheduleDraftStatus({ enabled: true }, true, false)), JSON.stringify({ tone: 'dirty', text: '有未保存的更改', buttonLabel: '保存并立即应用' }));
+    assert.equal(JSON.stringify(helper.scheduleDraftStatus({ enabled: false }, true, false)), JSON.stringify({ tone: 'closing', text: '计划将关闭，尚未保存', buttonLabel: '保存并立即应用' }));
+    assert.equal(JSON.stringify(helper.scheduleDraftStatus({ enabled: true }, true, true)), JSON.stringify({ tone: 'saving', text: '正在保存计划…', buttonLabel: '保存中…' }));
+    assert.match(appSource, /scheduleDraftState/);
+});
+
+test('schedule validation marks the focused control as invalid and clears it', () => {
+    assert.match(extractFunction('showScheduleValidationError'), /setAttribute\(['"]aria-invalid['"],\s*['"]true['"]\)/);
+    assert.match(extractFunction('clearScheduleErrors'), /removeAttribute\(['"]aria-invalid['"]\)/);
+});
+
 test('range trigger keeps equal date columns and positions its calendar icon independently', () => {
     assert.match(stylesSource, /\.schedule-range-trigger[^,{]*\{[^}]*position\s*:\s*relative/);
     assert.match(stylesSource, /\.schedule-range-trigger[^,{]*\{[^}]*grid-template-columns\s*:\s*(?:minmax\(0,\s*1fr\)|1fr)\s+24px\s+(?:minmax\(0,\s*1fr\)|1fr)/);
@@ -139,5 +170,6 @@ test('schedule helpers cover legacy values, cross-midnight arcs, keys, and rever
     assert.equal(helpers.scheduleWindowModel('23:30', 2).summary, '23:30 → 次日 01:30');
     assert.equal(helpers.durationHoursFromDialAngle('23:30', 22.5), 2);
     assert.equal(helpers.adjustScheduleDurationByKey(2, 'ArrowRight'), 3);
+    assert.equal(helpers.adjustScheduleDurationByKey(0, 'ArrowRight'), 1);
     assert.equal(JSON.stringify(helpers.normalizeDateRange('2026-07-24', '2026-07-20')), JSON.stringify(['2026-07-20', '2026-07-24']));
 });
