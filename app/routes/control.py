@@ -45,6 +45,54 @@ async def dashboard_styles():
     return FileResponse(STATE.dashboard_dir / 'styles.css', media_type='text/css')
 
 
+@router.api_route(
+    '/dashboard/assets/favicon.svg',
+    methods=['GET', 'HEAD'],
+    include_in_schema=False,
+)
+async def dashboard_favicon_svg():
+    return FileResponse(
+        STATE.dashboard_dir / 'assets' / 'favicon.svg',
+        media_type='image/svg+xml',
+    )
+
+
+@router.api_route(
+    '/dashboard/assets/favicon.ico',
+    methods=['GET', 'HEAD'],
+    include_in_schema=False,
+)
+async def dashboard_favicon_ico():
+    return FileResponse(
+        STATE.dashboard_dir / 'assets' / 'favicon.ico',
+        media_type='image/x-icon',
+    )
+
+
+@router.api_route(
+    '/dashboard/assets/favicon-32x32.png',
+    methods=['GET', 'HEAD'],
+    include_in_schema=False,
+)
+async def dashboard_favicon_32():
+    return FileResponse(
+        STATE.dashboard_dir / 'assets' / 'favicon-32x32.png',
+        media_type='image/png',
+    )
+
+
+@router.api_route(
+    '/dashboard/assets/favicon-16x16.png',
+    methods=['GET', 'HEAD'],
+    include_in_schema=False,
+)
+async def dashboard_favicon_16():
+    return FileResponse(
+        STATE.dashboard_dir / 'assets' / 'favicon-16x16.png',
+        media_type='image/png',
+    )
+
+
 @router.get('/dashboard/app.js', include_in_schema=False)
 async def dashboard_script():
     return FileResponse(STATE.dashboard_dir / 'app.js', media_type='application/javascript')

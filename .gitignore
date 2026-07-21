@@ -36,6 +36,7 @@ __pycache__/
 .venv/
 .idea/
 .codex/
+.superpowers/
 .codex-current-tests/
 .codex-test-temp/
 .test-tmp-codex/

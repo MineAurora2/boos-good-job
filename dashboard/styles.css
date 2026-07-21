@@ -92,18 +92,13 @@ button { color: inherit; }
 html[data-theme="light"] .sidebar { background: rgba(255,255,255,.94); box-shadow: 8px 0 30px rgba(46,72,87,.05); }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px 28px; }
 .brand-mark {
-    position: relative;
+    display: block;
+    flex: 0 0 auto;
     width: 38px;
     height: 38px;
-    border: 1px solid rgba(57, 215, 242, 0.35);
     border-radius: 11px;
-    background: linear-gradient(145deg, rgba(57, 215, 242, 0.17), rgba(57, 215, 242, 0.02));
-    box-shadow: inset 0 0 18px rgba(57, 215, 242, 0.08), 0 0 25px rgba(57, 215, 242, 0.08);
+    box-shadow: 0 0 25px rgba(57, 215, 242, 0.12);
 }
-.brand-mark span { position: absolute; display: block; width: 4px; border-radius: 5px; background: var(--cyan); bottom: 9px; box-shadow: 0 0 9px rgba(57, 215, 242, .6); }
-.brand-mark span:nth-child(1) { height: 9px; left: 9px; opacity: .55; }
-.brand-mark span:nth-child(2) { height: 17px; left: 17px; }
-.brand-mark span:nth-child(3) { height: 13px; left: 25px; opacity: .8; }
 .brand strong { display: block; font-size: 16px; letter-spacing: .07em; }
 .brand small { display: block; margin-top: 3px; color: var(--cyan); font-size: 9px; letter-spacing: .3em; }
 
