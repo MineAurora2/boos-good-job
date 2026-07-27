@@ -553,6 +553,20 @@ tbody tr:hover { background: rgba(57,215,242,.025); }
 .pagination button:disabled { opacity: .35; cursor: not-allowed; }
 footer { padding: 26px 5px 2px; color: #3e5663; font-size: 9px; text-align: center; }
 
+/* 公司屏蔽名单 */
+.blocklist-add-form { display: flex; align-items: flex-end; gap: 12px; padding: 14px 22px; border-bottom: 1px solid var(--line); background: var(--surface-2); flex-wrap: wrap; }
+.blocklist-add-form label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--text-soft); }
+.blocklist-add-form input { padding: 8px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--text); font-size: 12px; outline: none; min-width: 160px; }
+.blocklist-select-col { width: 42px; text-align: center; cursor: default; }
+.blocklist-detail { max-width: 280px; white-space: normal; word-break: break-word; color: var(--text-soft); }
+.blocklist-reason { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text-soft); }
+.blocklist-reason-below_threshold { color: #ffca7a; border-color: rgba(255,178,74,.28); background: rgba(255,178,74,.09); }
+.blocklist-reason-ai_rejected { color: #ff8b98; border-color: rgba(255,111,127,.25); background: rgba(255,111,127,.07); }
+.blocklist-reason-manual { color: var(--cyan); border-color: rgba(57,215,242,.28); background: rgba(57,215,242,.09); }
+.blocklist-unblock { padding: 6px 13px; border-radius: 8px; border: 1px solid rgba(255,111,127,.25); background: rgba(255,111,127,.07); color: #ff8b98; font-size: 11px; cursor: pointer; transition: all .15s; }
+.blocklist-unblock:hover { color: #ffd2d7; border-color: rgba(255,111,127,.48); background: rgba(255,111,127,.15); }
+#blocklistTable tbody td { cursor: default; }
+
 .admin-panel { margin-top: 14px; overflow: visible; }
 .admin-tabs { display: flex; gap: 5px; margin: 20px 0 16px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }.admin-tabs button { padding: 8px 13px; border: 0; border-radius: 7px; background: transparent; color: #657d89; font-size: 10px; }.admin-tabs button.active { background: rgba(57,215,242,.09); color: var(--cyan); }
 .admin-view { display: none; }.admin-view.active { display: block; }

@@ -14,6 +14,7 @@ from app import paths
 from app.config import Config
 from app.runtime import ACCOUNT_DAILY_LIMIT_MAX, ACCOUNT_DAILY_LIMIT_MIN, RUNTIME_MONITOR
 from app.security import is_lan_client_host
+from app.storage.blocklist_store import BlocklistStore
 from app.storage.delivery_store import DeliveryStore
 from app.storage.io import append_jsonl
 from app.storage.llm_usage_store import LLMUsageStore
@@ -36,6 +37,7 @@ class ApplicationState:
         self._startup_lock = threading.Lock()
         self._delivery_store: DeliveryStore | None = None
         self._llm_usage_store: LLMUsageStore | None = None
+        self._blocklist_store: BlocklistStore | None = None
 
     def startup(self) -> None:
         """Load configuration and initialize database resources once per path."""
@@ -52,6 +54,8 @@ class ApplicationState:
                 self._delivery_store.daily_limit = daily_limit
             if self._llm_usage_store is None or self._llm_usage_store.db_path != database_path:
                 self._llm_usage_store = LLMUsageStore(database_path)
+            if self._blocklist_store is None or self._blocklist_store.db_path != database_path:
+                self._blocklist_store = BlocklistStore(database_path)
 
             imported = self._delivery_store.import_legacy_once(
                 self.greeted_log_path,
@@ -82,6 +86,14 @@ class ApplicationState:
             self.startup()
         assert self._llm_usage_store is not None
         return self._llm_usage_store
+
+    @property
+    def blocklist_store(self) -> BlocklistStore:
+        """Return the company blocklist store sharing the configured delivery database."""
+        if self._blocklist_store is None:
+            self.startup()
+        assert self._blocklist_store is not None
+        return self._blocklist_store
 
     def record_job_decision(self, result: dict, raw_job: str, delay_ms: int) -> None:
         """Append one scoring decision and its rule deductions."""

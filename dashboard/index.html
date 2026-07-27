@@ -40,6 +40,10 @@
                 <button class="nav-item" data-scroll="applications">
                     <span class="nav-icon">▤</span><span>投递记录</span>
                 </button>
+                <button class="nav-item" data-scroll="blocklistSection">
+                    <span class="nav-icon">⊘</span><span>屏蔽名单</span>
+                    <span class="nav-count" id="navBlocklistCount">0</span>
+                </button>
                 <button class="nav-item" data-scroll="adminSection">
                     <span class="nav-icon">⚙</span><span>系统管理</span>
                 </button>
@@ -408,6 +412,57 @@
                 <div class="pagination">
                     <span id="pageInfo">第 1 页</span>
                     <div><button id="prevPage" aria-label="上一页">←</button><div id="pageNumbers"></div><button id="nextPage" aria-label="下一页">→</button></div>
+                </div>
+            </section>
+
+            <section id="blocklistSection" class="panel records-panel">
+                <div class="records-head">
+                    <div><span class="eyebrow">COMPANY BLOCKLIST</span><h2>公司屏蔽名单</h2><p id="blocklistSubtitle">共 0 条屏蔽记录</p></div>
+                    <div class="record-filters">
+                        <label class="search-box"><span>⌕</span><input id="blocklistSearch" type="search" placeholder="搜索公司或岗位"></label>
+                        <select id="blocklistReasonFilter" class="compact-select">
+                            <option value="">全部原因</option>
+                            <option value="below_threshold">评分不达标</option>
+                            <option value="ai_rejected">AI 筛选拒绝</option>
+                            <option value="manual">手动添加</option>
+                        </select>
+                        <button id="blocklistRefresh" class="icon-button" title="刷新屏蔽名单" aria-label="刷新屏蔽名单">↻</button>
+                    </div>
+                </div>
+                <div class="table-command-bar">
+                    <div class="selection-tools">
+                        <span id="blocklistSelectedCount">已选择 0 项</span>
+                        <button id="blocklistDeleteSelected" class="danger-action" disabled>解除所选</button>
+                        <button id="blocklistClearSelection" disabled>取消选择</button>
+                    </div>
+                    <div class="table-view-tools">
+                        <button id="blocklistAddButton" class="primary-action">手动添加屏蔽</button>
+                    </div>
+                </div>
+                <div class="blocklist-add-form" id="blocklistAddForm" hidden>
+                    <label><span>公司名称</span><input id="blocklistAddCompany" type="text" placeholder="必填"></label>
+                    <label><span>岗位名称</span><input id="blocklistAddTitle" type="text" placeholder="必填"></label>
+                    <label><span>备注</span><input id="blocklistAddNote" type="text" placeholder="选填"></label>
+                    <button id="blocklistAddSubmit" class="primary-action">加入屏蔽名单</button>
+                    <button id="blocklistAddCancel" class="reset-filter">取消</button>
+                </div>
+                <div class="table-wrap">
+                    <table id="blocklistTable">
+                        <thead>
+                            <tr>
+                                <th class="blocklist-select-col"><input type="checkbox" id="blocklistSelectAll" aria-label="全选屏蔽记录"></th>
+                                <th>公司</th>
+                                <th>岗位</th>
+                                <th>屏蔽原因</th>
+                                <th>分数</th>
+                                <th>AI 理由 / 备注</th>
+                                <th>加入时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="blocklistBody"></tbody>
+                    </table>
+                    <div class="empty-state" id="blocklistEmptyState" hidden><span>⌕</span><strong>暂无屏蔽记录</strong><p>被评分或 AI 过滤的公司岗位会自动出现在这里</p></div>
                 </div>
             </section>
 

@@ -333,6 +333,46 @@ def check_greet(payload: dict = Body(..., description='公司名和职位名')):
     }
 
 
+@router.post('/blocklist/check', summary='检查公司与岗位是否已进入屏蔽名单')
+def check_blocklist(payload: dict = Body(..., description='公司名和职位名')):
+    company = (payload.get('company') or '').strip()
+    title = (payload.get('title') or '').strip()
+    status = STATE.blocklist_store.is_blocked(company, title)
+    if status.get('blocked'):
+        entry = status.get('entry') or {}
+        print(
+            f'[屏蔽预检] 命中屏蔽名单，评分前跳过（不解析、不调用 LLM） | '
+            f'company={company} | title={title} | reason={entry.get("reason", "")}',
+            flush=True,
+        )
+    return {
+        'blocked': status.get('blocked', False),
+        'company': company,
+        'title': title,
+        'entry': status.get('entry'),
+    }
+
+
+@router.post('/blocklist/add', summary='将被过滤的公司岗位写入屏蔽名单')
+def add_blocklist(payload: dict = Body(..., description='公司、岗位、屏蔽原因与评分信息')):
+    company = (payload.get('company') or '').strip()
+    title = (payload.get('title') or '').strip()
+    result = STATE.blocklist_store.block(
+        company=company,
+        title=title,
+        reason=payload.get('reason') or '',
+        score=payload.get('score'),
+        ai_reason=payload.get('aiReason') or '',
+    )
+    if result.get('success') and result.get('created'):
+        print(
+            f'[屏蔽名单] 自动拉黑被过滤公司岗位 | company={company} | title={title} | '
+            f'reason={result.get("reason")}',
+            flush=True,
+        )
+    return result
+
+
 @router.post('/log-greet', summary='记录已打招呼的岗位（兼容旧客户端）')
 def log_greet(payload: dict = Body(..., description='公司名和职位名')):
     return STATE.delivery_store.record_legacy_sent(

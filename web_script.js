@@ -721,6 +721,36 @@
                 return { unavailable: true, error };
             }
         },
+        // 评分前查询屏蔽名单：命中即可跳过，省去岗位解析与大模型调用。
+        // 服务不可用时返回 blocked=false，保持“宁可多评估、不误伤”的降级策略。
+        async blocklistCheck(api, company, title) {
+            runtimeLifecycle.guard();
+            try {
+                const result = await api.checkBlocklist(company, title);
+                runtimeLifecycle.guard();
+                return result;
+            } catch (error) {
+                if (isStopError(error)) throw error;
+                return { blocked: false, unavailable: true, error };
+            }
+        },
+        // 被关键词扣星或 AI 筛选过滤的公司岗位自动写入屏蔽名单；失败不影响主流程。
+        // HR 活跃未通过不在此拉黑：HR 活跃度会随时间变化，不应永久屏蔽。
+        async autoBlock(api, jobInfo, rulePassed, aiPassed, decision) {
+            const company = jobInfo?.company || '';
+            const title = jobInfo?.title || '';
+            if (!company || !title) return { success: false, reason: 'missing_company' };
+            // AI 拒绝优先记为 ai_rejected，其余（低于阈值/被丢弃）记为 below_threshold。
+            const reason = !aiPassed ? 'ai_rejected' : 'below_threshold';
+            const aiReason = !aiPassed ? (decision?.aiReason || 'AI 判断未通过') : '';
+            runtimeLifecycle.guard();
+            try {
+                return await api.addBlocklist(company, title, reason, decision?.score ?? null, aiReason);
+            } catch (error) {
+                if (isStopError(error)) throw error;
+                return { success: false, error };
+            }
+        },
         async claim(api, identity, job, jobUrl) {
             runtimeLifecycle.guard();
             try {
@@ -1482,6 +1512,20 @@
 
         checkDelivery(company, title) {
             return this.__http('/check-greet', 'POST', JSON.stringify({ company, title }));
+        }
+
+        checkBlocklist(company, title) {
+            return this.__http('/blocklist/check', 'POST', JSON.stringify({ company, title }));
+        }
+
+        addBlocklist(company, title, reason, score = null, aiReason = '') {
+            return this.__http('/blocklist/add', 'POST', JSON.stringify({
+                company,
+                title,
+                reason,
+                score,
+                aiReason,
+            }));
         }
 
         setDesiredState(workerId, desiredState) {
@@ -3382,6 +3426,33 @@
                         });
                         return loop();
                     }
+                    // 评分前先查屏蔽名单：命中则跳过解析与 LLM 调用，直接进入下一个岗位。
+                    const blockCheck = await deliveryFlow.blocklistCheck(api, jobInfo.company, jobInfo.title);
+                    if (blockCheck.blocked) {
+                        const blockEntry = blockCheck.entry || {};
+                        const blockMessage = `公司 [${jobInfo.company}] + 岗位 [${jobInfo.title}] 在屏蔽名单中，评分前跳过`;
+                        logger.add(blockMessage, { sender: 'delivery', verbosity: 'normal', level: 'warning' });
+                        console.log(`[goodJobs] ${blockMessage}`, blockEntry);
+                        await logAction({
+                            action: 'company_blocklist_skipped',
+                            scene: 'search',
+                            title: jobInfo.title,
+                            company: jobInfo.company,
+                            jobUrl: href,
+                            salary: jobInfo.salary,
+                            location: jobInfo.location,
+                            city: jobInfo.city,
+                            industry: jobInfo.industry,
+                            experience: jobInfo.experience,
+                            education: jobInfo.education,
+                            keyword: currentKeyword,
+                            reason: blockEntry.reason || '',
+                            aiReason: blockEntry.ai_reason || '',
+                            accountId: identity.accountId,
+                            workerId: identity.workerId,
+                        });
+                        return loop();
+                    }
                     // 否则发送消息计算匹配度
                     logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
                     runtime.state = 'evaluating';
@@ -3745,6 +3816,8 @@
                             hrActiveLevel: jobInfo.hrActiveLevel,
                             ...(aiPassed ? {} : { aiReason: decision.aiReason || 'AI 判断未通过' }),
                         });
+                        // 被关键词扣星或 AI 筛选过滤的公司岗位自动加入屏蔽名单，下次评分前直接跳过。
+                        await deliveryFlow.autoBlock(api, jobInfo, rulePassed, aiPassed, decision);
                         loop();
                     }
                 } catch (e) {

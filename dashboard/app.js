@@ -60,6 +60,7 @@ const state = {
     expandedDecisions: new Set(),
     llm: null,
     llmDirty: false,
+    blocklist: { entries: [], search: '', reason: '', selected: new Set() },
     llmUsage: {
         days: 7,
         data: null,
@@ -85,6 +86,7 @@ const LOG_VERBOSITY_RANK = { concise: 0, normal: 1, detailed: 2 };
 const DESIRED_STATE_LABELS = { running: '运行', paused: '暂停', stopped: '结束' };
 const EXECUTION_STATE_LABELS = { starting: '启动中', running: '运行中', pausing: '暂停中', paused: '已暂停', stopping: '结束中', stopped: '已结束', error: '异常' };
 const SYNC_STATE_LABELS = { pending: '等待同步', applying: '正在应用', synced: '已同步', failed: '同步失败' };
+const BLOCKLIST_REASON_LABELS = { below_threshold: '评分不达标', ai_rejected: 'AI 筛选拒绝', manual: '手动添加' };
 const ACCOUNT_DAILY_LIMIT_MIN = 0;
 const ACCOUNT_DAILY_LIMIT_MAX = 150;
 const SCHEDULE_DEFAULT = { enabled: false, mode: 'daily', startTime: '', durationMinutes: 0, weekdays: [], dateStart: '', dateEnd: '' };
@@ -198,6 +200,14 @@ const CITY_COORDINATES = {
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+}
+
+function debounce(fn, delay = 200) {
+    let timer = null;
+    return (...args) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), delay);
+    };
 }
 
 function readAuthToken() {
@@ -3309,8 +3319,125 @@ function resetFilters() {
     $('#searchInput').value = ''; $('#statusFilter').value = 'all'; $('#cityFilter').value = 'all'; $('#experienceFilter').value = 'all'; $('#educationFilter').value = 'all'; $('#minSalaryFilter').value = ''; $('#maxSalaryFilter').value = ''; $('#keywordFilter').value = ''; updateDashboard();
 }
 
+function blocklistCellText(value, fallback = '') {
+    const text = String(value ?? '').trim();
+    return text || fallback;
+}
+
+function renderBlocklist() {
+    const body = $('#blocklistBody');
+    const empty = $('#blocklistEmptyState');
+    const entries = state.blocklist.entries || [];
+    $('#blocklistSubtitle').textContent = `共 ${entries.length} 条屏蔽记录`;
+    body.innerHTML = '';
+    empty.hidden = entries.length > 0;
+    for (const entry of entries) {
+        const key = String(entry.company_key || '');
+        const reasonLabel = BLOCKLIST_REASON_LABELS[entry.reason] || entry.reason || '';
+        const score = entry.score === null || entry.score === undefined ? '—' : entry.score;
+        const detail = blocklistCellText(entry.ai_reason) || blocklistCellText(entry.note) || '—';
+        const row = document.createElement('tr');
+        const checked = state.blocklist.selected.has(key) ? 'checked' : '';
+        row.innerHTML = `
+            <td class="blocklist-select-col"><input type="checkbox" data-blocklist-select="${escapeHtml(key)}" ${checked} aria-label="选择屏蔽记录"></td>
+            <td>${escapeHtml(blocklistCellText(entry.company, '未记录公司'))}</td>
+            <td>${escapeHtml(blocklistCellText(entry.title, '未记录岗位'))}</td>
+            <td><span class="blocklist-reason blocklist-reason-${escapeHtml(entry.reason || 'manual')}">${escapeHtml(reasonLabel)}</span></td>
+            <td>${escapeHtml(String(score))}</td>
+            <td class="blocklist-detail">${escapeHtml(detail)}</td>
+            <td>${escapeHtml(blocklistCellText(entry.created_at, '—'))}</td>
+            <td><button class="blocklist-unblock" data-blocklist-unblock="${escapeHtml(key)}">解除</button></td>
+        `;
+        body.appendChild(row);
+    }
+    const selectAll = $('#blocklistSelectAll');
+    if (selectAll) selectAll.checked = entries.length > 0 && entries.every((entry) => state.blocklist.selected.has(String(entry.company_key || '')));
+    updateBlocklistToolbar();
+}
+
+function updateBlocklistToolbar() {
+    const count = state.blocklist.selected.size;
+    $('#blocklistSelectedCount').textContent = `已选择 ${count} 项`;
+    $('#blocklistDeleteSelected').disabled = count === 0;
+    $('#blocklistClearSelection').disabled = count === 0;
+}
+
+async function loadBlocklist({ silent = false } = {}) {
+    const params = new URLSearchParams();
+    if (state.blocklist.search) params.set('keyword', state.blocklist.search);
+    if (state.blocklist.reason) params.set('reason', state.blocklist.reason);
+    const query = params.toString();
+    try {
+        const data = await apiJson(`/api/admin/blocklist${query ? `?${query}` : ''}`);
+        state.blocklist.entries = Array.isArray(data.entries) ? data.entries : [];
+        const existing = new Set(state.blocklist.entries.map((entry) => String(entry.company_key || '')));
+        state.blocklist.selected = new Set([...state.blocklist.selected].filter((key) => existing.has(key)));
+        renderBlocklist();
+    } catch (error) {
+        if (!silent) showToast(`无法读取屏蔽名单：${error.message}`);
+    }
+}
+
+async function unblockCompanies(keys) {
+    const companyKeys = [...new Set(keys)].filter(Boolean);
+    if (!companyKeys.length) return;
+    try {
+        const result = await apiJson('/api/admin/blocklist/delete', { method: 'POST', body: JSON.stringify({ companyKeys }) });
+        companyKeys.forEach((key) => state.blocklist.selected.delete(key));
+        await loadBlocklist({ silent: true });
+        showToast(`已解除 ${result.deleted || companyKeys.length} 条屏蔽`);
+    } catch (error) {
+        showToast(`解除屏蔽失败：${error.message}`);
+    }
+}
+
+async function submitManualBlock() {
+    const company = $('#blocklistAddCompany').value.trim();
+    const title = $('#blocklistAddTitle').value.trim();
+    const note = $('#blocklistAddNote').value.trim();
+    if (!company) return showToast('请填写公司名称');
+    if (!title) return showToast('请填写岗位名称');
+    try {
+        await apiJson('/api/admin/blocklist/add', { method: 'POST', body: JSON.stringify({ company, title, note }) });
+        $('#blocklistAddCompany').value = ''; $('#blocklistAddTitle').value = ''; $('#blocklistAddNote').value = '';
+        $('#blocklistAddForm').hidden = true;
+        await loadBlocklist({ silent: true });
+        showToast('已加入屏蔽名单');
+    } catch (error) {
+        showToast(`加入失败：${error.message}`);
+    }
+}
+
+function bindBlocklistEvents() {
+    $('#blocklistSearch').addEventListener('input', debounce((event) => { state.blocklist.search = event.target.value.trim(); loadBlocklist({ silent: true }); }, 250));
+    $('#blocklistReasonFilter').addEventListener('change', (event) => { state.blocklist.reason = event.target.value; loadBlocklist({ silent: true }); });
+    $('#blocklistRefresh').addEventListener('click', () => loadBlocklist());
+    $('#blocklistAddButton').addEventListener('click', () => { const form = $('#blocklistAddForm'); form.hidden = !form.hidden; if (!form.hidden) $('#blocklistAddCompany').focus(); });
+    $('#blocklistAddCancel').addEventListener('click', () => { $('#blocklistAddForm').hidden = true; });
+    $('#blocklistAddSubmit').addEventListener('click', submitManualBlock);
+    $('#blocklistDeleteSelected').addEventListener('click', () => unblockCompanies([...state.blocklist.selected]));
+    $('#blocklistClearSelection').addEventListener('click', () => { state.blocklist.selected.clear(); renderBlocklist(); });
+    $('#blocklistSelectAll').addEventListener('change', (event) => {
+        if (event.target.checked) state.blocklist.entries.forEach((entry) => state.blocklist.selected.add(String(entry.company_key || '')));
+        else state.blocklist.selected.clear();
+        renderBlocklist();
+    });
+    $('#blocklistBody').addEventListener('change', (event) => {
+        const key = event.target.dataset.blocklistSelect; if (!key) return;
+        if (event.target.checked) state.blocklist.selected.add(key); else state.blocklist.selected.delete(key);
+        updateBlocklistToolbar();
+        const selectAll = $('#blocklistSelectAll');
+        if (selectAll) selectAll.checked = state.blocklist.entries.length > 0 && state.blocklist.entries.every((entry) => state.blocklist.selected.has(String(entry.company_key || '')));
+    });
+    $('#blocklistBody').addEventListener('click', (event) => {
+        const button = event.target.closest('[data-blocklist-unblock]'); if (!button) return;
+        unblockCompanies([button.dataset.blocklistUnblock]);
+    });
+}
+
 function bindEvents() {
     bindScheduleControls();
+    bindBlocklistEvents();
     $$('#rangeSwitch button').forEach((button) => button.addEventListener('click', () => { $$('#rangeSwitch button').forEach((item) => item.classList.toggle('active', item === button)); state.range = button.dataset.range; state.page = 1; updateDashboard(); }));
     $('#searchInput').addEventListener('input', (event) => { state.search = event.target.value; state.page = 1; updateDashboard(); });
     $('#statusFilter').addEventListener('change', (event) => { state.status = event.target.value; state.page = 1; updateDashboard(); });
@@ -3530,6 +3657,7 @@ loadData({ silent: true });
 loadRuntime().then(connectRuntimeStream);
 loadControlState();
 loadAdmin();
+loadBlocklist({ silent: true });
 
 // 托管轮询：页面隐藏时暂停，避免切走标签页 / 锁屏后仍持续打接口。
 const POLLERS = [

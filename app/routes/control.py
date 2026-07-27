@@ -193,6 +193,51 @@ def admin_delete_deliveries(request: Request, payload: dict = Body(...)):
     }
 
 
+@router.get('/api/admin/blocklist', summary='读取公司岗位屏蔽名单')
+def admin_list_blocklist(
+    request: Request,
+    keyword: str = Query('', max_length=100),
+    reason: str = Query('', max_length=40),
+):
+    require_local_admin(request)
+    entries = STATE.blocklist_store.list_blocked(keyword=keyword, reason=reason)
+    return {'entries': entries, 'total': len(entries)}
+
+
+@router.post('/api/admin/blocklist/add', summary='手动将公司岗位加入屏蔽名单')
+def admin_add_blocklist(request: Request, payload: dict = Body(...)):
+    require_local_admin(request)
+    company = (payload.get('company') or '').strip()
+    title = (payload.get('title') or '').strip()
+    if not company:
+        raise HTTPException(status_code=400, detail='请填写公司名称')
+    if not title:
+        raise HTTPException(status_code=400, detail='请填写岗位名称')
+    result = STATE.blocklist_store.block(
+        company=company,
+        title=title,
+        reason='manual',
+        note=payload.get('note') or '',
+    )
+    if not result.get('success'):
+        raise HTTPException(status_code=400, detail='公司名称无有效字符，无法加入屏蔽名单')
+    RUNTIME_MONITOR.audit('blocklist_added', {'company': company, 'title': title})
+    return result
+
+
+@router.post('/api/admin/blocklist/delete', summary='解除公司岗位屏蔽')
+def admin_delete_blocklist(request: Request, payload: dict = Body(...)):
+    require_local_admin(request)
+    company_keys = {str(value).strip() for value in (payload.get('companyKeys') or []) if str(value).strip()}
+    if not company_keys:
+        raise HTTPException(status_code=400, detail='请选择需要解除屏蔽的记录')
+    if len(company_keys) > 500:
+        raise HTTPException(status_code=400, detail='单次最多解除 500 条屏蔽记录')
+    result = STATE.blocklist_store.unblock(company_keys=company_keys)
+    RUNTIME_MONITOR.audit('blocklist_deleted', {'count': result.get('deleted', 0)})
+    return {'success': True, 'deleted': result.get('deleted', 0)}
+
+
 @router.post('/api/runtime/heartbeat', summary='脚本运行心跳与日志批量上报')
 def runtime_heartbeat(payload: dict = Body(...)):
     try:
