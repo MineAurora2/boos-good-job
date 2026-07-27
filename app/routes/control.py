@@ -35,14 +35,23 @@ from app.storage.io import read_jsonl, replace_jsonl
 router = APIRouter()
 
 
+# 页面、样式与脚本随代码更新而变化；用 no-cache 强制浏览器每次带条件请求重新校验，
+# 避免改动后浏览器仍展示缓存的旧版仪表盘（曾导致新增功能看似“未生效”）。
+_NO_CACHE_HEADERS = {'Cache-Control': 'no-cache'}
+
+
 @router.get('/dashboard', include_in_schema=False)
 async def dashboard_page():
-    return FileResponse(STATE.dashboard_dir / 'index.html')
+    return FileResponse(STATE.dashboard_dir / 'index.html', headers=_NO_CACHE_HEADERS)
 
 
 @router.get('/dashboard/styles.css', include_in_schema=False)
 async def dashboard_styles():
-    return FileResponse(STATE.dashboard_dir / 'styles.css', media_type='text/css')
+    return FileResponse(
+        STATE.dashboard_dir / 'styles.css',
+        media_type='text/css',
+        headers=_NO_CACHE_HEADERS,
+    )
 
 
 @router.api_route(
@@ -95,7 +104,11 @@ async def dashboard_favicon_16():
 
 @router.get('/dashboard/app.js', include_in_schema=False)
 async def dashboard_script():
-    return FileResponse(STATE.dashboard_dir / 'app.js', media_type='application/javascript')
+    return FileResponse(
+        STATE.dashboard_dir / 'app.js',
+        media_type='application/javascript',
+        headers=_NO_CACHE_HEADERS,
+    )
 
 
 @router.get('/dashboard/vendor/echarts.min.js', include_in_schema=False)
