@@ -55,6 +55,9 @@ class ApplicationState:
             if self._llm_usage_store is None or self._llm_usage_store.db_path != database_path:
                 self._llm_usage_store = LLMUsageStore(database_path)
             if self._blocklist_store is None or self._blocklist_store.db_path != database_path:
+                # 屏蔽库持有常驻连接，切换数据库文件前先关闭旧连接释放文件句柄。
+                if self._blocklist_store is not None:
+                    self._blocklist_store.close()
                 self._blocklist_store = BlocklistStore(database_path)
 
             imported = self._delivery_store.import_legacy_once(
@@ -94,6 +97,12 @@ class ApplicationState:
             self.startup()
         assert self._blocklist_store is not None
         return self._blocklist_store
+
+    def close(self) -> None:
+        """关闭持有常驻连接的存储；进程退出或测试清理时调用。"""
+        with self._startup_lock:
+            if self._blocklist_store is not None:
+                self._blocklist_store.close()
 
     def record_job_decision(self, result: dict, raw_job: str, delay_ms: int) -> None:
         """Append one scoring decision and its rule deductions."""

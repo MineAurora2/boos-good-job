@@ -43,6 +43,7 @@ class BlocklistRouteTests(unittest.TestCase):
         self.delivery_state_patch.stop()
         self.control_state_patch.stop()
         self.monitor_patch.stop()
+        self.store.close()
         self._tempdir.cleanup()
 
     def test_check_reports_missing_then_present_after_add(self) -> None:

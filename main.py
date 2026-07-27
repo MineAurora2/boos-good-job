@@ -34,6 +34,7 @@ async def lifespan(_app: FastAPI):
             await shutdown_introduce_jobs()
         finally:
             LLM_MANAGER.set_usage_recorder(None)
+            STATE.close()
 
 
 def create_app() -> FastAPI:
