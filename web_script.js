@@ -1425,6 +1425,18 @@
         }
 
         /**
+         * AI 职位二次筛选。仅在 HR 活跃度与星级扣分全部通过后调用；
+         * 重复投递等场景不应调用本接口。
+         * @param {string} title 职位标题
+         * @param {string} salary 薪资范围
+         * @param {string} detail 职位描述
+         */
+        getAiFilter(title, salary, detail) {
+            const data = `# 职位名称\n${title}\n\n# 薪资范围\n${salary}\n\n# 职位描述\n${detail}`;
+            return this.__http('/ai-filter', 'POST', JSON.stringify(data));
+        }
+
+        /**
          * 所有投递条件通过后，生成最终发送给招聘者的招呼语
          */
         async generateIntroduce(claimToken, company, title, salary, detail) {
@@ -3453,14 +3465,37 @@
                         });
                         return loop();
                     }
-                    // 否则发送消息计算匹配度
+                    // 重复投递优先判定：命中即跳过，不使用 HR 活跃度、星级扣分、AI 等任何过滤器。
+                    const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
+                    if (duplicateCheck.unavailable) {
+                        logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
+                        return loop();
+                    }
+                    if (duplicateCheck.greeted) {
+                        const duplicateDecision = publishDuplicateDecision(jobInfo, duplicateCheck, href);
+                        const duplicateMessage = duplicateDecision.decisionReason;
+                        logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
+                        console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
+                        await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
+                        return loop();
+                    }
+                    // 正常投递：先做规则扣星评分，AI 筛选延后到 HR 活跃度与星级全部通过后再执行。
                     logger.add(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
                     runtime.state = 'evaluating';
                     runtime.phase = '岗位匹配评分';
                     const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
                     const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
-                    const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
                     const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                    let aiPassed = true;
+                    // AI 筛选：必须在 HR 活跃度与星级扣分都通过后才执行；任一未通过则跳过 AI，节省大模型调用。
+                    if (hrActivePassed && rulePassed) {
+                        runtime.phase = 'AI 二次筛选';
+                        const aiResult = await api.getAiFilter(jobInfo.title, jobInfo.salary, jobInfo.detail);
+                        decision.aiFilterEnabled = Boolean(aiResult.aiFilterEnabled);
+                        decision.aiPassed = aiResult.aiPassed ?? null;
+                        decision.aiReason = aiResult.aiReason || '';
+                        aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
+                    }
                     runtime.duplicateCard = null;
                     runtime.duplicateCardUntil = 0;
                     runtime.currentDecision = {
@@ -3560,19 +3595,6 @@
                                 hrActive: jobInfo.hrActive,
                                 hrActiveLevel: jobInfo.hrActiveLevel,
                             });
-                            return loop();
-                        }
-                        const duplicateCheck = await deliveryFlow.precheck(api, jobInfo.company, jobInfo.title);
-                        if (duplicateCheck.unavailable) {
-                            logger.add('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                            return loop();
-                        }
-                        if (duplicateCheck.greeted) {
-                            const duplicateDecision = publishDuplicateDecision(jobInfo, duplicateCheck, href);
-                            const duplicateMessage = duplicateDecision.decisionReason;
-                            logger.add(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                            console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                            await logAction(createDuplicateActionPayload('search', { ...jobInfo, jobUrl: href }, duplicateDecision, identity, currentKeyword));
                             return loop();
                         }
                         runtime.state = 'claiming';
@@ -4534,12 +4556,38 @@
                                     status(`职位 [${jobInfo.title}] 未识别公司，为避免重复投递已跳过`);
                                     continue;
                                 }
-                                // 获取职位匹配度
+                                // 重复投递优先判定：命中即跳过，不使用 HR 活跃度、星级扣分、AI 等任何过滤器。
+                                const dupPrecheck = await deliveryFlow.precheck(api, company, jobInfo.title);
+                                if (dupPrecheck.unavailable) {
+                                    status('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
+                                    continue;
+                                }
+                                if (dupPrecheck.greeted) {
+                                    const duplicateDecision = publishDuplicateDecision(
+                                        { ...jobInfo, company },
+                                        dupPrecheck,
+                                        { title: jobInfo.title || '', company },
+                                    );
+                                    const duplicateMessage = duplicateDecision.decisionReason;
+                                    status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
+                                    console.log(`[goodJobs] ${duplicateMessage}`, dupPrecheck.delivery || {});
+                                    await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
+                                    continue;
+                                }
+                                // 正常投递：先做规则扣星评分，AI 筛选延后到 HR 活跃度与星级全部通过后再执行。
                                 status(`开始计算职位 [${jobInfo.title}] 的匹配度`, { sender: 'delivery', verbosity: 'detailed' });
                                 const decision = await api.getJobScore(jobInfo.title, jobInfo.salary, jobInfo.detail);
                                 const hrActivePassed = hrActivePasses(jobInfo.hrActiveLevel);
-                                const aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
                                 const rulePassed = !decision.discarded && decision.score >= OPTIONS.thread;
+                                let aiPassed = true;
+                                // AI 筛选：必须在 HR 活跃度与星级扣分都通过后才执行；任一未通过则跳过 AI。
+                                if (hrActivePassed && rulePassed) {
+                                    const aiResult = await api.getAiFilter(jobInfo.title, jobInfo.salary, jobInfo.detail);
+                                    decision.aiFilterEnabled = Boolean(aiResult.aiFilterEnabled);
+                                    decision.aiPassed = aiResult.aiPassed ?? null;
+                                    decision.aiReason = aiResult.aiReason || '';
+                                    aiPassed = !decision.aiFilterEnabled || decision.aiPassed !== false;
+                                }
                                 const currentDecision = {
                                     workerId: identity.workerId,
                                     accountId: identity.accountId,
@@ -4601,23 +4649,6 @@
                                             score: decision.score, accountId: identity.accountId, workerId: identity.workerId,
                                             hrActive: jobInfo.hrActive, hrActiveLevel: jobInfo.hrActiveLevel,
                                         });
-                                        continue;
-                                    }
-                                    const duplicateCheck = await deliveryFlow.precheck(api, company, jobInfo.title);
-                                    if (duplicateCheck.unavailable) {
-                                        status('重复投递检查服务不可用，为安全起见已跳过本岗位', { sender: 'claim', verbosity: 'concise', level: 'error' });
-                                        continue;
-                                    }
-                                    if (duplicateCheck.greeted) {
-                                        const duplicateDecision = publishDuplicateDecision(
-                                            { ...jobInfo, company },
-                                            duplicateCheck,
-                                            currentDecision,
-                                        );
-                                        const duplicateMessage = duplicateDecision.decisionReason;
-                                        status(duplicateMessage, { sender: 'claim', verbosity: 'normal', level: 'warning' });
-                                        console.log(`[goodJobs] ${duplicateMessage}`, duplicateCheck.delivery || {});
-                                        await logAction(createDuplicateActionPayload('chat', { ...jobInfo, company }, duplicateDecision, identity));
                                         continue;
                                     }
                                     if (!await antiDetection.delay()) continue;

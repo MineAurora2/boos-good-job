@@ -11,7 +11,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 from app.state import STATE
 from app.config import Config
-from app.scoring import evaluate_job_match
+from app.scoring import evaluate_job_match, parse_job_fields
 from app.llm.manager import LLM_MANAGER
 from app.llm.tasks import generate_custom_introduce, llm_job_filter
 from app.storage.delivery_store import delivery_key
@@ -39,19 +39,12 @@ async def get_client_config():
     return Config.get_client_config()
 
 
-@router.post('/get-job-score', summary='获取职位匹配度')
+@router.post('/get-job-score', summary='获取职位匹配度（仅规则扣星，不含AI筛选）')
 async def get_job_score(job: str = Body(..., description='职位信息')):
+    # 仅做规则扣星评分。AI 筛选已拆分到 /ai-filter，由前端在 HR 活跃度与星级
+    # 全部通过后才调用，避免在重复投递或已被规则淘汰的岗位上浪费大模型调用。
     result = evaluate_job_match(job)
     title = result.get('title') or ''
-    salary = result.get('salary') or ''
-    detail = result.get('detail') or ''
-    use_ai_filter = LLM_MANAGER.available() and LLM_MANAGER.job_filter_enabled
-    ai_pass, ai_reason = await llm_job_filter(title, salary, detail)
-    if use_ai_filter:
-        STATE.record_ai_filter(title, salary, detail, result['score'], ai_pass, ai_reason)
-    if use_ai_filter and not ai_pass:
-        result['score'] = 0
-        result['reason'] = f'AI筛选不通过: {ai_reason}'
 
     display_title = title or '未识别标题'
     print(
@@ -74,9 +67,33 @@ async def get_job_score(job: str = Body(..., description='职位信息')):
         'introduce': Config.introduce,
         'introduceGenerated': False,
         'resumeIndex': Config.frontend.get('resumeIndex', 0),
-        'aiFilterEnabled': use_ai_filter,
-        'aiPassed': ai_pass if use_ai_filter else None,
-        'aiReason': ai_reason if use_ai_filter else '',
+        # AI 筛选结果不再随评分返回，保留占位字段兼容旧消费者。
+        'aiFilterEnabled': False,
+        'aiPassed': None,
+        'aiReason': '',
+    }
+
+
+@router.post('/ai-filter', summary='AI 职位二次筛选（HR活跃度与星级全部通过后调用）')
+async def ai_filter(job: str = Body(..., description='职位信息')):
+    # 前端只在“正常投递且 HR 活跃度、星级扣分全部符合”时才调用本接口；
+    # 重复投递等场景直接跳过，不会到达这里。
+    title, salary, detail = parse_job_fields(job)
+    use_ai_filter = LLM_MANAGER.available() and LLM_MANAGER.job_filter_enabled
+    if not use_ai_filter:
+        return {'aiFilterEnabled': False, 'aiPassed': None, 'aiReason': ''}
+
+    ai_pass, ai_reason = await llm_job_filter(title, salary, detail)
+    STATE.record_ai_filter(title, salary, detail, 0, ai_pass, ai_reason)
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] /ai-filter | "
+        f'title={title or "未识别标题"} | passed={ai_pass} | reason={ai_reason}',
+        flush=True,
+    )
+    return {
+        'aiFilterEnabled': True,
+        'aiPassed': ai_pass,
+        'aiReason': ai_reason,
     }
 
 
