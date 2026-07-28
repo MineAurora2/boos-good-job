@@ -1209,6 +1209,8 @@ class RuntimeMonitor:
             state = 'waiting'
         else:
             state = 'finished'
+        # 当前时段总时长供前端渲染进度环：已消耗比例 = (总时长 - 剩余) / 总时长。
+        window_seconds = int((window.end - window.start).total_seconds()) if window else 0
         return {
             'enabled': schedule['enabled'],
             'state': state,
@@ -1218,6 +1220,8 @@ class RuntimeMonitor:
             'currentEnd': window.end.isoformat(timespec='seconds') if window else None,
             'nextStart': next_start.isoformat(timespec='seconds') if next_start else None,
             'remainingSeconds': max(0, int((window.end - now).total_seconds())) if window else 0,
+            'windowSeconds': window_seconds,
+            'intervalCount': len(schedule['intervals']),
             'ownedCount': owned,
             'suppressedCount': suppressed,
             'lastAction': last_action,

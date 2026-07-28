@@ -55,6 +55,8 @@ const state = {
     scheduleDraft: null,
     scheduleSaving: false,
     scheduleFeedback: '',
+    scheduleIntervals: [],
+    scheduleCollapsed: false,
     accountLimitDrafts: new Map(),
     accountLimitPending: new Map(),
     expandedDecisions: new Set(),
@@ -89,8 +91,10 @@ const SYNC_STATE_LABELS = { pending: '等待同步', applying: '正在应用', s
 const BLOCKLIST_REASON_LABELS = { below_threshold: '评分不达标', ai_rejected: 'AI 筛选拒绝', manual: '手动添加' };
 const ACCOUNT_DAILY_LIMIT_MIN = 0;
 const ACCOUNT_DAILY_LIMIT_MAX = 150;
-const SCHEDULE_DEFAULT = { enabled: false, mode: 'daily', startTime: '', durationMinutes: 0, weekdays: [], dateStart: '', dateEnd: '' };
+const SCHEDULE_DEFAULT = { enabled: false, mode: 'daily', intervals: [], weekdays: [], dateStart: '', dateEnd: '' };
+const SCHEDULE_MAX_INTERVALS = 12;
 const SCHEDULE_MODES = new Set(['daily', 'weekly', 'weekdays', 'date_range']);
+const SCHEDULE_CARD_COLLAPSE_KEY = 'goodjobs.schedule.card.collapsed';
 const CONTROL_DELIVERY_POLL_INTERVAL_MS = 150;
 const CONTROL_DELIVERY_TIMEOUT_MS = 6000;
 const LLM_USAGE_POLL_INTERVAL_MS = 30000;
@@ -1462,37 +1466,91 @@ function initDatePicker() {
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); }); window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
 }
 
+// 时段时间选择器：面向动态时段行的开始/结束按钮，通过 state.scheduleTimeTarget 记录当前编辑目标。
 function initScheduleTimePicker() {
-    const trigger = $('#scheduleTimeTrigger');
-    if (!trigger) return;
-    const picker = document.createElement('div'); picker.id = 'scheduleTimePicker'; picker.className = 'gj-time-picker'; picker.hidden = true; picker.setAttribute('role', 'dialog'); picker.setAttribute('aria-label', '开始时间选择器');
+    const list = $('#scheduleIntervalList');
+    if (!list) return;
+    const picker = document.createElement('div'); picker.id = 'scheduleTimePicker'; picker.className = 'gj-time-picker'; picker.hidden = true; picker.setAttribute('role', 'dialog'); picker.setAttribute('aria-label', '时段时间选择器');
     const wheelButtons = (count, unit) => Array.from({ length: count }, (_, value) => `<button type="button" data-time-unit="${unit}" data-time-value="${String(value).padStart(2, '0')}">${String(value).padStart(2, '0')}</button>`).join('');
-    picker.innerHTML = `<div class="gj-time-head"><span>开始时间</span><strong>24 小时制</strong></div><div class="gj-time-wheels"><div><span>小时</span><div class="gj-time-wheel" data-time-wheel="hour">${wheelButtons(24, 'hour')}</div></div><i>:</i><div><span>分钟</span><div class="gj-time-wheel" data-time-wheel="minute">${wheelButtons(60, 'minute')}</div></div></div><div class="gj-time-foot"><button type="button" data-time-action="now">现在</button><div><button type="button" data-time-action="cancel">取消</button><button type="button" data-time-action="apply">确定</button></div></div>`;
+    picker.innerHTML = `<div class="gj-time-head"><span id="scheduleTimePickerTitle">选择时间</span><strong>24 小时制</strong></div><div class="gj-time-wheels"><div><span>小时</span><div class="gj-time-wheel" data-time-wheel="hour">${wheelButtons(24, 'hour')}</div></div><i>:</i><div><span>分钟</span><div class="gj-time-wheel" data-time-wheel="minute">${wheelButtons(60, 'minute')}</div></div></div><div class="gj-time-foot"><button type="button" data-time-action="now">现在</button><div><button type="button" data-time-action="cancel">取消</button><button type="button" data-time-action="apply">确定</button></div></div>`;
     document.body.appendChild(picker);
     let hour = '09', minute = '00';
-    const position = () => { if (picker.hidden) return; const rect = trigger.getBoundingClientRect(); const width = 300; let left = Math.min(rect.left, window.innerWidth - width - 12); let top = rect.bottom + 8; if (top + 350 > window.innerHeight) top = Math.max(12, rect.top - 350); picker.style.left = `${Math.max(12, left)}px`; picker.style.top = `${top}px`; };
+    let activeTrigger = null;
+    const targetButton = () => {
+        const target = state.scheduleTimeTarget;
+        if (!target) return null;
+        return list.querySelector(`[data-interval-field="${target.field}"][data-interval-index="${target.index}"]`);
+    };
+    const position = () => {
+        if (picker.hidden) return;
+        const anchor = activeTrigger || targetButton();
+        if (!anchor) return;
+        const rect = anchor.getBoundingClientRect();
+        const width = 300;
+        const left = Math.min(rect.left, window.innerWidth - width - 12);
+        let top = rect.bottom + 8;
+        if (top + 350 > window.innerHeight) top = Math.max(12, rect.top - 350);
+        picker.style.left = `${Math.max(12, left)}px`;
+        picker.style.top = `${top}px`;
+    };
     const render = (scroll = false) => {
         picker.querySelectorAll('[data-time-unit="hour"]').forEach((button) => button.classList.toggle('selected', button.dataset.timeValue === hour));
         picker.querySelectorAll('[data-time-unit="minute"]').forEach((button) => button.classList.toggle('selected', button.dataset.timeValue === minute));
         if (scroll) requestAnimationFrame(() => picker.querySelectorAll('.selected').forEach((button) => button.scrollIntoView({ block: 'center' })));
     };
-    const close = (restoreFocus = false) => { picker.hidden = true; trigger.setAttribute('aria-expanded', 'false'); if (restoreFocus) trigger.focus(); };
-    picker.addEventListener('schedule-picker-close', () => close(false));
-    const open = () => {
-        const current = /^([01]\d|2[0-3]):([0-5]\d)$/.exec($('#scheduleStartTime').value);
-        const now = new Date(); hour = current?.[1] || String(now.getHours()).padStart(2, '0'); minute = current?.[2] || String(now.getMinutes()).padStart(2, '0');
-        picker.hidden = false; trigger.setAttribute('aria-expanded', 'true'); render(true); position();
+    const close = (restoreFocus = false) => {
+        picker.hidden = true;
+        const trigger = activeTrigger;
+        activeTrigger = null;
+        state.scheduleTimeTarget = null;
+        if (trigger) trigger.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && trigger) trigger.focus();
     };
-    trigger.addEventListener('click', () => { if (picker.hidden) open(); else close(true); });
+    picker.addEventListener('schedule-picker-close', () => close(false));
+    const open = (button) => {
+        const index = Number(button.dataset.intervalIndex);
+        const field = button.dataset.intervalField;
+        state.scheduleTimeTarget = { index, field };
+        activeTrigger = button;
+        const intervals = scheduleIntervalsFromState();
+        const currentValue = intervals[index]?.[field] || '';
+        const current = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(currentValue);
+        const now = new Date();
+        hour = current?.[1] || (field === 'end' ? '18' : String(now.getHours()).padStart(2, '0'));
+        minute = current?.[2] || '00';
+        const title = $('#scheduleTimePickerTitle');
+        if (title) title.textContent = field === 'end' ? '结束时间' : '开始时间';
+        picker.hidden = false;
+        button.setAttribute('aria-expanded', 'true');
+        render(true);
+        position();
+    };
+    list.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-interval-field]');
+        if (!button) return;
+        if (!picker.hidden && activeTrigger === button) { close(true); return; }
+        open(button);
+    });
     picker.addEventListener('click', (event) => {
         const option = event.target.closest('[data-time-unit]');
         if (option) { if (option.dataset.timeUnit === 'hour') hour = option.dataset.timeValue; else minute = option.dataset.timeValue; render(); return; }
         const action = event.target.closest('[data-time-action]')?.dataset.timeAction;
         if (action === 'cancel') { close(true); return; }
         if (action === 'now') { const now = new Date(); hour = String(now.getHours()).padStart(2, '0'); minute = String(now.getMinutes()).padStart(2, '0'); render(true); return; }
-        if (action === 'apply') { $('#scheduleStartTime').value = `${hour}:${minute}`; $('#scheduleStartTime').dispatchEvent(new Event('change', { bubbles: true })); close(true); }
+        if (action === 'apply') {
+            const target = state.scheduleTimeTarget;
+            if (target) {
+                const intervals = scheduleIntervalsFromState();
+                if (intervals[target.index]) {
+                    intervals[target.index][target.field] = `${hour}:${minute}`;
+                    clearScheduleErrors();
+                    commitScheduleIntervals(intervals);
+                }
+            }
+            close(true);
+        }
     });
-    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !trigger.contains(event.target)) close(true); });
+    document.addEventListener('pointerdown', (event) => { if (!picker.hidden && !picker.contains(event.target) && !event.target.closest('[data-interval-field]')) close(true); });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && !picker.hidden) close(true); });
     window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
 }
@@ -1826,19 +1884,42 @@ function normalizedControlState() {
         timeline: (controlArray(data.timeline || data.events).length ? controlArray(data.timeline || data.events) : controlArray(runtime.events)).map((event) => { if (!event.payload) return event; const entry = eventMessage(event), type = entry.level === 'error' ? 'error' : (event.type?.includes('job') ? 'delivery' : event.type?.includes('deduct') ? 'deduction' : 'system'); return { ...entry, type }; }),
         audit: controlArray(data.audit || data.commands || data.commandHistory),
         health: data.health || data.services || {},
-        schedule: { enabled: false, mode: 'daily', startTime: '', durationMinutes: 0, weekdays: [], dateStart: '', dateEnd: '', ...(data.plan?.schedule || task.schedule || {}) },
+        schedule: { ...SCHEDULE_DEFAULT, ...(data.plan?.schedule || task.schedule || {}) },
         scheduleStatus: data.scheduleStatus || {},
     };
 }
 
+const SCHEDULE_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+function scheduleTimeToMinutes(value) {
+    if (String(value || '').trim() === '24:00') return 1440;
+    const match = SCHEDULE_TIME_PATTERN.exec(String(value || '').trim());
+    if (!match) return null;
+    return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function normalizeScheduleIntervals(rawIntervals) {
+    const parsed = (Array.isArray(rawIntervals) ? rawIntervals : [])
+        .map((interval) => ({
+            start: String(interval?.start || '').trim(),
+            end: String(interval?.end || '').trim(),
+        }))
+        .filter((interval) => interval.start || interval.end);
+    return parsed.sort((a, b) => {
+        const startA = scheduleTimeToMinutes(a.start);
+        const startB = scheduleTimeToMinutes(b.start);
+        if (startA === null) return 1;
+        if (startB === null) return -1;
+        return startA - startB;
+    });
+}
+
 function schedulePayloadFromValues(values) {
-    const durationHours = Math.max(0, Math.min(24, Number.parseInt(values.durationHours, 10) || 0));
     const weekdays = [...new Set((Array.isArray(values.weekdays) ? values.weekdays : []).map((day) => Number(day)).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))].sort((a, b) => a - b);
     return {
         enabled: Boolean(values.enabled),
         mode: String(values.mode || 'daily'),
-        startTime: String(values.startTime || '').trim(),
-        durationMinutes: durationHours * 60,
+        intervals: normalizeScheduleIntervals(values.intervals),
         weekdays,
         dateStart: String(values.dateStart || '').trim(),
         dateEnd: String(values.dateEnd || '').trim(),
@@ -1848,58 +1929,34 @@ function schedulePayloadFromValues(values) {
 function validateSchedulePayload(schedule) {
     if (!['daily', 'weekly', 'weekdays', 'date_range'].includes(schedule.mode)) return '请选择有效的周期';
     if (!schedule.enabled) return '';
-    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(schedule.startTime)) return '请输入有效的开始时间';
-    if (!Number.isInteger(schedule.durationMinutes) || schedule.durationMinutes < 60 || schedule.durationMinutes > 1440 || schedule.durationMinutes % 60 !== 0) return '持续时长请选择 1 至 24 小时';
+    const intervals = Array.isArray(schedule.intervals) ? schedule.intervals : [];
+    if (!intervals.length) return '请至少添加一个投递时段';
+    let previousEnd = -1;
+    for (const interval of intervals) {
+        const start = scheduleTimeToMinutes(interval.start);
+        const end = scheduleTimeToMinutes(interval.end);
+        if (start === null || end === null) return '时段时间格式无效';
+        if (start >= end) return '每个时段的结束时间必须晚于开始时间';
+        if (start < previousEnd) return '时段之间不能重叠';
+        previousEnd = end;
+    }
     if (schedule.mode === 'weekly' && !schedule.weekdays.length) return '每周模式至少选择一天';
     if (schedule.mode === 'date_range' && (!/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateStart) || !/^\d{4}-\d{2}-\d{2}$/.test(schedule.dateEnd) || schedule.dateStart > schedule.dateEnd)) return '日期范围不能为空';
     return '';
 }
 
-function durationHoursFromMinutes(value) {
-    const minutes = Math.max(0, Number(value) || 0);
-    if (!minutes) return 0;
-    return Math.min(24, Math.ceil(minutes / 60));
+function scheduleIntervalsSummary(intervals) {
+    const valid = (Array.isArray(intervals) ? intervals : []).filter((interval) => scheduleTimeToMinutes(interval.start) !== null && scheduleTimeToMinutes(interval.end) !== null);
+    if (!valid.length) return '';
+    return valid.map((interval) => `${interval.start}-${interval.end}`).join('、');
 }
 
-function scheduleWindowModel(startTime, durationHours) {
-    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(startTime || ''));
-    const hours = Math.max(0, Math.min(24, Number.parseInt(durationHours, 10) || 0));
-    if (!match || !hours) {
-        return { startMinutes: null, endMinutes: null, crossesMidnight: false, startLabel: '', endLabel: '', summary: '请选择开始时间和持续时长' };
-    }
-    const startMinutes = Number(match[1]) * 60 + Number(match[2]);
-    const totalMinutes = startMinutes + hours * 60;
-    const endMinutes = totalMinutes % 1440;
-    const crossesMidnight = totalMinutes >= 1440;
-    const endLabel = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`;
-    return {
-        startMinutes,
-        endMinutes,
-        crossesMidnight,
-        startLabel: `${match[1]}:${match[2]}`,
-        endLabel,
-        summary: `${match[1]}:${match[2]} → ${crossesMidnight ? '次日 ' : ''}${endLabel}`,
-    };
-}
-
-function durationHoursFromDialAngle(startTime, angleDegrees) {
-    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(startTime || ''));
-    if (!match) return 1;
-    const startMinutes = Number(match[1]) * 60 + Number(match[2]);
-    const startAngle = startMinutes / 4;
-    const normalizedAngle = ((Number(angleDegrees) % 360) + 360) % 360;
-    const delta = (normalizedAngle - startAngle + 360) % 360;
-    const roundedHours = Math.round(delta / 15);
-    return roundedHours === 0 ? 24 : Math.max(1, Math.min(24, roundedHours));
-}
-
-function adjustScheduleDurationByKey(currentHours, key) {
-    const current = Math.max(1, Math.min(24, Number.parseInt(currentHours, 10) || 1));
-    if (key === 'Home') return 1;
-    if (key === 'End') return 24;
-    if (key === 'ArrowUp' || key === 'ArrowRight') return Math.min(24, current + 1);
-    if (key === 'ArrowDown' || key === 'ArrowLeft') return Math.max(1, current - 1);
-    return null;
+function scheduleTotalMinutes(intervals) {
+    return (Array.isArray(intervals) ? intervals : []).reduce((total, interval) => {
+        const start = scheduleTimeToMinutes(interval.start);
+        const end = scheduleTimeToMinutes(interval.end);
+        return start !== null && end !== null && end > start ? total + (end - start) : total;
+    }, 0);
 }
 
 function normalizeDateRange(start, end) {
@@ -1927,64 +1984,22 @@ function renderGlobalLifecycle(data = normalizedControlState()) {
 function scheduleStatusLabel(status) {
     if (!status?.enabled) return '未启用定时计划';
     if (status.state === 'running') return `定时投递运行中，剩余 ${Math.ceil(Number(status.remainingSeconds || 0) / 60)} 分钟`;
-    if (status.state === 'suppressed') return '本窗口已被手动暂停，下一窗口将重新评估';
-    if (status.nextStart) return `等待窗口，下一次开始 ${controlTime(status.nextStart)}`;
-    return '日期范围已结束';
+    if (status.state === 'suppressed') return '本时段已被手动暂停，下一时段将重新评估';
+    if (status.nextStart) return `等待时段，下一次开始 ${controlTime(status.nextStart)}`;
+    return '计划时段已全部结束';
 }
 
-function scheduleDialPoint(angle, radius = 124) {
-    const radians = (Number(angle) - 90) * Math.PI / 180;
-    return { x: 160 + Math.cos(radians) * radius, y: 160 + Math.sin(radians) * radius };
-}
-
-function renderScheduleDial(startTime, durationHours) {
-    const dial = $('#scheduleDurationDial');
-    const arc = $('#scheduleDurationArc');
-    const handle = $('#scheduleDurationHandle');
-    const startMarker = $('#scheduleStartMarker');
-    if (!dial || !arc || !handle || !startMarker) return;
-    const model = scheduleWindowModel(startTime, durationHours);
-    const hours = Math.max(0, Math.min(24, Number(durationHours) || 0));
-    const startAngle = model.startMinutes === null ? 0 : model.startMinutes / 4;
-    const endAngle = (startAngle + hours * 15) % 360;
-    const startPoint = scheduleDialPoint(startAngle, 112);
-    const endPoint = scheduleDialPoint(endAngle);
-    const ticks = $('#scheduleDialTicks');
-    if (ticks && !ticks.childElementCount) {
-        const namespace = 'http://www.w3.org/2000/svg';
-        Array.from({ length: 24 }, (_, hour) => {
-            const angle = hour * 15;
-            const outer = scheduleDialPoint(angle, hour % 6 === 0 ? 114 : 112);
-            const inner = scheduleDialPoint(angle, hour % 6 === 0 ? 102 : 106);
-            const line = document.createElementNS(namespace, 'line');
-            line.setAttribute('x1', inner.x.toFixed(2)); line.setAttribute('y1', inner.y.toFixed(2));
-            line.setAttribute('x2', outer.x.toFixed(2)); line.setAttribute('y2', outer.y.toFixed(2));
-            if (hour % 6 === 0) line.classList.add('major');
-            ticks.appendChild(line);
-        });
-    }
-    dial.dataset.unset = hours ? 'false' : 'true';
-    arc.style.strokeDasharray = hours ? `${hours / 24 * 100} ${100 - hours / 24 * 100}` : '0 100';
-    arc.style.transform = `rotate(${startAngle - 90}deg)`;
-    startMarker.setAttribute('transform', `translate(${startPoint.x.toFixed(2)} ${startPoint.y.toFixed(2)})`);
-    handle.setAttribute('transform', `translate(${endPoint.x.toFixed(2)} ${endPoint.y.toFixed(2)})`);
-    handle.setAttribute('aria-valuenow', String(hours || 1));
-    handle.setAttribute('aria-valuetext', hours ? `${hours} 小时` : '未设置');
-    $('#scheduleDurationValue').textContent = hours || '—';
-    $('#scheduleWindowSummary').textContent = model.summary;
-}
-
-function schedulePlanSummary(schedule, durationHours) {
+function schedulePlanSummary(schedule) {
     const modeLabels = { daily: '每天', weekly: '每周', weekdays: '工作日', date_range: '日期范围' };
     const weekdayLabels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
     const parts = [modeLabels[schedule.mode] || '未选择周期'];
     if (schedule.mode === 'weekly' && schedule.weekdays?.length) parts.push(schedule.weekdays.map((day) => weekdayLabels[day]).join('、'));
     if (schedule.mode === 'date_range' && schedule.dateStart && schedule.dateEnd) parts.push(`${schedule.dateStart} 至 ${schedule.dateEnd}`);
-    if (schedule.startTime) parts.push(schedule.startTime);
-    if (durationHours) parts.push(`${durationHours} 小时`);
-    return parts.length >= 3 || (schedule.mode === 'daily' && schedule.startTime && durationHours) || (schedule.mode === 'weekdays' && schedule.startTime && durationHours)
-        ? parts.join(' · ')
-        : '计划尚未完成';
+    const intervalsSummary = scheduleIntervalsSummary(schedule.intervals);
+    if (intervalsSummary) parts.push(intervalsSummary);
+    const dateReady = schedule.mode !== 'date_range' || (schedule.dateStart && schedule.dateEnd);
+    const weekdayReady = schedule.mode !== 'weekly' || (schedule.weekdays?.length);
+    return intervalsSummary && dateReady && weekdayReady ? parts.join(' · ') : '计划尚未完成';
 }
 
 function formatScheduleDate(value) {
@@ -1993,14 +2008,111 @@ function formatScheduleDate(value) {
 }
 
 function scheduleDraftFromForm() {
-    const values = scheduleFormValues();
-    const payload = schedulePayloadFromValues(values);
-    return { ...payload, durationHours: Math.max(0, Math.min(24, Number.parseInt(values.durationHours, 10) || 0)) };
+    return schedulePayloadFromValues(scheduleFormValues());
 }
 
 function clearScheduleErrors() {
     $$('.schedule-field-error').forEach((element) => { element.textContent = ''; });
     $$('.schedule-field-invalid').forEach((element) => element.classList.remove('schedule-field-invalid'));
+}
+
+function scheduleIntervalsFromState() {
+    return (Array.isArray(state.scheduleIntervals) ? state.scheduleIntervals : []).map((interval) => ({
+        start: String(interval?.start || '').trim(),
+        end: String(interval?.end || '').trim(),
+    }));
+}
+
+function commitScheduleIntervals(intervals) {
+    state.scheduleIntervals = (Array.isArray(intervals) ? intervals : []).map((interval) => ({
+        start: String(interval?.start || '').trim(),
+        end: String(interval?.end || '').trim(),
+    }));
+    state.scheduleDraft = scheduleDraftFromForm();
+    renderSchedulePanel();
+}
+
+function renderScheduleIntervals() {
+    const list = $('#scheduleIntervalList');
+    const empty = $('#scheduleIntervalsEmpty');
+    if (!list) return;
+    const intervals = scheduleIntervalsFromState();
+    if (empty) empty.hidden = intervals.length > 0;
+    list.innerHTML = intervals.map((interval, index) => {
+        const startLabel = interval.start || '开始';
+        const endLabel = interval.end || '结束';
+        return `
+            <div class="schedule-interval-row" data-interval-index="${index}">
+                <button type="button" class="schedule-interval-time" data-interval-field="start" data-interval-index="${index}" aria-label="设置第 ${index + 1} 段开始时间">
+                    <small>开始</small><strong>${escapeHtml(startLabel)}</strong>
+                </button>
+                <i aria-hidden="true">→</i>
+                <button type="button" class="schedule-interval-time" data-interval-field="end" data-interval-index="${index}" aria-label="设置第 ${index + 1} 段结束时间">
+                    <small>结束</small><strong>${escapeHtml(endLabel)}</strong>
+                </button>
+                <button type="button" class="schedule-interval-remove" data-interval-remove="${index}" aria-label="删除第 ${index + 1} 段时段">✕</button>
+            </div>`;
+    }).join('');
+}
+
+function scheduleProgressText(remainingSeconds) {
+    const total = Math.max(0, Math.floor(Number(remainingSeconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function stopScheduleProgressAnimation() {
+    if (state.scheduleProgressTimer) {
+        clearInterval(state.scheduleProgressTimer);
+        state.scheduleProgressTimer = null;
+    }
+}
+
+function renderScheduleProgressRing(status) {
+    const ring = $('#scheduleProgressRing');
+    const arc = $('#scheduleProgressArc');
+    const label = $('#scheduleProgressLabel');
+    if (!ring || !arc || !label) return;
+    const running = status?.state === 'running' && Number(status.windowSeconds) > 0;
+    if (!running) {
+        stopScheduleProgressAnimation();
+        ring.hidden = true;
+        ring.setAttribute('aria-hidden', 'true');
+        return;
+    }
+    ring.hidden = false;
+    ring.setAttribute('aria-hidden', 'false');
+    // 以状态快照时刻为锚点，本地每秒递减，避免频繁请求后端也能平滑走动。
+    const windowSeconds = Math.max(1, Number(status.windowSeconds) || 0);
+    const anchorRemaining = Math.max(0, Number(status.remainingSeconds) || 0);
+    const anchorAt = Date.now();
+    const paint = () => {
+        const elapsedSinceAnchor = (Date.now() - anchorAt) / 1000;
+        const remaining = Math.max(0, anchorRemaining - elapsedSinceAnchor);
+        const ratioRemaining = Math.max(0, Math.min(1, remaining / windowSeconds));
+        arc.style.strokeDasharray = `${(ratioRemaining * 100).toFixed(2)} 100`;
+        label.textContent = scheduleProgressText(remaining);
+        if (remaining <= 0) stopScheduleProgressAnimation();
+    };
+    stopScheduleProgressAnimation();
+    paint();
+    state.scheduleProgressTimer = setInterval(paint, 1000);
+}
+
+function setScheduleCardCollapsed(collapsed) {
+    const body = $('#scheduleCardBody');
+    const toggle = $('#scheduleCollapseToggle');
+    const card = $('#deliveryScheduleCard');
+    if (!body || !toggle || !card) return;
+    const isCollapsed = Boolean(collapsed);
+    card.classList.toggle('schedule-card-collapsed', isCollapsed);
+    body.hidden = isCollapsed;
+    toggle.setAttribute('aria-expanded', String(!isCollapsed));
+    toggle.setAttribute('aria-label', isCollapsed ? '展开定时投递卡片' : '收起定时投递卡片');
+    try { localStorage.setItem(SCHEDULE_CARD_COLLAPSE_KEY, isCollapsed ? '1' : '0'); } catch (_) { /* 忽略存储不可用 */ }
 }
 
 function setScheduleConfigExpanded(expanded) {
@@ -2032,15 +2144,13 @@ function setScheduleConfigExpanded(expanded) {
 
 function showScheduleValidationError(message) {
     clearScheduleErrors();
-    const target = message.includes('开始时间')
-        ? ['#scheduleStartTimeError', '#scheduleTimeTrigger']
-        : message.includes('持续时长')
-            ? ['#scheduleDurationError', '#scheduleDurationHandle']
-            : message.includes('每周')
-                ? ['#scheduleWeekdaysError', '#scheduleWeekdays']
-                : message.includes('日期范围')
-                    ? ['#scheduleDateRangeError', '#scheduleDateTrigger']
-                    : [null, '#scheduleMode'];
+    const target = message.includes('时段')
+        ? ['#scheduleIntervalsError', '#scheduleIntervalAdd']
+        : message.includes('每周')
+            ? ['#scheduleWeekdaysError', '#scheduleWeekdays']
+            : message.includes('日期范围')
+                ? ['#scheduleDateRangeError', '#scheduleDateTrigger']
+                : [null, '#scheduleMode'];
     if (target[0]) $(target[0]).textContent = message;
     const control = $(target[1]);
     control?.classList.add('schedule-field-invalid');
@@ -2055,13 +2165,15 @@ function renderSchedulePanel(data = normalizedControlState()) {
     const status = data.scheduleStatus || {};
     const setValue = (selector, value) => { const element = $(selector); if (element) element.value = value ?? ''; };
     const setChecked = (selector, value) => { const element = $(selector); if (element) element.checked = Boolean(value); };
-    const durationHours = schedule.durationHours === undefined
-        ? durationHoursFromMinutes(schedule.durationMinutes)
-        : Math.max(0, Math.min(24, Number(schedule.durationHours) || 0));
+    // 未处于编辑草稿时，用服务端计划回填时段编辑器，保证展示与后端一致。
+    if (!state.scheduleDraft) {
+        state.scheduleIntervals = (Array.isArray(schedule.intervals) ? schedule.intervals : []).map((interval) => ({
+            start: String(interval?.start || '').trim(),
+            end: String(interval?.end || '').trim(),
+        }));
+    }
     setChecked('#scheduleEnabled', schedule.enabled);
     setValue('#scheduleMode', schedule.mode || 'daily');
-    setValue('#scheduleStartTime', schedule.startTime || '');
-    setValue('#scheduleDurationHours', durationHours);
     setValue('#scheduleDateStart', schedule.dateStart || '');
     setValue('#scheduleDateEnd', schedule.dateEnd || '');
     $$('[data-schedule-weekday]').forEach((input) => { input.checked = (schedule.weekdays || []).includes(Number(input.value)); });
@@ -2071,17 +2183,17 @@ function renderSchedulePanel(data = normalizedControlState()) {
         button.classList.toggle('active', selected);
         button.setAttribute('aria-pressed', String(selected));
     });
-    $('#scheduleStartTimeDisplay').textContent = schedule.startTime || '选择开始时间';
     $('#scheduleDateStartDisplay').textContent = formatScheduleDate(schedule.dateStart);
     $('#scheduleDateEndDisplay').textContent = formatScheduleDate(schedule.dateEnd);
-    $('#schedulePlanSummary').textContent = schedulePlanSummary(schedule, durationHours);
-    renderScheduleDial(schedule.startTime, durationHours);
+    $('#schedulePlanSummary').textContent = schedulePlanSummary(schedule);
+    renderScheduleIntervals();
     const text = scheduleStatusLabel(status);
     $('#scheduleStatusText').textContent = text;
     const statusNode = $('#scheduleStatus');
     statusNode.querySelector('span').textContent = text;
     statusNode.classList.toggle('running', status.state === 'running');
     statusNode.classList.toggle('waiting', Boolean(status.enabled && status.state !== 'running'));
+    renderScheduleProgressRing(status);
     $('#scheduleFeedback').textContent = state.scheduleFeedback || '';
     setScheduleConfigExpanded(schedule.enabled);
     const actions = $('.schedule-actions');
@@ -2102,8 +2214,7 @@ function scheduleFormValues() {
     return {
         enabled: $('#scheduleEnabled')?.checked,
         mode: $('#scheduleMode')?.value,
-        startTime: $('#scheduleStartTime')?.value,
-        durationHours: $('#scheduleDurationHours')?.value,
+        intervals: scheduleIntervalsFromState(),
         weekdays: $$('[data-schedule-weekday]:checked').map((input) => Number(input.value)),
         dateStart: $('#scheduleDateStart')?.value,
         dateEnd: $('#scheduleDateEnd')?.value,
@@ -2143,13 +2254,28 @@ function bindScheduleControls() {
     const card = $('#deliveryScheduleCard');
     if (!card || card.dataset.bound === '1') return;
     card.dataset.bound = '1';
+    // 恢复上次的卡片收纳状态；存储不可用时默认展开。
+    let collapsedPref = false;
+    try { collapsedPref = localStorage.getItem(SCHEDULE_CARD_COLLAPSE_KEY) === '1'; } catch (_) { /* 忽略存储不可用 */ }
+    setScheduleCardCollapsed(collapsedPref);
     const updateDraft = () => { state.scheduleDraft = scheduleDraftFromForm(); renderSchedulePanel(); };
     card.addEventListener('click', (event) => {
         const modeButton = event.target.closest('[data-schedule-mode]');
         if (modeButton) {
             $('#scheduleMode').value = modeButton.dataset.scheduleMode;
             $('#scheduleMode').dispatchEvent(new Event('change', { bubbles: true }));
+            return;
         }
+        const removeButton = event.target.closest('[data-interval-remove]');
+        if (removeButton) {
+            const index = Number(removeButton.dataset.intervalRemove);
+            const intervals = scheduleIntervalsFromState();
+            intervals.splice(index, 1);
+            clearScheduleErrors();
+            commitScheduleIntervals(intervals);
+            return;
+        }
+        // 时段开始/结束时间的选择由 initScheduleTimePicker 内部的时段列表监听器处理。
     });
     card.addEventListener('change', (event) => {
         if (!event.target.matches('[data-schedule-field], [data-schedule-weekday]')) return;
@@ -2161,35 +2287,18 @@ function bindScheduleControls() {
         clearScheduleErrors();
         updateDraft();
     });
-    const setDuration = (hours) => {
-        const input = $('#scheduleDurationHours');
-        input.value = Math.max(1, Math.min(24, Number(hours) || 1));
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-    };
-    const dialSvg = $('#scheduleDurationDial svg');
-    const durationFromPointer = (event) => {
-        const rect = dialSvg.getBoundingClientRect();
-        const x = event.clientX - (rect.left + rect.width / 2);
-        const y = event.clientY - (rect.top + rect.height / 2);
-        const angle = ((Math.atan2(y, x) * 180 / Math.PI) + 90 + 360) % 360;
-        setDuration(durationHoursFromDialAngle($('#scheduleStartTime').value || '00:00', angle));
-    };
-    let draggingDial = false;
-    dialSvg.addEventListener('pointerdown', (event) => {
-        draggingDial = true;
-        dialSvg.setPointerCapture?.(event.pointerId);
-        $('#scheduleDurationHandle').focus();
-        durationFromPointer(event);
+    $('#scheduleIntervalAdd')?.addEventListener('click', () => {
+        const intervals = scheduleIntervalsFromState();
+        if (intervals.length >= 12) { state.scheduleFeedback = '最多支持 12 个时段'; renderSchedulePanel(); return; }
+        // 依据上一段结束时间推荐一个合理的默认起始，减少手动输入。
+        const last = intervals[intervals.length - 1];
+        const suggestedStart = last && scheduleTimeToMinutes(last.end) !== null ? last.end : '09:00';
+        intervals.push({ start: suggestedStart, end: '' });
+        clearScheduleErrors();
+        commitScheduleIntervals(intervals);
     });
-    dialSvg.addEventListener('pointermove', (event) => { if (draggingDial) durationFromPointer(event); });
-    const stopDragging = () => { draggingDial = false; };
-    dialSvg.addEventListener('pointerup', stopDragging);
-    dialSvg.addEventListener('pointercancel', stopDragging);
-    $('#scheduleDurationHandle').addEventListener('keydown', (event) => {
-        const next = adjustScheduleDurationByKey($('#scheduleDurationHours').value, event.key);
-        if (next === null) return;
-        event.preventDefault();
-        setDuration(next);
+    $('#scheduleCollapseToggle')?.addEventListener('click', () => {
+        setScheduleCardCollapsed($('#deliveryScheduleCard')?.classList.contains('schedule-card-collapsed') !== true);
     });
     $('#saveSchedule')?.addEventListener('click', () => saveSchedule(true));
 }

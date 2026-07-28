@@ -37,17 +37,29 @@ function evaluate(source) {
     return vm.runInNewContext(source, Object.create(null));
 }
 
+// scheduleTimeToMinutes references a module-level constant; extract it so the
+// sandboxed helper copies resolve it the same way the browser bundle does.
+function extractConstant(name) {
+    const match = new RegExp(`const ${name}\\s*=\\s*[^;]+;`).exec(appSource);
+    assert.ok(match, `missing constant ${name}`);
+    return match[0];
+}
+
+const SCHEDULE_TIME_PATTERN_SOURCE = extractConstant('SCHEDULE_TIME_PATTERN');
+
 test('hidden compatibility metrics stay hidden in the live monitor', () => {
     assert.match(htmlSource, /id="activeClients" hidden/);
     assert.match(htmlSource, /id="heartbeatWindowHint" hidden/);
     assert.match(stylesSource, /\.monitor-metrics \[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important/);
 });
 
-test('schedule editor exposes the accessible dial and styled picker contracts', () => {
-    assert.match(htmlSource, /id="scheduleDurationDial"/);
-    assert.match(htmlSource, /id="scheduleDurationHandle"[^>]*role="slider"[^>]*aria-valuemin="1"[^>]*aria-valuemax="24"/);
-    assert.doesNotMatch(htmlSource, /id="scheduleDurationDial"[\s\S]*?<svg[^>]*aria-hidden="true"[\s\S]*?id="scheduleDurationHandle"/);
-    assert.doesNotMatch(htmlSource, /id="scheduleDurationMinutes"/);
+test('schedule editor exposes the intervals editor and reuses the styled time picker', () => {
+    assert.match(htmlSource, /id="scheduleIntervalList"/);
+    assert.match(htmlSource, /id="scheduleIntervalAdd"/);
+    assert.match(htmlSource, /id="scheduleIntervalsEmpty"/);
+    assert.doesNotMatch(htmlSource, /id="scheduleDurationDial"/);
+    assert.doesNotMatch(htmlSource, /id="scheduleDurationHandle"/);
+    assert.doesNotMatch(htmlSource, /id="scheduleStartTime"/);
     assert.match(htmlSource, /data-date-picker-mode="range"/);
     assert.match(appSource, /gj-time-picker/);
     assert.match(stylesSource, /\.schedule-weekdays\[hidden\],\s*\.schedule-hint\[hidden\],\s*\.schedule-date-range\[hidden\]\s*\{\s*display:none/);
@@ -70,17 +82,23 @@ test('schedule settings are collapsed until the enable toggle is selected', () =
     assert.match(stylesSource, /\.schedule-config-collapse[^}]*\.schedule-config-inner[^}]*min-height\s*:\s*0/);
     assert.match(stylesSource, /\.schedule-config-collapse[^}]*grid-template-rows\s*:\s*1fr/);
     assert.match(stylesSource, /\.schedule-actions\[hidden\]\s*\{[^}]*display\s*:\s*none/);
-    assert.doesNotMatch(stylesSource, /\.schedule-feedback:empty\s*\{[^}]*display\s*:\s*none/);
 
     assert.match(appSource, /scheduleConfigCollapse/);
     assert.match(appSource, /aria-hidden/);
     assert.match(appSource, /inert/);
 });
 
-test('duration dial has no separate plus or minus stepper controls', () => {
-    assert.doesNotMatch(htmlSource, /scheduleDuration(?:Decrease|Increase)|schedule-duration-steppers/);
-    assert.doesNotMatch(appSource, /scheduleDuration(?:Decrease|Increase)|schedule-duration-steppers/);
-    assert.doesNotMatch(stylesSource, /schedule-duration-steppers/);
+test('schedule card can be collapsed for storage and shows a progress ring', () => {
+    assert.match(htmlSource, /id="scheduleCollapseToggle"[^>]*aria-controls="scheduleCardBody"/);
+    assert.match(htmlSource, /id="scheduleCardBody"/);
+    assert.match(htmlSource, /id="scheduleProgressRing"[^>]*hidden/);
+    assert.match(htmlSource, /id="scheduleProgressArc"/);
+    assert.match(htmlSource, /id="scheduleProgressLabel"/);
+    assert.match(appSource, /SCHEDULE_CARD_COLLAPSE_KEY/);
+    assert.match(appSource, /function setScheduleCardCollapsed/);
+    assert.match(appSource, /function renderScheduleProgressRing/);
+    assert.match(stylesSource, /\.schedule-card-body\[hidden\]\s*\{\s*display:none/);
+    assert.match(stylesSource, /\.schedule-progress-arc\s*\{[^}]*stroke:var\(--green\)/);
 });
 
 test('schedule editor exposes one save-and-apply command', () => {
@@ -106,44 +124,67 @@ test('range trigger keeps equal date columns and positions its calendar icon ind
     const datePickerSource = extractFunction('initDatePicker');
     assert.match(datePickerSource, /rect\.left\s*\+\s*\(rect\.width\s*-\s*width\)\s*\/\s*2/);
     assert.match(datePickerSource, /schedule-picker-close/);
-    assert.match(datePickerSource, /openSingle[\s\S]*close\(false\)/);
-    assert.match(datePickerSource, /openRange[\s\S]*close\(false\)/);
     assert.match(extractFunction('setScheduleConfigExpanded'), /datePickerOpen[\s\S]*schedule-picker-close/);
     assert.match(stylesSource, /\.gj-calendar-days\s*\{[^}]*row-gap\s*:\s*3px/);
     assert.match(stylesSource, /button\.in-range\s*\{[^}]*border-radius\s*:\s*0/);
 });
 
-test('schedule payload preserves the backend contract with whole-hour durations', () => {
+test('schedule payload sends a sorted, non-overlapping intervals array', () => {
     const helpers = evaluate(`
+        ${SCHEDULE_TIME_PATTERN_SOURCE}
+        ${extractFunction('scheduleTimeToMinutes')}
+        ${extractFunction('normalizeScheduleIntervals')}
         ${extractFunction('schedulePayloadFromValues')}
         ${extractFunction('validateSchedulePayload')}
         ({ schedulePayloadFromValues, validateSchedulePayload });
     `);
     const payload = helpers.schedulePayloadFromValues({
         enabled: true,
-        mode: 'weekly',
-        startTime: '09:30',
-        durationHours: '2',
+        mode: 'weekdays',
+        intervals: [{ start: '14:00', end: '18:00' }, { start: '08:00', end: '12:00' }],
         weekdays: [4, 0, 4],
         dateStart: '',
         dateEnd: '',
     });
-    assert.equal(JSON.stringify(payload), JSON.stringify({ enabled: true, mode: 'weekly', startTime: '09:30', durationMinutes: 120, weekdays: [0, 4], dateStart: '', dateEnd: '' }));
-    assert.equal(helpers.validateSchedulePayload({ ...payload, durationMinutes: 90 }), '持续时长请选择 1 至 24 小时');
+    assert.equal(JSON.stringify(payload.intervals), JSON.stringify([{ start: '08:00', end: '12:00' }, { start: '14:00', end: '18:00' }]));
+    assert.equal(payload.mode, 'weekdays');
+    assert.equal(helpers.validateSchedulePayload(payload), '');
 });
 
-test('schedule helpers cover legacy values, cross-midnight arcs, keys, and reverse ranges', () => {
+test('schedule validation rejects empty, reversed, and overlapping intervals', () => {
     const helpers = evaluate(`
-        ${extractFunction('durationHoursFromMinutes')}
-        ${extractFunction('scheduleWindowModel')}
-        ${extractFunction('durationHoursFromDialAngle')}
-        ${extractFunction('adjustScheduleDurationByKey')}
-        ${extractFunction('normalizeDateRange')}
-        ({ durationHoursFromMinutes, scheduleWindowModel, durationHoursFromDialAngle, adjustScheduleDurationByKey, normalizeDateRange });
+        ${SCHEDULE_TIME_PATTERN_SOURCE}
+        ${extractFunction('scheduleTimeToMinutes')}
+        ${extractFunction('validateSchedulePayload')}
+        ({ validateSchedulePayload });
     `);
-    assert.equal(helpers.durationHoursFromMinutes(90), 2);
-    assert.equal(helpers.scheduleWindowModel('23:30', 2).summary, '23:30 → 次日 01:30');
-    assert.equal(helpers.durationHoursFromDialAngle('23:30', 22.5), 2);
-    assert.equal(helpers.adjustScheduleDurationByKey(2, 'ArrowRight'), 3);
+    const base = { enabled: true, mode: 'daily', weekdays: [], dateStart: '', dateEnd: '' };
+    assert.equal(helpers.validateSchedulePayload({ ...base, intervals: [] }), '请至少添加一个投递时段');
+    assert.equal(helpers.validateSchedulePayload({ ...base, intervals: [{ start: '18:00', end: '09:00' }] }), '每个时段的结束时间必须晚于开始时间');
+    assert.equal(helpers.validateSchedulePayload({ ...base, intervals: [{ start: '08:00', end: '12:00' }, { start: '11:00', end: '15:00' }] }), '时段之间不能重叠');
+    assert.equal(helpers.validateSchedulePayload({ ...base, intervals: [{ start: '08:00', end: '12:00' }, { start: '14:00', end: '18:00' }] }), '');
+});
+
+test('schedule helpers summarize intervals and reverse date ranges', () => {
+    const helpers = evaluate(`
+        ${SCHEDULE_TIME_PATTERN_SOURCE}
+        ${extractFunction('scheduleTimeToMinutes')}
+        ${extractFunction('scheduleIntervalsSummary')}
+        ${extractFunction('scheduleTotalMinutes')}
+        ${extractFunction('normalizeDateRange')}
+        ({ scheduleIntervalsSummary, scheduleTotalMinutes, normalizeDateRange });
+    `);
+    assert.equal(helpers.scheduleIntervalsSummary([{ start: '08:00', end: '12:00' }, { start: '14:00', end: '18:00' }]), '08:00-12:00、14:00-18:00');
+    assert.equal(helpers.scheduleTotalMinutes([{ start: '08:00', end: '12:00' }, { start: '14:00', end: '18:00' }]), 480);
     assert.equal(JSON.stringify(helpers.normalizeDateRange('2026-07-24', '2026-07-20')), JSON.stringify(['2026-07-20', '2026-07-24']));
+});
+
+test('schedule progress text formats remaining time', () => {
+    const helpers = evaluate(`
+        ${extractFunction('scheduleProgressText')}
+        ({ scheduleProgressText });
+    `);
+    assert.equal(helpers.scheduleProgressText(3725), '1:02:05');
+    assert.equal(helpers.scheduleProgressText(125), '02:05');
+    assert.equal(helpers.scheduleProgressText(0), '00:00');
 });

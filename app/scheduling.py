@@ -9,11 +9,11 @@ from typing import Any
 
 
 SCHEDULE_MODES = frozenset({'daily', 'weekly', 'weekdays', 'date_range'})
+MAX_INTERVALS = 12
 DEFAULT_SCHEDULE = {
     'enabled': False,
     'mode': 'daily',
-    'startTime': '',
-    'durationMinutes': 0,
+    'intervals': [],
     'weekdays': [],
     'dateStart': '',
     'dateEnd': '',
@@ -27,17 +27,24 @@ class ScheduleWindow:
     end: datetime
 
 
-def _parse_time(value: Any) -> datetime_time | None:
+def _parse_time_minutes(value: Any) -> int:
+    """Parse an ``HH:MM`` string into minutes since midnight (0..1440)."""
     text = str(value or '').strip()
-    if not text:
-        return None
+    if text == '24:00':
+        return 1440
     try:
         parsed = datetime.strptime(text, '%H:%M')
-    except ValueError as error:
-        raise ValueError('invalid_schedule_start_time') from error
+    except (ValueError, TypeError) as error:
+        raise ValueError('invalid_schedule_interval') from error
     if parsed.strftime('%H:%M') != text:
-        raise ValueError('invalid_schedule_start_time')
-    return parsed.time()
+        raise ValueError('invalid_schedule_interval')
+    return parsed.hour * 60 + parsed.minute
+
+
+def _minutes_to_label(minutes: int) -> str:
+    if minutes >= 1440:
+        return '24:00'
+    return f'{minutes // 60:02d}:{minutes % 60:02d}'
 
 
 def _parse_date(value: Any) -> date | None:
@@ -53,10 +60,76 @@ def _parse_date(value: Any) -> date | None:
     return parsed
 
 
+def _migrate_legacy_intervals(payload: dict) -> list:
+    """Convert a legacy ``startTime`` + ``durationMinutes`` schedule into one interval.
+
+    The old single-window model allowed crossing midnight; when migrating we clamp the
+    end to the same day (24:00) because the interval model does not cross midnight.
+    """
+    start_text = str(payload.get('startTime') or '').strip()
+    if not start_text:
+        return []
+    try:
+        start_minutes = _parse_time_minutes(start_text)
+    except ValueError:
+        return []
+    raw_duration = payload.get('durationMinutes')
+    if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+        return []
+    duration = int(raw_duration)
+    if duration <= 0:
+        return []
+    end_minutes = min(1440, start_minutes + duration)
+    if end_minutes <= start_minutes:
+        return []
+    return [{'start': _minutes_to_label(start_minutes), 'end': _minutes_to_label(end_minutes)}]
+
+
+def _normalize_intervals(raw_intervals: Any) -> list[dict]:
+    """Validate the interval list: same-day ranges, sorted, non-overlapping."""
+    if not isinstance(raw_intervals, list):
+        raise ValueError('invalid_schedule_intervals')
+    if len(raw_intervals) > MAX_INTERVALS:
+        raise ValueError('invalid_schedule_intervals')
+    parsed: list[tuple[int, int]] = []
+    for item in raw_intervals:
+        if not isinstance(item, dict):
+            raise ValueError('invalid_schedule_interval')
+        unsupported = set(item) - {'start', 'end'}
+        if unsupported:
+            raise ValueError('invalid_schedule_interval')
+        start_minutes = _parse_time_minutes(item.get('start'))
+        end_minutes = _parse_time_minutes(item.get('end'))
+        if not 0 <= start_minutes < end_minutes <= 1440:
+            raise ValueError('invalid_schedule_interval')
+        parsed.append((start_minutes, end_minutes))
+
+    parsed.sort()
+    for index in range(1, len(parsed)):
+        if parsed[index][0] < parsed[index - 1][1]:
+            raise ValueError('overlapping_schedule_intervals')
+
+    return [
+        {'start': _minutes_to_label(start), 'end': _minutes_to_label(end)}
+        for start, end in parsed
+    ]
+
+
 def normalize_schedule(payload: dict | None) -> dict:
     """Validate and return a complete, JSON-safe schedule configuration."""
     if not isinstance(payload, dict):
         raise ValueError('invalid_schedule_payload')
+    # Accept legacy single-window fields transparently by migrating them before
+    # rejecting unknown keys, so previously saved plans keep working after upgrade.
+    payload = dict(payload)
+    legacy_keys = {'startTime', 'durationMinutes'}
+    has_legacy = bool(legacy_keys & set(payload))
+    migrated_intervals = _migrate_legacy_intervals(payload) if has_legacy else []
+    for key in legacy_keys:
+        payload.pop(key, None)
+    if migrated_intervals and 'intervals' not in payload:
+        payload['intervals'] = migrated_intervals
+
     unsupported = set(payload) - set(DEFAULT_SCHEDULE)
     if unsupported:
         raise ValueError(f'unsupported_schedule_field:{sorted(unsupported)[0]}')
@@ -68,16 +141,7 @@ def normalize_schedule(payload: dict | None) -> dict:
     if mode not in SCHEDULE_MODES:
         raise ValueError('invalid_schedule_mode')
 
-    start = _parse_time(candidate['startTime'])
-    raw_duration = candidate['durationMinutes']
-    if isinstance(raw_duration, bool):
-        raise ValueError('invalid_schedule_duration')
-    try:
-        duration = int(raw_duration)
-    except (TypeError, ValueError) as error:
-        raise ValueError('invalid_schedule_duration') from error
-    if isinstance(raw_duration, float) and not raw_duration.is_integer():
-        raise ValueError('invalid_schedule_duration')
+    intervals = _normalize_intervals(candidate['intervals'])
 
     raw_weekdays = candidate['weekdays']
     if not isinstance(raw_weekdays, list):
@@ -103,16 +167,12 @@ def normalize_schedule(payload: dict | None) -> dict:
         raise ValueError('invalid_schedule_date_range')
 
     if candidate['enabled']:
-        if start is None:
-            raise ValueError('invalid_schedule_start_time')
-        if not 1 <= duration <= 1440:
-            raise ValueError('invalid_schedule_duration')
+        if not intervals:
+            raise ValueError('missing_schedule_intervals')
         if mode == 'weekly' and not weekdays:
             raise ValueError('missing_schedule_weekdays')
         if mode == 'date_range' and (date_start is None or date_end is None):
             raise ValueError('missing_schedule_date_range')
-    elif duration < 0 or duration > 1440:
-        raise ValueError('invalid_schedule_duration')
 
     if mode == 'weekdays':
         weekdays = [0, 1, 2, 3, 4]
@@ -125,8 +185,7 @@ def normalize_schedule(payload: dict | None) -> dict:
     return {
         'enabled': candidate['enabled'],
         'mode': mode,
-        'startTime': start.strftime('%H:%M') if start else '',
-        'durationMinutes': duration,
+        'intervals': intervals,
         'weekdays': weekdays,
         'dateStart': date_start.isoformat() if date_start else '',
         'dateEnd': date_end.isoformat() if date_end else '',
@@ -144,27 +203,34 @@ def _valid_start_date(day: date, schedule: dict) -> bool:
     return date.fromisoformat(schedule['dateStart']) <= day <= date.fromisoformat(schedule['dateEnd'])
 
 
-def _window_start(day: date, schedule: dict) -> datetime:
-    return datetime.combine(day, datetime.strptime(schedule['startTime'], '%H:%M').time())
+def _interval_bounds(day: date, interval: dict) -> tuple[datetime, datetime]:
+    start_minutes = _parse_time_minutes(interval['start'])
+    end_minutes = _parse_time_minutes(interval['end'])
+    start = datetime.combine(day, datetime_time()) + timedelta(minutes=start_minutes)
+    end = datetime.combine(day, datetime_time()) + timedelta(minutes=end_minutes)
+    return start, end
 
 
 def schedule_window(now: datetime, schedule: dict) -> ScheduleWindow | None:
-    """Return the active window, considering a previous-day cross-midnight start."""
+    """Return the active interval for today, if ``now`` falls inside one.
+
+    Intervals never cross midnight, so only the current day needs to be checked.
+    """
     if not schedule.get('enabled'):
         return None
-    for day in (now.date(), now.date() - timedelta(days=1)):
-        if not _valid_start_date(day, schedule):
-            continue
-        start = _window_start(day, schedule)
-        end = start + timedelta(minutes=schedule['durationMinutes'])
+    day = now.date()
+    if not _valid_start_date(day, schedule):
+        return None
+    for interval in schedule['intervals']:
+        start, end = _interval_bounds(day, interval)
         if start <= now < end:
-            return ScheduleWindow(start.strftime('%Y-%m-%dT%H:%M'), start, end)
+            return ScheduleWindow(f'{day.isoformat()}T{interval["start"]}', start, end)
     return None
 
 
 def next_schedule_start(now: datetime, schedule: dict) -> datetime | None:
-    """Return the first configured start strictly after ``now``."""
-    if not schedule.get('enabled'):
+    """Return the first configured interval start strictly after ``now``."""
+    if not schedule.get('enabled') or not schedule['intervals']:
         return None
     mode = schedule['mode']
     if mode == 'date_range':
@@ -172,8 +238,8 @@ def next_schedule_start(now: datetime, schedule: dict) -> datetime | None:
         last = date.fromisoformat(schedule['dateEnd'])
         day = max(now.date(), first)
         while day <= last:
-            start = _window_start(day, schedule)
-            if start > now:
+            start = _first_interval_start_after(now, day, schedule)
+            if start is not None:
                 return start
             day += timedelta(days=1)
         return None
@@ -181,8 +247,16 @@ def next_schedule_start(now: datetime, schedule: dict) -> datetime | None:
     day = now.date()
     for _ in range(8):
         if _valid_start_date(day, schedule):
-            start = _window_start(day, schedule)
-            if start > now:
+            start = _first_interval_start_after(now, day, schedule)
+            if start is not None:
                 return start
         day += timedelta(days=1)
+    return None
+
+
+def _first_interval_start_after(now: datetime, day: date, schedule: dict) -> datetime | None:
+    for interval in schedule['intervals']:
+        start, _ = _interval_bounds(day, interval)
+        if start > now:
+            return start
     return None
